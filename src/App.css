@@ -1,10 +1,4 @@
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-body {
+.login-page {
   display: flex;
   justify-content: center;
   align-items: center;
@@ -66,4 +60,10 @@ button {
 
 button:hover {
   background: #004a9e;
+}
+.error-msg {
+  color: red;
+  font-size: 13px;
+  text-align: center;
+  margin: 0;
 }
