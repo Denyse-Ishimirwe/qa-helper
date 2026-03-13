@@ -15,6 +15,10 @@ function Dashboard({ email, onLogout }) {
     setShowModal(false)
   }
 
+  function handleDelete(index) {
+    setProjects(projects.filter((_, i) => i !== index))
+  }
+
   return (
     <div className="page">
       <div className="topbar">
@@ -41,7 +45,7 @@ function Dashboard({ email, onLogout }) {
           <span>Form URL</span>
           <span>Last Tested</span>
           <span>Status</span>
-          <span>Action</span>
+          <span>Actions</span>
         </div>
 
         {projects.length === 0 ? (
@@ -54,8 +58,11 @@ function Dashboard({ email, onLogout }) {
               <span>{project.name}</span>
               <span>{project.url}</span>
               <span>Never</span>
-              <span>{project.status}</span>
-              <button>Run Test</button>
+              <span className="status-badge">{project.status}</span>
+              <div className="action-buttons">
+                <button className="run-btn">Run Test</button>
+                <button className="delete-btn" onClick={() => handleDelete(index)}>Delete</button>
+              </div>
             </div>
           ))
         )}
@@ -67,18 +74,21 @@ function Dashboard({ email, onLogout }) {
         <div className="modal-overlay">
           <div className="modal">
             <h2>New Project</h2>
+            <label>Project Name</label>
             <input
               type="text"
-              placeholder="Project Name"
+              placeholder="Enter project name"
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
             />
+            <label>Form URL</label>
             <input
               type="text"
-              placeholder="Form URL"
+              placeholder="Enter form URL"
               value={formUrl}
               onChange={(e) => setFormUrl(e.target.value)}
             />
+            <label>Requirements Document</label>
             <input type="file" accept=".pdf,.doc,.docx" />
             <div className="modal-buttons">
               <button onClick={() => setShowModal(false)}>Cancel</button>

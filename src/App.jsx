@@ -9,13 +9,17 @@ function App() {
   const [error, setError] = useState('')
 
   function handleLogin() {
-    if (email === '' || password === '') {
-      setError('Email and Password are required')
-      return
-    }
-    setError('')
-    setLoggedIn(true)
+  if (email === '' || password === '') {
+    setError('Email and Password are required')
+    return
   }
+  if (!email.includes('@') || !email.includes('.')) {
+    setError('Please enter a valid email address')
+    return
+  }
+  setError('')
+  setLoggedIn(true)
+}
 
   if (loggedIn) {
     return <Dashboard email={email} onLogout={() => {
@@ -29,12 +33,14 @@ function App() {
     <div className="login-page">
       <div className="login-container">
         <h1>QA Helper</h1>
+        <label>Email Address</label>
         <input
           value={email}
           onChange={(e) => setEmail(e.target.value)}
           type="email"
           placeholder="Enter your email address"
         />
+        <label>Password</label>
         <input
           value={password}
           onChange={(e) => setPassword(e.target.value)}
