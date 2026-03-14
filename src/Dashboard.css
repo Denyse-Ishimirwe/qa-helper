@@ -24,16 +24,64 @@
   font-weight: bold;
 }
 
+.user-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.user-info span {
+  color: white;
+  font-size: 14px;
+}
+
+.user-info button {
+  background: white;
+  color: #00448e;
+  border: none;
+  padding: 8px 16px;
+  border-radius: 6px;
+  font-weight: bold;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.user-info button:hover {
+  background: #f0f0f0;
+}
+
 .content {
   max-width: 900px;
   margin: 40px auto;
   padding: 0 20px;
 }
 
-.content h2 {
+.content-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.content-top h2 {
   color: #00448e;
   font-size: 26px;
-  margin-bottom: 20px;
+  margin: 0;
+}
+
+.new-project-btn {
+  padding: 12px 28px;
+  background: #0063cf;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.new-project-btn:hover {
+  background: #004a9e;
 }
 
 .filters {
@@ -75,6 +123,29 @@
   font-weight: bold;
 }
 
+.table-row {
+  display: grid;
+  grid-template-columns: 2fr 2fr 1.5fr 1fr 1.5fr;
+  background: white;
+  padding: 12px 16px;
+  border: 1px solid #e0e0e0;
+  border-top: none;
+  font-size: 13px;
+  align-items: center;
+}
+
+.table-row:hover {
+  background: #f9fbff;
+}
+
+.url-cell {
+  color: #0063cf;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .empty-state {
   background: white;
   padding: 60px 20px;
@@ -85,47 +156,70 @@
   border-top: none;
 }
 
-.new-project-btn {
-  margin-top: 24px;
-  padding: 13px 32px;
+.status-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: bold;
+}
+
+.status-badge.not-tested {
+  background: #f0f0f0;
+  color: #888;
+}
+
+.status-badge.in-progress {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.status-badge.passed {
+  background: #d4edda;
+  color: #155724;
+}
+
+.status-badge.failed {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.action-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.run-btn {
+  padding: 6px 14px;
   background: #0063cf;
   color: white;
   border: none;
-  border-radius: 6px;
-  font-size: 15px;
-  font-weight: bold;
+  border-radius: 4px;
   cursor: pointer;
-  display: block;
+  font-size: 12px;
+  font-weight: bold;
 }
 
-.new-project-btn:hover {
+.run-btn:hover {
   background: #004a9e;
 }
-.user-info {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
 
-.user-info span {
-  color: white;
-  font-size: 14px;
-}
-
-.user-info button {
+.delete-btn {
+  padding: 6px 14px;
   background: white;
-  color: #00448e;
-  border: none;
-  padding: 8px 16px;
-  border-radius: 6px;
-  font-weight: bold;
+  color: red;
+  border: 1.5px solid red;
+  border-radius: 4px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: bold;
 }
 
-.user-info button:hover {
-  background: #f0f0f0;
+.delete-btn:hover {
+  background: #fff0f0;
 }
+
 .modal-overlay {
   position: fixed;
   top: 0;
@@ -143,7 +237,7 @@
   background: white;
   padding: 40px;
   border-radius: 12px;
-  width: 400px;
+  width: 420px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -152,7 +246,14 @@
 .modal h2 {
   color: #00448e;
   font-size: 20px;
-  margin-bottom: 8px;
+  margin-bottom: 4px;
+}
+
+.modal label {
+  font-size: 13px;
+  font-weight: bold;
+  color: #444;
+  margin-bottom: -8px;
 }
 
 .modal input {
@@ -161,6 +262,11 @@
   border-radius: 6px;
   font-size: 14px;
   outline: none;
+  width: 100%;
+}
+
+.modal input:focus {
+  border-color: #004a9e;
 }
 
 .modal-buttons {
@@ -181,43 +287,15 @@
   color: #0063cf;
 }
 
+.modal-buttons button:hover {
+  background: #f0f5ff;
+}
+
 .modal-buttons .submit-btn {
   background: #0063cf;
   color: white;
 }
-.table-row {
-  display: grid;
-  grid-template-columns: 2fr 2fr 1.5fr 1fr 1.5fr;
-  background: white;
-  padding: 12px 16px;
-  border: 1px solid #e0e0e0;
-  border-top: none;
-  font-size: 13px;
-  align-items: center;
-}
 
-.table-row button {
-  padding: 6px 14px;
-  background:#0063cf;
-  color: white;
-  border: none;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 12px;
-
-.delete-btn {
-  padding: 6px 14px;
-  background: white;
-  color: red;
-  border: 1.5px solid red;
-  border-radius: 4px;
-  cursor: pointer;
-  font-size: 12px;
-  margin-left: 8px;
-}
-}
-.action-buttons {
-  display: flex;
-  gap: 8px;
-  align-items: center;
+.modal-buttons .submit-btn:hover {
+  background: #004a9e;
 }
