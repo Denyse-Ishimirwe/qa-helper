@@ -1,28 +1,84 @@
 import './Dashboard.css'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 function Dashboard({ email, onLogout }) {
   const [showModal, setShowModal] = useState(false)
   const [projects, setProjects] = useState([])
   const [projectName, setProjectName] = useState('')
   const [formUrl, setFormUrl] = useState('')
+  const [srdFile, setSrdFile] = useState(null)
   const [activeFilter, setActiveFilter] = useState('All Projects')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
 
-  function handleCreateProject() {
-    if (projectName === '' || formUrl === '') return
-    setProjects([...projects, {
-      name: projectName,
-      url: formUrl,
-      status: 'Not Tested',
-      lastTested: 'Never'
-    }])
-    setProjectName('')
-    setFormUrl('')
-    setShowModal(false)
+  // Load projects from backend when dashboard opens
+  useEffect(() => {
+    fetchProjects()
+  }, [])
+
+  async function fetchProjects() {
+    try {
+      const res = await fetch('http://localhost:3000/api/projects')
+      const data = await res.json()
+      setProjects(data)
+    } catch (err) {
+      console.error('Failed to load projects:', err)
+    }
   }
 
-  function handleDelete(index) {
-    setProjects(projects.filter((_, i) => i !== index))
+  async function handleCreateProject() {
+    if (projectName === '' || formUrl === '') {
+      setError('Project name and form URL are required')
+      return
+    }
+    if (!srdFile) {
+      setError('Please upload an SRD document')
+      return
+    }
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const formData = new FormData()
+      formData.append('name', projectName)
+      formData.append('form_url', formUrl)
+      formData.append('srd', srdFile)
+
+      const res = await fetch('http://localhost:3000/api/projects', {
+        method: 'POST',
+        body: formData
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error || 'Failed to create project')
+        return
+      }
+
+      await fetchProjects()
+      setProjectName('')
+      setFormUrl('')
+      setSrdFile(null)
+      setShowModal(false)
+
+    } catch (err) {
+      setError('Failed to create project')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleDelete(id) {
+    try {
+      await fetch(`http://localhost:3000/api/projects/${id}`, {
+        method: 'DELETE'
+      })
+      await fetchProjects()
+    } catch (err) {
+      console.error('Failed to delete project:', err)
+    }
   }
 
   const filters = ['All Projects', 'Not Tested', 'In Progress', 'Passed', 'Failed']
@@ -83,11 +139,11 @@ function Dashboard({ email, onLogout }) {
             </p>
           </div>
         ) : (
-          filteredProjects.map((project, index) => (
-            <div className="table-row" key={index}>
+          filteredProjects.map((project) => (
+            <div className="table-row" key={project.id}>
               <span>{project.name}</span>
-              <span className="url-cell">{project.url}</span>
-              <span>{project.lastTested}</span>
+              <span className="url-cell">{project.form_url}</span>
+              <span>{project.last_tested}</span>
               <span className={`status-badge ${project.status.toLowerCase().replace(' ', '-')}`}>
                 {project.status}
               </span>
@@ -95,7 +151,7 @@ function Dashboard({ email, onLogout }) {
                 <button className="run-btn">Run Test</button>
                 <button
                   className="delete-btn"
-                  onClick={() => handleDelete(index)}
+                  onClick={() => handleDelete(project.id)}
                 >
                   Delete
                 </button>
@@ -125,14 +181,23 @@ function Dashboard({ email, onLogout }) {
               onChange={(e) => setFormUrl(e.target.value)}
             />
             <label>Requirements Document</label>
-            <input type="file" accept=".pdf,.doc,.docx" />
+            <input
+              type="file"
+              accept=".pdf,.doc,.docx"
+              onChange={(e) => setSrdFile(e.target.files[0])}
+            />
+            {error && <p className="error-msg">{error}</p>}
             <div className="modal-buttons">
-              <button onClick={() => setShowModal(false)}>Cancel</button>
+              <button onClick={() => {
+                setShowModal(false)
+                setError('')
+              }}>Cancel</button>
               <button
                 className="submit-btn"
                 onClick={handleCreateProject}
+                disabled={loading}
               >
-                Create Project
+                {loading ? 'Creating...' : 'Create Project'}
               </button>
             </div>
           </div>
