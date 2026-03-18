@@ -1,5 +1,6 @@
 import './Dashboard.css'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
+import TestPanel from './TestPanel'
 
 function Dashboard({ email, onLogout }) {
   const [showModal, setShowModal] = useState(false)
@@ -10,10 +11,29 @@ function Dashboard({ email, onLogout }) {
   const [activeFilter, setActiveFilter] = useState('All Projects')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [selectedProject, setSelectedProject] = useState(null)
+  const [confirmDelete, setConfirmDelete] = useState(null)
+  const [editProject, setEditProject] = useState(null)
+  const [editName, setEditName] = useState('')
+  const [editUrl, setEditUrl] = useState('')
+  const [editSrd, setEditSrd] = useState(null)
+  const [editError, setEditError] = useState('')
+  const [editLoading, setEditLoading] = useState(false)
+  const [openMenu, setOpenMenu] = useState(null)
+  const menuRef = useRef(null)
 
-  // Load projects from backend when dashboard opens
   useEffect(() => {
     fetchProjects()
+  }, [])
+
+  useEffect(() => {
+    function handleClickOutside(e) {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        setOpenMenu(null)
+      }
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
 
   async function fetchProjects() {
@@ -21,8 +41,8 @@ function Dashboard({ email, onLogout }) {
       const res = await fetch('http://localhost:3000/api/projects')
       const data = await res.json()
       setProjects(data)
-    } catch (err) {
-      console.error('Failed to load projects:', err)
+    } catch {
+      console.error('Failed to load projects')
     }
   }
 
@@ -63,21 +83,66 @@ function Dashboard({ email, onLogout }) {
       setSrdFile(null)
       setShowModal(false)
 
-    } catch (err) {
+    } catch {
       setError('Failed to create project')
     } finally {
       setLoading(false)
     }
   }
 
+  function openEditModal(project) {
+    setEditProject(project)
+    setEditName(project.name)
+    setEditUrl(project.form_url)
+    setEditSrd(null)
+    setEditError('')
+    setOpenMenu(null)
+  }
+
+  async function handleEditProject() {
+    if (!editName || !editUrl) {
+      setEditError('Project name and form URL are required')
+      return
+    }
+
+    setEditLoading(true)
+    setEditError('')
+
+    try {
+      const formData = new FormData()
+      formData.append('name', editName)
+      formData.append('form_url', editUrl)
+      if (editSrd) formData.append('srd', editSrd)
+
+      const res = await fetch(`http://localhost:3000/api/projects/${editProject.id}`, {
+        method: 'PUT',
+        body: formData
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setEditError(data.error || 'Failed to update project')
+        return
+      }
+
+      await fetchProjects()
+      setEditProject(null)
+
+    } catch {
+      setEditError('Failed to update project')
+    } finally {
+      setEditLoading(false)
+    }
+  }
+
   async function handleDelete(id) {
     try {
-      await fetch(`http://localhost:3000/api/projects/${id}`, {
-        method: 'DELETE'
-      })
+      await fetch(`http://localhost:3000/api/projects/${id}`, { method: 'DELETE' })
       await fetchProjects()
-    } catch (err) {
-      console.error('Failed to delete project:', err)
+      setConfirmDelete(null)
+    } catch {
+      console.error('Failed to delete project')
     }
   }
 
@@ -102,10 +167,7 @@ function Dashboard({ email, onLogout }) {
 
         <div className="content-top">
           <h2>Projects</h2>
-          <button
-            className="new-project-btn"
-            onClick={() => setShowModal(true)}
-          >
+          <button className="new-project-btn" onClick={() => setShowModal(true)}>
             + New Project
           </button>
         </div>
@@ -148,13 +210,31 @@ function Dashboard({ email, onLogout }) {
                 {project.status}
               </span>
               <div className="action-buttons">
-                <button className="run-btn">Run Test</button>
                 <button
-                  className="delete-btn"
-                  onClick={() => handleDelete(project.id)}
+                  className="run-btn"
+                  onClick={() => setSelectedProject(project)}
                 >
-                  Delete
+                  View / Test
                 </button>
+                <div className="menu-wrapper" ref={openMenu === project.id ? menuRef : null}>
+                  <button
+                    className="menu-btn"
+                    onClick={() => setOpenMenu(openMenu === project.id ? null : project.id)}
+                  >
+                    ⋯
+                  </button>
+                  {openMenu === project.id && (
+                    <div className="dropdown-menu">
+                      <button onClick={() => openEditModal(project)}>Edit</button>
+                      <button
+                        className="dropdown-delete"
+                        onClick={() => { setConfirmDelete(project); setOpenMenu(null) }}
+                      >
+                         Delete
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           ))
@@ -162,6 +242,80 @@ function Dashboard({ email, onLogout }) {
 
       </div>
 
+      {selectedProject && (
+        <TestPanel
+          project={selectedProject}
+          onClose={() => {
+            setSelectedProject(null)
+            fetchProjects()
+          }}
+        />
+      )}
+
+      {/* Confirm delete modal */}
+      {confirmDelete && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Delete Project</h2>
+            <p style={{ color: '#444', fontSize: '14px', marginTop: '-8px' }}>
+              Are you sure you want to delete <strong>{confirmDelete.name}</strong>? This will also delete all its test cases and cannot be undone.
+            </p>
+            <div className="modal-buttons">
+              <button onClick={() => setConfirmDelete(null)}>Cancel</button>
+              <button
+                className="submit-btn"
+                style={{ background: 'red', borderColor: 'red' }}
+                onClick={() => handleDelete(confirmDelete.id)}
+              >
+                Yes, Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit project modal */}
+      {editProject && (
+        <div className="modal-overlay">
+          <div className="modal">
+            <h2>Edit Project</h2>
+            <label>Project Name</label>
+            <input
+              type="text"
+              value={editName}
+              onChange={e => setEditName(e.target.value)}
+              placeholder="Enter project name"
+            />
+            <label>Form URL</label>
+            <input
+              type="text"
+              value={editUrl}
+              onChange={e => setEditUrl(e.target.value)}
+              placeholder="https://example.com/form"
+            />
+            <label>Replace SRD Document</label>
+            <p className="srd-note">Your current SRD is saved. Only upload a new file if you want to replace it.</p>
+            <input
+              type="file"
+              accept=".pdf,.doc,.docx"
+              onChange={e => setEditSrd(e.target.files[0])}
+            />
+            {editError && <p className="error-msg">{editError}</p>}
+            <div className="modal-buttons">
+              <button onClick={() => setEditProject(null)}>Cancel</button>
+              <button
+                className="submit-btn"
+                onClick={handleEditProject}
+                disabled={editLoading}
+              >
+                {editLoading ? 'Saving...' : 'Save Changes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New project modal */}
       {showModal && (
         <div className="modal-overlay">
           <div className="modal">
@@ -188,10 +342,7 @@ function Dashboard({ email, onLogout }) {
             />
             {error && <p className="error-msg">{error}</p>}
             <div className="modal-buttons">
-              <button onClick={() => {
-                setShowModal(false)
-                setError('')
-              }}>Cancel</button>
+              <button onClick={() => { setShowModal(false); setError('') }}>Cancel</button>
               <button
                 className="submit-btn"
                 onClick={handleCreateProject}

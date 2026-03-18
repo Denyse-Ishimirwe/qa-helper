@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Registration Form</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: Arial, sans-serif;
+      background: #f4f6fb;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      padding: 40px 20px;
+    }
+
+    .form-container {
+      background: white;
+      padding: 40px;
+      border-radius: 12px;
+      width: 100%;
+      max-width: 520px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+    }
+
+    h1 {
+      color: #00448e;
+      font-size: 22px;
+      margin-bottom: 24px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 18px;
+    }
+
+    label {
+      font-size: 13px;
+      font-weight: bold;
+      color: #444;
+    }
+
+    input, select {
+      padding: 11px 14px;
+      border: 1.5px solid #ccc;
+      border-radius: 6px;
+      font-size: 14px;
+      outline: none;
+      font-family: Arial, sans-serif;
+    }
+
+    input:focus, select:focus {
+      border-color: #0063cf;
+    }
+
+    input.error, select.error {
+      border-color: red;
+    }
+
+    .error-msg {
+      color: red;
+      font-size: 12px;
+      display: none;
+    }
+
+    .error-msg.visible {
+      display: block;
+    }
+
+    button[type="submit"] {
+      width: 100%;
+      padding: 13px;
+      background: #0063cf;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 15px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-top: 8px;
+    }
+
+    button[type="submit"]:hover {
+      background: #004a9e;
+    }
+
+    .success-msg {
+      display: none;
+      background: #d4edda;
+      color: #155724;
+      padding: 14px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: bold;
+      text-align: center;
+      margin-top: 16px;
+    }
+
+    .success-msg.visible {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="form-container">
+    <h1>Registration Form</h1>
+
+    <div class="field">
+      <label for="firstName">First Name</label>
+      <input type="text" id="firstName" name="firstName" placeholder="Enter your first name" />
+      <span class="error-msg" id="firstNameError">First name is required</span>
+    </div>
+
+    <div class="field">
+      <label for="lastName">Last Name</label>
+      <input type="text" id="lastName" name="lastName" placeholder="Enter your last name" />
+      <span class="error-msg" id="lastNameError">Last name is required</span>
+    </div>
+
+    <div class="field">
+      <label for="dob">Date of Birth</label>
+      <input type="date" id="dob" name="dob" />
+      <span class="error-msg" id="dobError">Date of birth is required</span>
+    </div>
+
+    <div class="field">
+      <label for="gender">Gender</label>
+      <select id="gender" name="gender">
+        <option value="">Select gender</option>
+        <option value="male">Male</option>
+        <option value="female">Female</option>
+        <option value="other">Other</option>
+      </select>
+      <span class="error-msg" id="genderError">Please select a gender</span>
+    </div>
+
+    <div class="field">
+      <label for="nationality">Nationality</label>
+      <input type="text" id="nationality" name="nationality" placeholder="Enter your nationality" />
+      <span class="error-msg" id="nationalityError">Nationality is required</span>
+    </div>
+
+    <div class="field">
+      <label for="idNumber">ID Number</label>
+      <input type="text" id="idNumber" name="idNumber" placeholder="Enter your 16-digit national ID number" />
+      <span class="error-msg" id="idNumberError">ID number is required</span>
+      <span class="error-msg" id="idNumberFormatError">ID number must be 16 digits and start with 1 (e.g. 1199880012345678)</span>
+    </div>
+
+    <button type="submit" id="submitBtn">Submit</button>
+
+    <div class="success-msg" id="successMsg">
+      ✓ Form submitted successfully!
+    </div>
+  </div>
+
+  <script>
+    const fields = {
+      firstName:  { el: document.getElementById('firstName'),  error: document.getElementById('firstNameError') },
+      lastName:   { el: document.getElementById('lastName'),   error: document.getElementById('lastNameError') },
+      dob:        { el: document.getElementById('dob'),        error: document.getElementById('dobError') },
+      gender:     { el: document.getElementById('gender'),     error: document.getElementById('genderError') },
+      nationality:{ el: document.getElementById('nationality'),error: document.getElementById('nationalityError') },
+      idNumber:   { el: document.getElementById('idNumber'),   error: document.getElementById('idNumberError') },
+    }
+
+    const idFormatError = document.getElementById('idNumberFormatError')
+    const successMsg    = document.getElementById('successMsg')
+    const submitBtn     = document.getElementById('submitBtn')
+
+    submitBtn.addEventListener('click', () => {
+      let valid = true
+
+      // Reset all errors
+      Object.values(fields).forEach(f => {
+        f.el.classList.remove('error')
+        f.error.classList.remove('visible')
+      })
+      idFormatError.classList.remove('visible')
+      successMsg.classList.remove('visible')
+
+      // Validate required fields
+      Object.entries(fields).forEach(([key, f]) => {
+        if (!f.el.value.trim()) {
+          f.el.classList.add('error')
+          f.error.classList.add('visible')
+          valid = false
+        }
+      })
+
+      // Validate Rwandan ID number (16 digits starting with 1 or 2)
+      const idVal = fields.idNumber.el.value.trim()
+      if (idVal && !/^1\d{15}$/.test(idVal)) {
+        fields.idNumber.el.classList.add('error')
+        idFormatError.classList.add('visible')
+        valid = false
+      }
+
+      if (valid) {
+        successMsg.classList.add('visible')
+        // Reset form
+        Object.values(fields).forEach(f => f.el.value = '')
+        fields.gender.el.value = ''
+      }
+    })
+  </script>
+</body>
+</html>
