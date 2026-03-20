@@ -22,10 +22,13 @@ async function runTests(projectId) {
       let passed = false
       let notes = ''
 
-      const name = tc.name.toLowerCase()
+      const testTypeRaw = tc.test_type || 'required_field'
+      const testType = ['required_field', 'format_validation', 'successful_submit'].includes(testTypeRaw)
+        ? testTypeRaw
+        : 'required_field'
 
-      // --- Empty required field tests ---
-      if (name.includes('empty') || name.includes('required') || name.includes('blank')) {
+      // --- required_field tests ---
+      if (testType === 'required_field') {
         // Click submit without filling anything
         await page.click('#submitBtn')
         await page.waitForTimeout(500)
@@ -36,8 +39,8 @@ async function runTests(projectId) {
         notes = passed ? 'Error messages appeared correctly' : 'No error messages appeared'
       }
 
-      // --- ID format validation tests ---
-      else if (name.includes('id') && (name.includes('format') || name.includes('invalid') || name.includes('invalid id'))) {
+      // --- format_validation tests ---
+      else if (testType === 'format_validation') {
         await page.fill('#firstName', 'John')
         await page.fill('#lastName', 'Doe')
         await page.fill('#dob', '1990-01-01')
@@ -52,8 +55,8 @@ async function runTests(projectId) {
         notes = passed ? 'ID format error appeared correctly' : 'ID format error did not appear'
       }
 
-      // --- Successful submission tests ---
-      else if (name.includes('success') || name.includes('valid') || name.includes('submit') || name.includes('correct')) {
+      // --- successful_submit tests ---
+      else if (testType === 'successful_submit') {
         await page.fill('#firstName', 'John')
         await page.fill('#lastName', 'Doe')
         await page.fill('#dob', '1990-01-01')
@@ -68,13 +71,13 @@ async function runTests(projectId) {
         notes = passed ? 'Form submitted successfully' : 'Success message did not appear'
       }
 
-      // --- Fallback: try to detect errors or success generically ---
       else {
+        // Shouldn't happen due to validation above, but keep a safe fallback.
         await page.click('#submitBtn')
         await page.waitForTimeout(500)
         const errorVisible = await page.locator('.error-msg.visible').count()
         passed = errorVisible > 0
-        notes = passed ? 'Validation triggered' : 'Could not determine result - please review manually'
+        notes = passed ? 'Validation triggered' : 'Unknown test type - please review manually'
       }
 
       // Save result to database

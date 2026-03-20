@@ -107,11 +107,15 @@ app.post('/api/projects/:id/generate', async (req, res) => {
     const testCases = await generateTestCases(project.srd_text)
 
     const insertTestCase = db.prepare(
-      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result) VALUES (?, ?, ?, ?)'
+      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)'
     )
 
     for (const tc of testCases) {
-      insertTestCase.run(req.params.id, tc.name, tc.what_to_test, tc.expected_result)
+      const testType = ['required_field', 'format_validation', 'successful_submit'].includes(tc.test_type)
+        ? tc.test_type
+        : 'required_field'
+
+      insertTestCase.run(req.params.id, tc.name, tc.what_to_test, tc.expected_result, testType)
     }
 
     // Fix 1: Update project status to In Progress

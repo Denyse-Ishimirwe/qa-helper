@@ -15,6 +15,10 @@ async function generateTestCases(srdText) {
           - Test case name
           - What to test
           - Expected result
+          - Test type (must be exactly one of: required_field, format_validation, successful_submit)
+            - required_field: tests that an error appears when a required field is left empty
+            - format_validation: tests that an error appears when a field has wrong format
+            - successful_submit: tests that the form submits successfully when all fields are correct
 
           Requirements document:
           ${srdText}
@@ -24,7 +28,8 @@ async function generateTestCases(srdText) {
             {
               "name": "Test case name",
               "what_to_test": "What to test",
-              "expected_result": "Expected result"
+              "expected_result": "Expected result",
+              "test_type": "required_field"
             }
           ]
           Return only the JSON array, no other text.

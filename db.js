@@ -20,10 +20,18 @@ db.exec(`
     what_to_test TEXT NOT NULL,
     expected_result TEXT NOT NULL,
     status TEXT DEFAULT 'Not Run',
+    test_type TEXT DEFAULT 'required_field',
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (project_id) REFERENCES projects(id)
   );
 `)
+
+// Safe migration for existing databases: add test_type if missing.
+try {
+  db.exec(`ALTER TABLE test_cases ADD COLUMN test_type TEXT DEFAULT 'required_field'`)
+} catch {
+  // Column already exists — ignore
+}
 
 console.log('Database ready')
 
