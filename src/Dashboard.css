@@ -316,6 +316,22 @@
   border-color: #004a9e;
 }
 
+.modal textarea {
+  padding: 12px 16px;
+  border: 1.5px solid #0063cf;
+  border-radius: 6px;
+  font-size: 13px;
+  outline: none;
+  width: 100%;
+  resize: vertical;
+  min-height: 88px;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.modal textarea:focus {
+  border-color: #004a9e;
+}
+
 .modal-buttons {
   display: flex;
   justify-content: flex-end;

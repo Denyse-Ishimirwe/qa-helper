@@ -6,15 +6,16 @@ function TestPanel({ project, onClose }) {
   const [loading, setLoading] = useState(false)
   const [running, setRunning] = useState(false)
   const [editingId, setEditingId] = useState(null)
-  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '' })
+  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
   const [showAddForm, setShowAddForm] = useState(false)
-  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '' })
+  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
   const [addError, setAddError] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(null)
+  const [comparison, setComparison] = useState(null)
 
   const fetchTestCases = useCallback(async () => {
     try {
-      const res = await fetch(`http://localhost:3000/api/projects/${project.id}/test_cases`)
+      const res = await fetch(`/api/projects/${project.id}/test_cases`)
       const data = await res.json()
       setTestCases(Array.isArray(data) ? data : [])
     } catch (err) {
@@ -27,10 +28,29 @@ function TestPanel({ project, onClose }) {
     fetchTestCases()
   }, [fetchTestCases])
 
+  const fetchComparison = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/projects/${project.id}/runs/latest-comparison`)
+      if (!res.ok) {
+        setComparison(null)
+        return
+      }
+      const data = await res.json()
+      setComparison(data)
+    } catch (err) {
+      console.error('Failed to fetch run comparison:', err)
+      setComparison(null)
+    }
+  }, [project.id])
+
+  useEffect(() => {
+    fetchComparison()
+  }, [fetchComparison])
+
   async function handleGenerate() {
     setLoading(true)
     try {
-      const res = await fetch(`http://localhost:3000/api/projects/${project.id}/generate`, {
+      const res = await fetch(`/api/projects/${project.id}/generate`, {
         method: 'POST'
       })
       const data = await res.json()
@@ -49,7 +69,7 @@ function TestPanel({ project, onClose }) {
   async function handleRun() {
     setRunning(true)
     try {
-      const res = await fetch(`http://localhost:3000/api/projects/${project.id}/run`, {
+      const res = await fetch(`/api/projects/${project.id}/run`, {
         method: 'POST'
       })
       const data = await res.json()
@@ -58,6 +78,7 @@ function TestPanel({ project, onClose }) {
         return
       }
       await fetchTestCases()
+      await fetchComparison()
     } catch {
       alert('Failed to run tests')
     } finally {
@@ -67,12 +88,17 @@ function TestPanel({ project, onClose }) {
 
   function startEdit(tc) {
     setEditingId(tc.id)
-    setEditForm({ name: tc.name, what_to_test: tc.what_to_test, expected_result: tc.expected_result })
+    setEditForm({
+      name: tc.name,
+      what_to_test: tc.what_to_test,
+      expected_result: tc.expected_result,
+      test_type: tc.test_type || 'required_field'
+    })
   }
 
   async function handleSaveEdit(id) {
     try {
-      const res = await fetch(`http://localhost:3000/api/test_cases/${id}`, {
+      const res = await fetch(`/api/test_cases/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(editForm)
@@ -88,7 +114,7 @@ function TestPanel({ project, onClose }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`http://localhost:3000/api/test_cases/${id}`, { method: 'DELETE' })
+      await fetch(`/api/test_cases/${id}`, { method: 'DELETE' })
       setConfirmDelete(null)
       await fetchTestCases()
     } catch (err) {
@@ -102,13 +128,13 @@ function TestPanel({ project, onClose }) {
       return
     }
     try {
-      const res = await fetch(`http://localhost:3000/api/projects/${project.id}/test_cases`, {
+      const res = await fetch(`/api/projects/${project.id}/test_cases`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(newCase)
       })
       if (res.ok) {
-        setNewCase({ name: '', what_to_test: '', expected_result: '' })
+        setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
         setShowAddForm(false)
         setAddError('')
         await fetchTestCases()
@@ -121,6 +147,20 @@ function TestPanel({ project, onClose }) {
   const passed = testCases.filter(tc => tc.status === 'Passed').length
   const failed = testCases.filter(tc => tc.status === 'Failed').length
   const notRun = testCases.filter(tc => tc.status === 'Not Run').length
+  const canExportLatestRun = comparison?.current_run?.id
+
+  function downloadLatestRunReport() {
+    if (!canExportLatestRun) return
+    window.open(`/api/projects/${project.id}/runs/${comparison.current_run.id}/export.xlsx`, '_blank')
+  }
+
+  const groupDefinitions = [
+    { key: 'fixed', label: 'Fixed' },
+    { key: 'still_failing', label: 'Still Failing' },
+    { key: 'newly_broken', label: 'Newly Broken' },
+    { key: 'new_test_case', label: 'New Test Case' },
+    { key: 'removed_test_case', label: 'Removed Test Case' }
+  ]
 
   return (
     <>
@@ -168,6 +208,50 @@ function TestPanel({ project, onClose }) {
           </div>
         )}
 
+        {comparison && (
+          <div className="panel-comparison">
+            <p className="comparison-summary">
+              {comparison.summary_text}
+            </p>
+            <div className="comparison-counts">
+              <span className="comparison-pill comparison-fixed">Fixed: {comparison.counts?.fixed || 0}</span>
+              <span className="comparison-pill comparison-still">Still failing: {comparison.counts?.still_failing || 0}</span>
+              <span className="comparison-pill comparison-broken">Newly broken: {comparison.counts?.newly_broken || 0}</span>
+              <span className="comparison-pill comparison-new">New: {comparison.counts?.new_test_case || 0}</span>
+              <span className="comparison-pill comparison-removed">Removed: {comparison.counts?.removed_test_case || 0}</span>
+            </div>
+            <div className="comparison-actions">
+              <button
+                className="comparison-export-btn"
+                onClick={downloadLatestRunReport}
+                disabled={!canExportLatestRun}
+              >
+                Export Latest Run (Excel)
+              </button>
+            </div>
+            {comparison.previous_run && (
+              <div className="comparison-groups">
+                {groupDefinitions.map(group => {
+                  const items = comparison.groups?.[group.key] || []
+                  if (items.length === 0) return null
+                  return (
+                    <div className="comparison-group" key={group.key}>
+                      <p className="comparison-group-title">{group.label} ({items.length})</p>
+                      <ul className="comparison-group-list">
+                        {items.slice(0, 5).map(item => (
+                          <li key={`${group.key}-${item.id}-${item.test_case_id}`}>
+                            {item.snapshot_name || `Test case #${item.test_case_id}`}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
         {testCases.length > 0 && testCases.length < 5 && (
           <div className="panel-warning">
             ⚠ Only {testCases.length} test case{testCases.length !== 1 ? 's' : ''} — consider adding more manually.
@@ -212,6 +296,15 @@ function TestPanel({ project, onClose }) {
                       onChange={e => setEditForm({ ...editForm, expected_result: e.target.value })}
                       placeholder="Expected result"
                     />
+                    <select
+                      className="panel-input"
+                      value={editForm.test_type}
+                      onChange={e => setEditForm({ ...editForm, test_type: e.target.value })}
+                    >
+                      <option value="required_field">required_field</option>
+                      <option value="format_validation">format_validation</option>
+                      <option value="successful_submit">successful_submit</option>
+                    </select>
                     <div className="card-btns">
                       <button className="btn-save" onClick={() => handleSaveEdit(tc.id)}>Save</button>
                       <button className="btn-cancel" onClick={() => setEditingId(null)}>Cancel</button>
@@ -231,6 +324,10 @@ function TestPanel({ project, onClose }) {
                       </div>
                     </div>
                     <div className="card-body">
+                      <div className="card-field">
+                        <span className="field-label">Test type</span>
+                        <span className="field-value">{tc.test_type || 'required_field'}</span>
+                      </div>
                       <div className="card-field">
                         <span className="field-label">What to test</span>
                         <span className="field-value">{tc.what_to_test}</span>
@@ -274,9 +371,26 @@ function TestPanel({ project, onClose }) {
               value={newCase.expected_result}
               onChange={e => setNewCase({ ...newCase, expected_result: e.target.value })}
             />
+            <label>Test Type</label>
+            <select
+              className="panel-input"
+              value={newCase.test_type}
+              onChange={e => setNewCase({ ...newCase, test_type: e.target.value })}
+            >
+              <option value="required_field">required_field</option>
+              <option value="format_validation">format_validation</option>
+              <option value="successful_submit">successful_submit</option>
+            </select>
             {addError && <p className="panel-error">{addError}</p>}
             <div className="card-btns" style={{ marginTop: '12px' }}>
-              <button className="btn-cancel" onClick={() => { setShowAddForm(false); setAddError('') }}>Cancel</button>
+              <button className="btn-cancel" onClick={() => {
+                setShowAddForm(false)
+                setAddError('')
+                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+              }}
+              >
+                Cancel
+              </button>
               <button className="btn-save" onClick={handleAddCase}>Add</button>
             </div>
           </div>

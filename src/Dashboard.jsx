@@ -38,7 +38,7 @@ function Dashboard({ email, onLogout }) {
 
   async function fetchProjects() {
     try {
-      const res = await fetch('http://localhost:3000/api/projects')
+      const res = await fetch('/api/projects')
       const data = await res.json()
       setProjects(data)
     } catch {
@@ -65,7 +65,7 @@ function Dashboard({ email, onLogout }) {
       formData.append('form_url', formUrl)
       formData.append('srd', srdFile)
 
-      const res = await fetch('http://localhost:3000/api/projects', {
+      const res = await fetch('/api/projects', {
         method: 'POST',
         body: formData
       })
@@ -114,7 +114,7 @@ function Dashboard({ email, onLogout }) {
       formData.append('form_url', editUrl)
       if (editSrd) formData.append('srd', editSrd)
 
-      const res = await fetch(`http://localhost:3000/api/projects/${editProject.id}`, {
+      const res = await fetch(`/api/projects/${editProject.id}`, {
         method: 'PUT',
         body: formData
       })
@@ -138,7 +138,7 @@ function Dashboard({ email, onLogout }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`http://localhost:3000/api/projects/${id}`, { method: 'DELETE' })
+      await fetch(`/api/projects/${id}`, { method: 'DELETE' })
       await fetchProjects()
       setConfirmDelete(null)
     } catch {

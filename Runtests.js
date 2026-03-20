@@ -80,6 +80,12 @@ async function runTests(projectId) {
         notes = passed ? 'Validation triggered' : 'Unknown test type - please review manually'
       }
 
+      // QA verification helper: force a predictable fail for demo/UAT runs.
+      if ((tc.name || '').toUpperCase().includes('[FORCE_FAIL]')) {
+        passed = false
+        notes = 'Forced fail for QA verification'
+      }
+
       // Save result to database
       db.prepare(
         "UPDATE test_cases SET status = ? WHERE id = ?"
