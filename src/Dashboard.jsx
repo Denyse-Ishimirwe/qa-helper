@@ -2,7 +2,7 @@ import './Dashboard.css'
 import { useState, useEffect, useRef } from 'react'
 import TestPanel from './TestPanel'
 
-function Dashboard({ email, onLogout }) {
+function Dashboard({ email, token, onLogout }) {
   const [showModal, setShowModal] = useState(false)
   const [projects, setProjects] = useState([])
   const [projectName, setProjectName] = useState('')
@@ -21,6 +21,7 @@ function Dashboard({ email, onLogout }) {
   const [editLoading, setEditLoading] = useState(false)
   const [openMenu, setOpenMenu] = useState(null)
   const menuRef = useRef(null)
+  const [projectsLoadError, setProjectsLoadError] = useState('')
 
   useEffect(() => {
     fetchProjects()
@@ -38,11 +39,26 @@ function Dashboard({ email, onLogout }) {
 
   async function fetchProjects() {
     try {
-      const res = await fetch('/api/projects')
+      setProjectsLoadError('')
+  
+      const res = await fetch('/api/projects', {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+  
+      if (!res.ok) {
+        throw new Error(`Unable to load projects (HTTP ${res.status})`)
+      }
+  
       const data = await res.json()
+      if (!Array.isArray(data)) {
+        throw new Error('Unexpected response while loading projects')
+      }
+
       setProjects(data)
-    } catch {
-      console.error('Failed to load projects')
+    } catch (err) {
+      setProjects([])
+      setProjectsLoadError("We couldn't load your projects at the moment. Please refresh and try again.")
+      console.error('Failed to load projects:', err)
     }
   }
 
@@ -67,6 +83,7 @@ function Dashboard({ email, onLogout }) {
 
       const res = await fetch('/api/projects', {
         method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
         body: formData
       })
 
@@ -116,6 +133,7 @@ function Dashboard({ email, onLogout }) {
 
       const res = await fetch(`/api/projects/${editProject.id}`, {
         method: 'PUT',
+        headers: { Authorization: `Bearer ${token}` },
         body: formData
       })
 
@@ -138,7 +156,10 @@ function Dashboard({ email, onLogout }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`/api/projects/${id}`, { method: 'DELETE' })
+      await fetch(`/api/projects/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      })
       await fetchProjects()
       setConfirmDelete(null)
     } catch {
@@ -183,6 +204,11 @@ function Dashboard({ email, onLogout }) {
             </button>
           ))}
         </div>
+        {projectsLoadError && (
+          <div className="projects-load-error">
+            {projectsLoadError}
+          </div>
+        )}
 
         <div className="table-header">
           <span>Project Name</span>
@@ -245,6 +271,7 @@ function Dashboard({ email, onLogout }) {
       {selectedProject && (
         <TestPanel
           project={selectedProject}
+          token={token}
           onClose={() => {
             setSelectedProject(null)
             fetchProjects()

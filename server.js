@@ -1,28 +1,179 @@
 import express from 'express'
 import cors from 'cors'
+import 'dotenv/config'
 import db from './db.js'
 import upload from './multer.js'
 import extractText from './upload.js'
-import generateTestCases from './ai.js'
+import generateTestCases, { analyzeFormStructure } from './ai.js'
 import runTests from './Runtests.js'
 import XLSX from 'xlsx'
+import ExcelJS from 'exceljs'
+import bcrypt from 'bcrypt'
+import jwt from 'jsonwebtoken'
+import { chromium } from 'playwright'
+
 
 const app = express()
+const jwtSecret = process.env.JWT_SECRET
+
+if (!jwtSecret) {
+  throw new Error('JWT_SECRET is required. Add it to your .env file before starting the server.')
+}
+
+function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || ''
+    const [scheme, token] = authHeader.split(' ')
+
+    if (scheme !== 'Bearer' || !token) {
+      return res.status(401).json({ error: 'Missing or invalid Authorization header' })
+    }
+
+    const decoded = jwt.verify(
+      token,
+      jwtSecret
+    )
+
+    req.user = {
+      id: decoded.userId,
+      email: decoded.email
+    }
+
+    next()
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' })
+  }
+}
 
 app.use(cors())
 app.use(express.json())
 app.use(express.static('.'))
 
+async function resolveBestFormContext(page) {
+  const candidates = [page.mainFrame(), ...page.frames()]
+  let best = page.mainFrame()
+  let bestScore = -1
+
+  for (const frame of candidates) {
+    try {
+      const score = await frame.locator('input, select, textarea, button').count()
+      if (score > bestScore) {
+        bestScore = score
+        best = frame
+      }
+    } catch {}
+  }
+
+  return best
+}
+
+async function waitForPortalFormReady(page) {
+  const deadline = Date.now() + 20000
+  while (Date.now() < deadline) {
+    const context = await resolveBestFormContext(page)
+    const controls = await context.locator('input, select, textarea, button').count()
+    if (controls > 0) return context
+    await page.waitForTimeout(500)
+  }
+  return resolveBestFormContext(page)
+}
+
+function ensureProjectOwner(req, res) {
+  const project = db
+    .prepare('SELECT id, user_id FROM projects WHERE id = ?')
+    .get(req.params.id)
+
+  if (!project) {
+    res.status(404).json({ error: 'Project not found' })
+    return null
+  }
+
+  if (project.user_id !== req.user.id) {
+    res.status(403).json({ error: 'Forbidden' })
+    return null
+  }
+
+  return project
+}
+
+function ensureTestCaseOwner(req, res) {
+  const row = db.prepare(`
+    SELECT tc.id AS test_case_id, p.user_id
+    FROM test_cases tc
+    JOIN projects p ON p.id = tc.project_id
+    WHERE tc.id = ?
+  `).get(req.params.id)
+
+  if (!row) {
+    res.status(404).json({ error: 'Test case not found' })
+    return null
+  }
+
+  if (row.user_id !== req.user.id) {
+    res.status(403).json({ error: 'Forbidden' })
+    return null
+  }
+
+  return row
+}
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {}
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' })
+    }
+
+    const user = db
+      .prepare('SELECT id, email, password_hash FROM users WHERE email = ?')
+      .get(email)
+
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const passwordOk = await bcrypt.compare(password, user.password_hash)
+    if (!passwordOk) {
+      return res.status(401).json({ error: 'Invalid email or password' })
+    }
+
+    const token = jwt.sign(
+      { userId: user.id, email: user.email },
+      jwtSecret,
+      { expiresIn: '7d' }
+    )
+
+    return res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email
+      }
+    })
+  } catch (err) {
+    console.error('Login error:', err)
+    return res.status(500).json({ error: 'Login failed' })
+  }
+})
+
 app.get('/', (req, res) => {
   res.send('QA Helper API is running')
 })
 
-app.get('/api/projects', (req, res) => {
-  const projects = db.prepare('SELECT * FROM projects').all()
+app.get('/api/projects', requireAuth, (req, res) => {
+  const projects = db
+  .prepare(`
+    SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
+    FROM projects
+    WHERE user_id = ?
+    ORDER BY id DESC
+  `)
+  .all(req.user.id)
   res.json(projects)
 })
 
-app.post('/api/projects', upload.single('srd'), async (req, res) => {
+app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) => {
   try {
     const name = req.body?.name
     const form_url = req.body?.form_url
@@ -39,8 +190,8 @@ app.post('/api/projects', upload.single('srd'), async (req, res) => {
     console.log('Extracted text:', srdText)
 
     const result = db.prepare(
-      'INSERT INTO projects (name, form_url, srd_text) VALUES (?, ?, ?)'
-    ).run(name, form_url, srdText)
+      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)'
+    ).run(req.user.id, name, form_url, srdText)
 
     res.json({ success: true, id: result.lastInsertRowid })
 
@@ -51,8 +202,11 @@ app.post('/api/projects', upload.single('srd'), async (req, res) => {
 })
 
 // Edit a project (name, form_url, and optionally a new SRD)
-app.put('/api/projects/:id', upload.single('srd'), async (req, res) => {
+app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
     const { name, form_url } = req.body
 
     if (!name || !form_url) {
@@ -64,11 +218,11 @@ app.put('/api/projects/:id', upload.single('srd'), async (req, res) => {
       const srdText = await extractText(req.file.path)
       db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
       db.prepare(
-        "UPDATE projects SET name = ?, form_url = ?, srd_text = ?, status = 'Not Tested', last_tested = 'Never' WHERE id = ?"
+        "UPDATE projects SET name = ?, form_url = ?, srd_text = ?, form_structure = NULL, status = 'Not Tested', last_tested = 'Never' WHERE id = ?"
       ).run(name, form_url, srdText, req.params.id)
     } else {
       db.prepare(
-        'UPDATE projects SET name = ?, form_url = ? WHERE id = ?'
+        'UPDATE projects SET name = ?, form_url = ?, form_structure = NULL WHERE id = ?'
       ).run(name, form_url, req.params.id)
     }
 
@@ -80,7 +234,10 @@ app.put('/api/projects/:id', upload.single('srd'), async (req, res) => {
   }
 })
 
-app.delete('/api/projects/:id', (req, res) => {
+app.delete('/api/projects/:id', requireAuth, (req, res) => {
+  const ownedProject = ensureProjectOwner(req, res)
+  if (!ownedProject) return
+
   db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
   db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id)
   res.json({ success: true })
@@ -90,9 +247,16 @@ app.listen(3000, () => {
   console.log('Server running on port 3000')
 })
 
-app.post('/api/projects/:id/generate', async (req, res) => {
+app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
   try {
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id)
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const project = db.prepare(`
+      SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
+      FROM projects
+      WHERE id = ?
+    `).get(req.params.id)
 
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
@@ -105,7 +269,14 @@ app.post('/api/projects/:id/generate', async (req, res) => {
     // Fix 2: Delete old test cases before inserting new ones
     db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
 
-    const testCases = await generateTestCases(project.srd_text)
+    let formStructure = null
+    if (project.form_structure) {
+      try {
+        formStructure = JSON.parse(project.form_structure)
+      } catch {}
+    }
+
+    const testCases = await generateTestCases(project.srd_text, formStructure)
 
     const insertTestCase = db.prepare(
       'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)'
@@ -115,7 +286,6 @@ app.post('/api/projects/:id/generate', async (req, res) => {
       const testType = ['required_field', 'format_validation', 'successful_submit'].includes(tc.test_type)
         ? tc.test_type
         : 'required_field'
-
       insertTestCase.run(req.params.id, tc.name, tc.what_to_test, tc.expected_result, testType)
     }
 
@@ -128,20 +298,268 @@ app.post('/api/projects/:id/generate', async (req, res) => {
 
   } catch (err) {
     console.error(err)
+    if (String(err?.message || '').includes('AI service is temporarily unavailable')) {
+      return res.status(503).json({ error: err.message })
+    }
     res.status(500).json({ error: err.message })
   }
 })
 
-app.get('/api/projects/:id/test_cases', (req, res) => {
+app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
+  let browser
+  try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const project = db.prepare(`
+      SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
+      FROM projects
+      WHERE id = ?
+    `).get(req.params.id)
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' })
+    }
+
+    browser = await chromium.launch({ headless: false })
+    const page = await browser.newPage()
+
+    await page.goto(project.form_url, { waitUntil: 'domcontentloaded' })
+    const context = await waitForPortalFormReady(page)
+
+    const extracted = await context.evaluate(() => {
+      const getLabelText = (el) => {
+        const id = el.id
+        if (id) {
+          const byFor = document.querySelector(`label[for="${id}"]`)
+          if (byFor?.textContent?.trim()) return byFor.textContent.trim()
+        }
+        const wrappedLabel = el.closest('label')
+        if (wrappedLabel?.textContent?.trim()) return wrappedLabel.textContent.trim()
+        const aria = el.getAttribute('aria-label')
+        if (aria) return aria.trim()
+        return ''
+      }
+
+      const elements = Array.from(document.querySelectorAll('input, select, textarea, button'))
+      const fields = []
+      let submitButton = null
+
+      for (const el of elements) {
+        const tag = el.tagName.toLowerCase()
+        const inputType = String(el.getAttribute('type') || '').toLowerCase()
+        const isSubmit = (tag === 'button' && (inputType === '' || inputType === 'submit')) || inputType === 'submit'
+
+        const id = el.id || ''
+        const name = el.getAttribute('name') || ''
+        const placeholder = el.getAttribute('placeholder') || ''
+        const label = getLabelText(el)
+        const required = el.hasAttribute('required') || el.getAttribute('aria-required') === 'true'
+        const selector = id
+          ? `#${id}`
+          : name
+            ? `${tag}[name="${name.replace(/"/g, '\\"')}"]`
+            : ''
+
+        if (isSubmit && !submitButton) {
+          submitButton = { id, selector: selector || `${tag}[type="submit"]` }
+          continue
+        }
+
+        const interactive =
+          tag === 'textarea' ||
+          tag === 'select' ||
+          (tag === 'input' && !['hidden', 'submit', 'button', 'image', 'reset'].includes(inputType)) ||
+          (tag === 'button' && !isSubmit)
+
+        if (!interactive) continue
+
+        fields.push({
+          element: tag,
+          type: inputType || (tag === 'select' ? 'select' : tag),
+          id,
+          name,
+          placeholder,
+          label,
+          required,
+          selector
+        })
+      }
+
+      return { fields, submitButton }
+    })
+
+    const aiStructure = await analyzeFormStructure([
+      ...extracted.fields,
+      ...(extracted.submitButton ? [{ ...extracted.submitButton, type: 'submit' }] : [])
+    ])
+
+    const formStructure = {
+      fields: Array.isArray(aiStructure?.fields) ? aiStructure.fields : extracted.fields,
+      submitButton: aiStructure?.submitButton?.selector || aiStructure?.submitButton?.id
+        ? aiStructure.submitButton
+        : (extracted.submitButton || null)
+    }
+
+    db.prepare('UPDATE projects SET form_structure = ? WHERE id = ?')
+      .run(JSON.stringify(formStructure), req.params.id)
+
+    return res.json({
+      success: true,
+      form_structure: formStructure,
+      summary: `Found ${formStructure.fields.length} fields${formStructure.submitButton ? ' and a submit button' : ''}`
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: err.message || 'Failed to analyse form' })
+  } finally {
+    if (browser) await browser.close()
+  }
+})
+
+app.get('/api/projects/:id/test_cases', requireAuth, (req, res) => {
+  const ownedProject = ensureProjectOwner(req, res)
+  if (!ownedProject) return
+
   const testCases = db.prepare(
     'SELECT * FROM test_cases WHERE project_id = ?'
   ).all(req.params.id)
   res.json(testCases)
 })
 
-// Edit a test case
-app.put('/api/test_cases/:id', (req, res) => {
+app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const projectId = req.params.id
+    const project = db
+      .prepare('SELECT id, name FROM projects WHERE id = ?')
+      .get(projectId)
+
+    if (!project) {
+      return res.status(404).json({ error: 'Project not found' })
+    }
+
+    const testCases = db.prepare(`
+      SELECT name, what_to_test, expected_result, test_type, status
+      FROM test_cases
+      WHERE project_id = ?
+      ORDER BY id ASC
+    `).all(projectId)
+    const runsCountRow = db
+      .prepare('SELECT COUNT(*) AS total_runs FROM test_runs WHERE project_id = ?')
+      .get(projectId)
+    const totalRuns = Number(runsCountRow?.total_runs || 0)
+    const passedCount = testCases.filter(tc => tc.status === 'Passed').length
+    const failedCount = testCases.filter(tc => tc.status === 'Failed').length
+
+    const workbook = new ExcelJS.Workbook()
+    const worksheet = workbook.addWorksheet('Test Cases')
+
+    worksheet.mergeCells('A1:F1')
+    const titleCell = worksheet.getCell('A1')
+    titleCell.value = `${project.name || 'Project'} - Test Cases Report`
+    titleCell.font = {
+      name: 'Arial',
+      size: 16,
+      bold: true,
+      color: { argb: 'FF00448E' }
+    }
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' }
+
+    worksheet.mergeCells('A2:F2')
+    const statsCell = worksheet.getCell('A2')
+    statsCell.value = `Runs: ${totalRuns} | Passed: ${passedCount} | Failed: ${failedCount}`
+    statsCell.font = { name: 'Arial', size: 11, bold: true, color: { argb: 'FF1F2937' } }
+    statsCell.alignment = { horizontal: 'left', vertical: 'middle' }
+
+    const headerRow = worksheet.getRow(3)
+    headerRow.values = ['#', 'Test Case Name', 'What to Test', 'Expected Result', 'Type', 'Status']
+    headerRow.height = 22
+    headerRow.eachCell((cell) => {
+      cell.font = { name: 'Arial', bold: true, color: { argb: 'FFFFFFFF' } }
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF00448E' } }
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true }
+      cell.border = {
+        top: { style: 'thin' },
+        left: { style: 'thin' },
+        bottom: { style: 'thin' },
+        right: { style: 'thin' }
+      }
+    })
+
+    const toPlainType = (type) => {
+      if (type === 'required_field') return 'Required Field'
+      if (type === 'format_validation') return 'Format Validation'
+      if (type === 'successful_submit') return 'Successful Submit'
+      return 'Required Field'
+    }
+
+    for (let i = 0; i < testCases.length; i += 1) {
+      const tc = testCases[i]
+      const row = worksheet.addRow([
+        i + 1,
+        tc.name || '',
+        tc.what_to_test || '',
+        tc.expected_result || '',
+        toPlainType(tc.test_type),
+        tc.status || 'Not Run'
+      ])
+
+      row.eachCell((cell) => {
+        cell.font = { name: 'Arial', size: 11 }
+        cell.alignment = { vertical: 'top', horizontal: 'left', wrapText: true }
+        cell.border = {
+          top: { style: 'thin' },
+          left: { style: 'thin' },
+          bottom: { style: 'thin' },
+          right: { style: 'thin' }
+        }
+      })
+
+      const normalizedStatus = String(tc.status || '').toLowerCase()
+      if (normalizedStatus === 'passed') {
+        row.eachCell((cell) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE8F5E9' } }
+        })
+      } else if (normalizedStatus === 'failed') {
+        row.eachCell((cell) => {
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFEBEE' } }
+        })
+      }
+    }
+
+    worksheet.columns = [
+      { width: 6 },
+      { width: 32 },
+      { width: 42 },
+      { width: 42 },
+      { width: 22 },
+      { width: 14 }
+    ]
+
+    const safeProjectName = String(project.name || 'Project')
+      .replace(/[\\/:*?"<>|]/g, ' ')
+      .trim() || 'Project'
+    const fileName = `${safeProjectName} Test Cases.xlsx`
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
+
+    await workbook.xlsx.write(res)
+    res.end()
+  } catch (err) {
+    console.error(err)
+    res.status(500).json({ error: 'Failed to export test cases' })
+  }
+})
+
+// Edit a test case
+app.put('/api/test_cases/:id', requireAuth, (req, res) => {
+  try {
+    const ownedTestCase = ensureTestCaseOwner(req, res)
+    if (!ownedTestCase) return
+
     const { name, what_to_test, expected_result, test_type } = req.body
 
     if (!name || !what_to_test || !expected_result) {
@@ -151,7 +569,6 @@ app.put('/api/test_cases/:id', (req, res) => {
     const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
       ? test_type
       : 'required_field'
-
     db.prepare(
       'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ? WHERE id = ?'
     ).run(name, what_to_test, expected_result, safeTestType, req.params.id)
@@ -165,8 +582,11 @@ app.put('/api/test_cases/:id', (req, res) => {
 })
 
 // Delete a test case
-app.delete('/api/test_cases/:id', (req, res) => {
+app.delete('/api/test_cases/:id', requireAuth, (req, res) => {
   try {
+    const ownedTestCase = ensureTestCaseOwner(req, res)
+    if (!ownedTestCase) return
+
     db.prepare('DELETE FROM test_cases WHERE id = ?').run(req.params.id)
     res.json({ success: true, message: 'Test case deleted' })
   } catch (err) {
@@ -176,8 +596,11 @@ app.delete('/api/test_cases/:id', (req, res) => {
 })
 
 // Run tests with Playwright
-app.post('/api/projects/:id/run', async (req, res) => {
+app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
     const projectId = req.params.id
     const runStartedAt = new Date().toISOString()
 
@@ -233,8 +656,11 @@ app.post('/api/projects/:id/run', async (req, res) => {
   }
 })
 
-app.get('/api/projects/:id/runs/latest-comparison', (req, res) => {
+app.get('/api/projects/:id/runs/latest-comparison', requireAuth, (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
     const projectId = req.params.id
 
     const runs = db.prepare(
@@ -339,8 +765,11 @@ app.get('/api/projects/:id/runs/latest-comparison', (req, res) => {
   }
 })
 
-app.get('/api/projects/:id/runs/:runId/export.xlsx', (req, res) => {
+app.get('/api/projects/:id/runs/:runId/export.xlsx', requireAuth, (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
     const { id: projectId, runId } = req.params
     const run = db.prepare(
       'SELECT * FROM test_runs WHERE id = ? AND project_id = ?'
@@ -409,6 +838,7 @@ app.get('/api/projects/:id/runs/:runId/export.xlsx', (req, res) => {
       name: r.snapshot_name,
       what_to_test: r.snapshot_what_to_test,
       expected_result: r.snapshot_expected_result,
+      expected_outcome: r.snapshot_expected_outcome || 'should_pass',
       test_type: r.snapshot_test_type,
       created_at: r.created_at
     }))
@@ -431,8 +861,11 @@ app.get('/api/projects/:id/runs/:runId/export.xlsx', (req, res) => {
 })
 
 // Add a test case manually
-app.post('/api/projects/:id/test_cases', (req, res) => {
+app.post('/api/projects/:id/test_cases', requireAuth, (req, res) => {
   try {
+    const ownedProject = ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
     const { name, what_to_test, expected_result, test_type } = req.body
     const project_id = req.params.id
 
@@ -443,7 +876,6 @@ app.post('/api/projects/:id/test_cases', (req, res) => {
     const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
       ? test_type
       : 'required_field'
-
     const result = db.prepare(
       'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)'
     ).run(project_id, name, what_to_test, expected_result, safeTestType)

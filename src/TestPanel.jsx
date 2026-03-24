@@ -1,7 +1,7 @@
 import './TestPanel.css'
 import { useState, useEffect, useCallback } from 'react'
 
-function TestPanel({ project, onClose }) {
+function TestPanel({ project, token, onClose }) {
   const [testCases, setTestCases] = useState([])
   const [loading, setLoading] = useState(false)
   const [running, setRunning] = useState(false)
@@ -12,17 +12,22 @@ function TestPanel({ project, onClose }) {
   const [addError, setAddError] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [comparison, setComparison] = useState(null)
+  const [downloading, setDownloading] = useState(false)
+  const [analysing, setAnalysing] = useState(false)
+  const [analysisSummary, setAnalysisSummary] = useState('')
 
   const fetchTestCases = useCallback(async () => {
     try {
-      const res = await fetch(`/api/projects/${project.id}/test_cases`)
+      const res = await fetch(`/api/projects/${project.id}/test_cases`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
       const data = await res.json()
       setTestCases(Array.isArray(data) ? data : [])
     } catch (err) {
       console.error('Failed to fetch test cases:', err)
       setTestCases([])
     }
-  }, [project.id])
+  }, [project.id, token])
 
   useEffect(() => {
     fetchTestCases()
@@ -30,7 +35,9 @@ function TestPanel({ project, onClose }) {
 
   const fetchComparison = useCallback(async () => {
     try {
-      const res = await fetch(`/api/projects/${project.id}/runs/latest-comparison`)
+      const res = await fetch(`/api/projects/${project.id}/runs/latest-comparison`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
       if (!res.ok) {
         setComparison(null)
         return
@@ -41,17 +48,35 @@ function TestPanel({ project, onClose }) {
       console.error('Failed to fetch run comparison:', err)
       setComparison(null)
     }
-  }, [project.id])
+  }, [project.id, token])
 
   useEffect(() => {
     fetchComparison()
   }, [fetchComparison])
 
+  useEffect(() => {
+    if (project?.form_structure) {
+      try {
+        const parsed = JSON.parse(project.form_structure)
+        const fieldCount = Array.isArray(parsed?.fields) ? parsed.fields.length : 0
+        const hasSubmit = Boolean(parsed?.submitButton)
+        if (fieldCount > 0) {
+          setAnalysisSummary(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
+        }
+      } catch {
+        setAnalysisSummary('')
+      }
+    } else {
+      setAnalysisSummary('')
+    }
+  }, [project])
+
   async function handleGenerate() {
     setLoading(true)
     try {
       const res = await fetch(`/api/projects/${project.id}/generate`, {
-        method: 'POST'
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
       })
       const data = await res.json()
       if (!res.ok) {
@@ -66,11 +91,39 @@ function TestPanel({ project, onClose }) {
     }
   }
 
+  async function handleAnalyse() {
+    try {
+      setAnalysing(true)
+      const res = await fetch(`/api/projects/${project.id}/analyse`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        alert(data.error || 'Failed to analyse form')
+        return
+      }
+
+      if (data?.summary) {
+        setAnalysisSummary(data.summary)
+      } else {
+        const fieldCount = Array.isArray(data?.form_structure?.fields) ? data.form_structure.fields.length : 0
+        const hasSubmit = Boolean(data?.form_structure?.submitButton)
+        setAnalysisSummary(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
+      }
+    } catch {
+      alert('Failed to analyse form')
+    } finally {
+      setAnalysing(false)
+    }
+  }
+
   async function handleRun() {
     setRunning(true)
     try {
       const res = await fetch(`/api/projects/${project.id}/run`, {
-        method: 'POST'
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
       })
       const data = await res.json()
       if (!res.ok) {
@@ -100,7 +153,10 @@ function TestPanel({ project, onClose }) {
     try {
       const res = await fetch(`/api/test_cases/${id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
         body: JSON.stringify(editForm)
       })
       if (res.ok) {
@@ -114,7 +170,10 @@ function TestPanel({ project, onClose }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`/api/test_cases/${id}`, { method: 'DELETE' })
+      await fetch(`/api/test_cases/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` }
+      })
       setConfirmDelete(null)
       await fetchTestCases()
     } catch (err) {
@@ -130,7 +189,10 @@ function TestPanel({ project, onClose }) {
     try {
       const res = await fetch(`/api/projects/${project.id}/test_cases`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
         body: JSON.stringify(newCase)
       })
       if (res.ok) {
@@ -147,11 +209,35 @@ function TestPanel({ project, onClose }) {
   const passed = testCases.filter(tc => tc.status === 'Passed').length
   const failed = testCases.filter(tc => tc.status === 'Failed').length
   const notRun = testCases.filter(tc => tc.status === 'Not Run').length
-  const canExportLatestRun = comparison?.current_run?.id
+  const hasPreviousRun = Boolean(comparison?.previous_run)
 
-  function downloadLatestRunReport() {
-    if (!canExportLatestRun) return
-    window.open(`/api/projects/${project.id}/runs/${comparison.current_run.id}/export.xlsx`, '_blank')
+  async function downloadTestCasesReport() {
+    try {
+      setDownloading(true)
+      const res = await fetch(`/api/projects/${project.id}/export/testcases`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        alert(data.error || 'Failed to download test cases report')
+        return
+      }
+
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${project.name} Test Cases.xlsx`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch {
+      alert('Failed to download test cases report')
+    } finally {
+      setDownloading(false)
+    }
   }
 
   const groupDefinitions = [
@@ -181,9 +267,14 @@ function TestPanel({ project, onClose }) {
 
         <div className="panel-actions">
           {testCases.length === 0 ? (
-            <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading}>
-              {loading ? <><span className="btn-spinner" /> Generating...</> : '✦ Generate'}
-            </button>
+            <>
+              <button className="panel-regenerate-btn" onClick={handleAnalyse} disabled={analysing || loading}>
+                {analysing ? <><span className="btn-spinner" /> Analysing...</> : 'Analyse Form'}
+              </button>
+              <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading || analysing}>
+                {loading ? <><span className="btn-spinner" /> Generating...</> : '✦ Generate'}
+              </button>
+            </>
           ) : (
             <>
               <button className="panel-run-btn" onClick={handleRun} disabled={running || loading}>
@@ -195,9 +286,21 @@ function TestPanel({ project, onClose }) {
               <button className="panel-add-btn" onClick={() => setShowAddForm(true)} disabled={running}>
                 + Add
               </button>
+              <button
+                className="comparison-export-btn"
+                onClick={downloadTestCasesReport}
+                disabled={downloading || running || loading}
+                title="Download Test Cases"
+                aria-label="Download Test Cases"
+              >
+                {downloading ? 'Downloading...' : 'Download Test Cases'}
+              </button>
             </>
           )}
         </div>
+        {analysisSummary && (
+          <p className="panel-subtitle">{analysisSummary}</p>
+        )}
 
         {/* Results summary */}
         {testCases.length > 0 && (passed > 0 || failed > 0) && (
@@ -210,26 +313,23 @@ function TestPanel({ project, onClose }) {
 
         {comparison && (
           <div className="panel-comparison">
-            <p className="comparison-summary">
-              {comparison.summary_text}
-            </p>
-            <div className="comparison-counts">
-              <span className="comparison-pill comparison-fixed">Fixed: {comparison.counts?.fixed || 0}</span>
-              <span className="comparison-pill comparison-still">Still failing: {comparison.counts?.still_failing || 0}</span>
-              <span className="comparison-pill comparison-broken">Newly broken: {comparison.counts?.newly_broken || 0}</span>
-              <span className="comparison-pill comparison-new">New: {comparison.counts?.new_test_case || 0}</span>
-              <span className="comparison-pill comparison-removed">Removed: {comparison.counts?.removed_test_case || 0}</span>
+            <div className="comparison-header">
+              <p className="comparison-summary">
+                {hasPreviousRun
+                  ? 'Compared to previous run'
+                  : 'Run one more time to see a comparison with the previous run.'}
+              </p>
             </div>
-            <div className="comparison-actions">
-              <button
-                className="comparison-export-btn"
-                onClick={downloadLatestRunReport}
-                disabled={!canExportLatestRun}
-              >
-                Export Latest Run (Excel)
-              </button>
-            </div>
-            {comparison.previous_run && (
+            {hasPreviousRun && (
+              <div className="comparison-counts">
+                <span className="comparison-pill comparison-fixed">Fixed: {comparison.counts?.fixed || 0}</span>
+                <span className="comparison-pill comparison-still">Still failing: {comparison.counts?.still_failing || 0}</span>
+                <span className="comparison-pill comparison-broken">Newly broken: {comparison.counts?.newly_broken || 0}</span>
+                <span className="comparison-pill comparison-new">New: {comparison.counts?.new_test_case || 0}</span>
+                <span className="comparison-pill comparison-removed">Removed: {comparison.counts?.removed_test_case || 0}</span>
+              </div>
+            )}
+            {hasPreviousRun && (
               <div className="comparison-groups">
                 {groupDefinitions.map(group => {
                   const items = comparison.groups?.[group.key] || []
@@ -252,21 +352,9 @@ function TestPanel({ project, onClose }) {
           </div>
         )}
 
-        {testCases.length > 0 && testCases.length < 5 && (
-          <div className="panel-warning">
-            ⚠ Only {testCases.length} test case{testCases.length !== 1 ? 's' : ''} — consider adding more manually.
-          </div>
-        )}
-
         {(loading || running) && testCases.length === 0 && (
           <div className="panel-loading">
             <div className="panel-spinner" />
-          </div>
-        )}
-
-        {running && (
-          <div className="panel-running-msg">
-            🔄 Playwright is running your tests — a browser window will open automatically...
           </div>
         )}
 
@@ -336,6 +424,12 @@ function TestPanel({ project, onClose }) {
                         <span className="field-label">Expected result</span>
                         <span className="field-value">{tc.expected_result}</span>
                       </div>
+                      {tc.notes && (
+                        <div className="card-field">
+                          <span className="field-label">Run notes</span>
+                          <span className="field-value">{tc.notes}</span>
+                        </div>
+                      )}
                     </div>
                   </>
                 )}

@@ -7,8 +7,9 @@ function App() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [token, setToken] = useState('')
 
-  function handleLogin() {
+  async function handleLogin() {
     if (email === '' || password === '') {
       setError('Email and Password are required')
       return
@@ -17,15 +18,31 @@ function App() {
       setError('Please enter a valid email address')
       return
     }
-    setError('')
-    setLoggedIn(true)
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || 'Login failed')
+        return
+      }
+      setError('')
+      setToken(data.token || '')
+      setLoggedIn(true)
+    } catch {
+      setError('Login failed')
+    }
   }
 
   if (loggedIn) {
-    return <Dashboard email={email} onLogout={() => {
+    return <Dashboard email={email} token={token} onLogout={() => {
       setLoggedIn(false)
       setEmail('')
       setPassword('')
+      setToken('')
     }} />
   }
 

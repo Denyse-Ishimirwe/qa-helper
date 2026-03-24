@@ -681,32 +681,40 @@
 .summary-notrun { color: #888; }
 
 .panel-comparison {
-  margin: 10px 24px 0;
-  background: #f4f8ff;
-  border: 1px solid #d9e7ff;
-  border-radius: 6px;
-  padding: 10px 12px;
+  margin: 12px 24px 0;
+  background: #f8fbff;
+  border: 1px solid #dbe7f6;
+  border-radius: 10px;
+  padding: 12px;
   font-family: Arial, sans-serif;
+}
+
+.comparison-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .comparison-summary {
   margin: 0;
-  font-size: 12px;
-  color: #2d4d7a;
-  font-weight: bold;
+  font-size: 13px;
+  color: #2e4b6d;
+  font-weight: 600;
+  line-height: 1.4;
 }
 
 .comparison-counts {
   display: flex;
-  gap: 8px;
-  margin-top: 8px;
+  gap: 6px;
+  margin-top: 10px;
   flex-wrap: wrap;
 }
 
 .comparison-pill {
   font-size: 11px;
-  font-weight: bold;
-  padding: 4px 8px;
+  font-weight: 700;
+  padding: 5px 9px;
   border-radius: 12px;
 }
 
@@ -735,27 +743,24 @@
   color: #555;
 }
 
-.comparison-actions {
-  margin-top: 10px;
-}
-
 .comparison-export-btn {
-  border: 1px solid #1a4ea1;
-  background: #1a4ea1;
+  border: 1px solid #0d4aa2;
+  background: #0d4aa2;
   color: white;
   font-size: 12px;
-  font-weight: bold;
+  font-weight: 700;
   border-radius: 6px;
-  padding: 7px 10px;
+  padding: 8px 12px;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .comparison-export-btn:hover:not(:disabled) {
-  background: #123b7a;
+  background: #0a3a80;
 }
 
 .comparison-export-btn:disabled {
-  opacity: 0.6;
+  opacity: 0.5;
   cursor: not-allowed;
 }
 
@@ -789,18 +794,6 @@
 
 .comparison-group-list li {
   margin: 2px 0;
-}
-
-.panel-running-msg {
-  margin: 12px 24px 0;
-  background: #e8f0fe;
-  border: 1.5px solid #0063cf;
-  color: #0063cf;
-  padding: 10px 14px;
-  border-radius: 6px;
-  font-size: 12px;
-  font-weight: bold;
-  font-family: Arial, sans-serif;
 }
 
 .card-passed {
