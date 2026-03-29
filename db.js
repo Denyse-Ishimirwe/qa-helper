@@ -1,6 +1,17 @@
+import 'dotenv/config'
 import Database from 'better-sqlite3'
+import path from 'node:path'
+import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 
-const db = new Database('qahelper.db')
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const dbPath = process.env.DATABASE_PATH || path.join(__dirname, 'qahelper.db')
+const dbDir = path.dirname(dbPath)
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true })
+}
+
+const db = new Database(dbPath)
 
 db.exec(`
 

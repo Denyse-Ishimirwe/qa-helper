@@ -1,0 +1,33 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# Apply: Dashboard → New → Blueprint → connect this repo.
+#
+# Requires Starter (or higher) for persistent disk. For Free tier only:
+#   remove the entire `disk:` block and the DATABASE_PATH / UPLOADS_DIR lines
+#   (SQLite will reset on each deploy / spin-down).
+
+services:
+  - type: web
+    name: qa-helper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    region: oregon
+    branch: main
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_PATH
+        value: /data/qahelper.db
+      - key: UPLOADS_DIR
+        value: /data/uploads
+      - key: GROQ_API_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+    disk:
+      name: qahelper-data
+      mountPath: /data
+      sizeGB: 1

@@ -1,5 +1,8 @@
 import express from 'express'
 import cors from 'cors'
+import path from 'node:path'
+import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import 'dotenv/config'
 import db from './db.js'
 import upload from './multer.js'
@@ -13,11 +16,18 @@ import jwt from 'jsonwebtoken'
 import { chromium } from 'playwright'
 
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
 const app = express()
+const PORT = Number(process.env.PORT) || 3000
 const jwtSecret = process.env.JWT_SECRET
 
 if (!jwtSecret) {
   throw new Error('JWT_SECRET is required. Add it to your .env file before starting the server.')
+}
+
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1)
 }
 
 function requireAuth(req, res, next) {
@@ -45,9 +55,23 @@ function requireAuth(req, res, next) {
   }
 }
 
-app.use(cors())
+const corsOrigin = process.env.CORS_ORIGIN?.trim()
+if (corsOrigin) {
+  const origins = corsOrigin.split(',').map(s => s.trim()).filter(Boolean)
+  app.use(
+    cors({
+      origin: origins.length > 1 ? origins : origins[0],
+      credentials: true
+    })
+  )
+} else {
+  app.use(cors())
+}
 app.use(express.json())
-app.use(express.static('.'))
+
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ ok: true, time: new Date().toISOString() })
+})
 
 async function resolveBestFormContext(page) {
   const candidates = [page.mainFrame(), ...page.frames()]
@@ -241,10 +265,6 @@ app.delete('/api/projects/:id', requireAuth, (req, res) => {
   db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
   db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id)
   res.json({ success: true })
-})
-
-app.listen(3000, () => {
-  console.log('Server running on port 3000')
 })
 
 app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
@@ -886,4 +906,32 @@ app.post('/api/projects/:id/test_cases', requireAuth, (req, res) => {
     console.error(err)
     res.status(500).json({ error: err.message })
   }
+})
+
+const distDir = path.join(__dirname, 'dist')
+const distIndex = path.join(distDir, 'index.html')
+const testFormPath = path.join(__dirname, 'testform.html')
+
+if (fs.existsSync(distIndex)) {
+  app.use(express.static(distDir))
+  app.get('/testform.html', (req, res) => {
+    res.sendFile(testFormPath)
+  })
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api')) return next()
+    res.sendFile(distIndex, err => {
+      if (err) next(err)
+    })
+  })
+} else {
+  app.use(express.static('.'))
+  console.warn('No dist/index.html — run `npm run build` to serve the React app from this server (dev UI: npm run dev).')
+}
+
+const server = app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
+})
+server.on('error', err => {
+  console.error('Server failed to start:', err.message)
+  process.exit(1)
 })

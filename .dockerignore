@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.env
+.env.*
+!.env.example
+qahelper.db
+uploads
+test-results
+playwright-report
+playwright/.cache
+.cursor
+*.md
+CONTEXT.md
+plan.md

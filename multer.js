@@ -1,11 +1,12 @@
 import multer from 'multer'
 import path from 'path'
 import fs from 'fs'
+import { fileURLToPath } from 'url'
 
-// Create an 'uploads' folder if it doesn't already exist
-const uploadDir = 'uploads'
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const uploadDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads')
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir)
+  fs.mkdirSync(uploadDir, { recursive: true })
 }
 
 // Tell multer where to save files and what to name them
