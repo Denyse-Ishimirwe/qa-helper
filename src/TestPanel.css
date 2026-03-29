@@ -666,19 +666,24 @@
 }
 
 .panel-summary {
-  display: flex;
-  gap: 16px;
   padding: 12px 24px;
   background: #f9fbff;
   border-bottom: 1px solid #e8e8e8;
   font-family: Arial, sans-serif;
   font-size: 13px;
+}
+
+.summary-row.summary-counts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 18px;
   font-weight: bold;
 }
 
 .summary-passed { color: #155724; }
 .summary-failed { color: #721c24; }
-.summary-notrun { color: #888; }
+.summary-notrun { color: #666; }
 
 .panel-comparison {
   margin: 12px 24px 0;

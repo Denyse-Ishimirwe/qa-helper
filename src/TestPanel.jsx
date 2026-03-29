@@ -1,6 +1,14 @@
 import './TestPanel.css'
 import { useState, useEffect, useCallback } from 'react'
 
+/** Normalize API/DB status so UI counts match each card. */
+function normalizeTestStatus(status) {
+  const s = String(status || '').trim().toLowerCase()
+  if (s === 'passed') return 'Passed'
+  if (s === 'failed') return 'Failed'
+  return 'Not Run'
+}
+
 function TestPanel({ project, token, onClose }) {
   const [testCases, setTestCases] = useState([])
   const [loading, setLoading] = useState(false)
@@ -206,9 +214,9 @@ function TestPanel({ project, token, onClose }) {
     }
   }
 
-  const passed = testCases.filter(tc => tc.status === 'Passed').length
-  const failed = testCases.filter(tc => tc.status === 'Failed').length
-  const notRun = testCases.filter(tc => tc.status === 'Not Run').length
+  const passed = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Passed').length
+  const failed = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Failed').length
+  const notRun = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Not Run').length
   const hasPreviousRun = Boolean(comparison?.previous_run)
 
   async function downloadTestCasesReport() {
@@ -286,15 +294,6 @@ function TestPanel({ project, token, onClose }) {
               <button className="panel-add-btn" onClick={() => setShowAddForm(true)} disabled={running}>
                 + Add
               </button>
-              <button
-                className="comparison-export-btn"
-                onClick={downloadTestCasesReport}
-                disabled={downloading || running || loading}
-                title="Download Test Cases"
-                aria-label="Download Test Cases"
-              >
-                {downloading ? 'Downloading...' : 'Download Test Cases'}
-              </button>
             </>
           )}
         </div>
@@ -302,12 +301,13 @@ function TestPanel({ project, token, onClose }) {
           <p className="panel-subtitle">{analysisSummary}</p>
         )}
 
-        {/* Results summary */}
-        {testCases.length > 0 && (passed > 0 || failed > 0) && (
+        {testCases.length > 0 && (
           <div className="panel-summary">
-            <span className="summary-passed">✓ {passed} Passed</span>
-            <span className="summary-failed">✗ {failed} Failed</span>
-            {notRun > 0 && <span className="summary-notrun">— {notRun} Not Run</span>}
+            <div className="summary-row summary-counts">
+              <span className="summary-passed">✓ {passed} passed</span>
+              <span className="summary-failed">✗ {failed} failed</span>
+              <span className="summary-notrun">○ {notRun} not run</span>
+            </div>
           </div>
         )}
 
@@ -319,6 +319,17 @@ function TestPanel({ project, token, onClose }) {
                   ? 'Compared to previous run'
                   : 'Run one more time to see a comparison with the previous run.'}
               </p>
+              {testCases.length > 0 && (
+                <button
+                  className="comparison-export-btn"
+                  onClick={downloadTestCasesReport}
+                  disabled={downloading || running || loading}
+                  title="Download Test Cases"
+                  aria-label="Download Test Cases"
+                >
+                  {downloading ? 'Downloading...' : 'Download Test Cases'}
+                </button>
+              )}
             </div>
             {hasPreviousRun && (
               <div className="comparison-counts">
@@ -362,8 +373,15 @@ function TestPanel({ project, token, onClose }) {
           {testCases.length === 0 && !loading ? (
             <p className="panel-empty">No test cases yet. Click Generate to get started.</p>
           ) : (
-            testCases.map((tc, index) => (
-              <div className={`panel-card ${tc.status === 'Passed' ? 'card-passed' : tc.status === 'Failed' ? 'card-failed' : ''}`} key={tc.id}>
+            testCases.map((tc, index) => {
+              const st = normalizeTestStatus(tc.status)
+              return (
+              <div
+                className={`panel-card ${
+                  st === 'Passed' ? 'card-passed' : st === 'Failed' ? 'card-failed' : ''
+                }`}
+                key={tc.id}
+              >
                 {editingId === tc.id ? (
                   <div className="panel-edit-form">
                     <input
@@ -403,8 +421,12 @@ function TestPanel({ project, token, onClose }) {
                     <div className="card-top">
                       <span className="card-num">{index + 1}</span>
                       <span className="card-name">{tc.name}</span>
-                      <span className={`tc-status ${tc.status === 'Passed' ? 'tc-passed' : tc.status === 'Failed' ? 'tc-failed' : 'tc-notrun'}`}>
-                        {tc.status === 'Passed' ? '✓ Passed' : tc.status === 'Failed' ? '✗ Failed' : 'Not Run'}
+                      <span
+                        className={`tc-status ${
+                          st === 'Passed' ? 'tc-passed' : st === 'Failed' ? 'tc-failed' : 'tc-notrun'
+                        }`}
+                      >
+                        {st === 'Passed' ? '✓ Passed' : st === 'Failed' ? '✗ Failed' : 'Not Run'}
                       </span>
                       <div className="card-btns">
                         <button className="btn-edit" onClick={() => startEdit(tc)}>Edit</button>
@@ -434,7 +456,8 @@ function TestPanel({ project, token, onClose }) {
                   </>
                 )}
               </div>
-            ))
+            )
+            })
           )}
         </div>
 

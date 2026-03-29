@@ -80,8 +80,10 @@ try {
 } catch {}
 
 try {
-  db.exec(`ALTER TABLE test_cases ADD COLUMN notes TEXT`)
-} catch {}
+  db.exec(`ALTER TABLE test_cases ADD COLUMN notes TEXT DEFAULT ''`)
+} catch {
+  // already exists
+}
 
 try {
   db.exec(`ALTER TABLE projects ADD COLUMN user_id INTEGER`)

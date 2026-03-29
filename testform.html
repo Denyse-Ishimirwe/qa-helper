@@ -115,9 +115,8 @@
     <h1>Registration Form</h1>
 
     <div class="field">
-      <label for="firstName">First Name</label>
+      <label for="firstName">First Name <span style="font-weight: normal; color: #666;">(optional)</span></label>
       <input type="text" id="firstName" name="firstName" placeholder="Enter your first name" />
-      <span class="error-msg" id="firstNameError">First name is required</span>
     </div>
 
     <div class="field">
@@ -165,7 +164,6 @@
 
   <script>
     const fields = {
-      firstName:  { el: document.getElementById('firstName'),  error: document.getElementById('firstNameError') },
       lastName:   { el: document.getElementById('lastName'),   error: document.getElementById('lastNameError') },
       dob:        { el: document.getElementById('dob'),        error: document.getElementById('dobError') },
       gender:     { el: document.getElementById('gender'),     error: document.getElementById('genderError') },
