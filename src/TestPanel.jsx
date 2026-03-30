@@ -282,6 +282,9 @@ function TestPanel({ project, token, onClose }) {
               <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading || analysing}>
                 {loading ? <><span className="btn-spinner" /> Generating...</> : '✦ Generate'}
               </button>
+              <button className="panel-add-btn" type="button" onClick={() => setShowAddForm(true)} disabled={loading || analysing}>
+                + Add
+              </button>
             </>
           ) : (
             <>
@@ -307,6 +310,58 @@ function TestPanel({ project, token, onClose }) {
               <span className="summary-passed">✓ {passed} passed</span>
               <span className="summary-failed">✗ {failed} failed</span>
               <span className="summary-notrun">○ {notRun} not run</span>
+            </div>
+          </div>
+        )}
+
+        {showAddForm && (
+          <div className="panel-add-form">
+            <h3>Add Test Case</h3>
+            <label>Test Case Name</label>
+            <input
+              className="panel-input"
+              type="text"
+              placeholder="e.g. Empty first name field"
+              value={newCase.name}
+              onChange={e => setNewCase({ ...newCase, name: e.target.value })}
+            />
+            <label>What to Test</label>
+            <input
+              className="panel-input"
+              type="text"
+              placeholder="e.g. Leave first name blank and submit"
+              value={newCase.what_to_test}
+              onChange={e => setNewCase({ ...newCase, what_to_test: e.target.value })}
+            />
+            <label>Expected Result</label>
+            <input
+              className="panel-input"
+              type="text"
+              placeholder="e.g. Error message appears"
+              value={newCase.expected_result}
+              onChange={e => setNewCase({ ...newCase, expected_result: e.target.value })}
+            />
+            <label>Test Type</label>
+            <select
+              className="panel-input"
+              value={newCase.test_type}
+              onChange={e => setNewCase({ ...newCase, test_type: e.target.value })}
+            >
+              <option value="required_field">required_field</option>
+              <option value="format_validation">format_validation</option>
+              <option value="successful_submit">successful_submit</option>
+            </select>
+            {addError && <p className="panel-error">{addError}</p>}
+            <div className="card-btns" style={{ marginTop: '12px' }}>
+              <button className="btn-cancel" onClick={() => {
+                setShowAddForm(false)
+                setAddError('')
+                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+              }}
+              >
+                Cancel
+              </button>
+              <button className="btn-save" onClick={handleAddCase}>Add</button>
             </div>
           </div>
         )}
@@ -460,58 +515,6 @@ function TestPanel({ project, token, onClose }) {
             })
           )}
         </div>
-
-        {showAddForm && (
-          <div className="panel-add-form">
-            <h3>Add Test Case</h3>
-            <label>Test Case Name</label>
-            <input
-              className="panel-input"
-              type="text"
-              placeholder="e.g. Empty first name field"
-              value={newCase.name}
-              onChange={e => setNewCase({ ...newCase, name: e.target.value })}
-            />
-            <label>What to Test</label>
-            <input
-              className="panel-input"
-              type="text"
-              placeholder="e.g. Leave first name blank and submit"
-              value={newCase.what_to_test}
-              onChange={e => setNewCase({ ...newCase, what_to_test: e.target.value })}
-            />
-            <label>Expected Result</label>
-            <input
-              className="panel-input"
-              type="text"
-              placeholder="e.g. Error message appears"
-              value={newCase.expected_result}
-              onChange={e => setNewCase({ ...newCase, expected_result: e.target.value })}
-            />
-            <label>Test Type</label>
-            <select
-              className="panel-input"
-              value={newCase.test_type}
-              onChange={e => setNewCase({ ...newCase, test_type: e.target.value })}
-            >
-              <option value="required_field">required_field</option>
-              <option value="format_validation">format_validation</option>
-              <option value="successful_submit">successful_submit</option>
-            </select>
-            {addError && <p className="panel-error">{addError}</p>}
-            <div className="card-btns" style={{ marginTop: '12px' }}>
-              <button className="btn-cancel" onClick={() => {
-                setShowAddForm(false)
-                setAddError('')
-                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
-              }}
-              >
-                Cancel
-              </button>
-              <button className="btn-save" onClick={handleAddCase}>Add</button>
-            </div>
-          </div>
-        )}
 
       </div>
 
