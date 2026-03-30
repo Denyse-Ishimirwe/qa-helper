@@ -7,7 +7,7 @@
 - `GET /api/health` for uptime checks (Docker HEALTHCHECK uses it)
 - `Dockerfile` + `.dockerignore` (Node 22, Vite build, Playwright Chromium)
 - Production: `trust proxy` when `NODE_ENV=production`
-- Default DB file: `qahelper.db` next to `server.js` (or `DATABASE_PATH`)
+- Default DB: `qahelper.db` next to `server.js` locally; in **production**, if a folder **`/data`** exists (persistent disk), SQLite and uploads use **`/data/qahelper.db`** and **`/data/uploads`** automatically so projects survive redeploys (override with `DATABASE_PATH` / `UPLOADS_DIR` if needed).
 
 ---
 
@@ -42,8 +42,9 @@ Never commit `.env`; only set these in the host’s dashboard.
 
 SQLite and `uploads/` are **on disk**. Without a volume/disk, **data is lost** when the container redeploys.
 
-- Attach a **disk** / **volume** (e.g. mount `/data`).
-- Set `DATABASE_PATH=/data/qahelper.db` and `UPLOADS_DIR=/data/uploads`.
+- Attach a **disk** / **volume** mounted at **`/data`** (matches this repo’s defaults).
+- Set **`NODE_ENV=production`**. The app will then use **`/data/qahelper.db`** and **`/data/uploads`** automatically — you do not need `DATABASE_PATH` / `UPLOADS_DIR` unless you want a different layout.
+- If your host mounts storage elsewhere, set **`DATABASE_PATH`** and **`UPLOADS_DIR`** explicitly.
 
 ### 5. Smoke-test after deploy
 

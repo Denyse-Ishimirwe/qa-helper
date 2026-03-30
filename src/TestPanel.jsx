@@ -21,8 +21,7 @@ function TestPanel({ project, token, onClose }) {
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [comparison, setComparison] = useState(null)
   const [downloading, setDownloading] = useState(false)
-  const [analysing, setAnalysing] = useState(false)
-  const [analysisSummary, setAnalysisSummary] = useState('')
+  const [formStructureHint, setFormStructureHint] = useState('')
 
   const fetchTestCases = useCallback(async () => {
     try {
@@ -69,13 +68,15 @@ function TestPanel({ project, token, onClose }) {
         const fieldCount = Array.isArray(parsed?.fields) ? parsed.fields.length : 0
         const hasSubmit = Boolean(parsed?.submitButton)
         if (fieldCount > 0) {
-          setAnalysisSummary(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
+          setFormStructureHint(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
+        } else {
+          setFormStructureHint('')
         }
       } catch {
-        setAnalysisSummary('')
+        setFormStructureHint('')
       }
     } else {
-      setAnalysisSummary('')
+      setFormStructureHint('')
     }
   }, [project])
 
@@ -96,33 +97,6 @@ function TestPanel({ project, token, onClose }) {
       alert('Failed to generate test cases')
     } finally {
       setLoading(false)
-    }
-  }
-
-  async function handleAnalyse() {
-    try {
-      setAnalysing(true)
-      const res = await fetch(`/api/projects/${project.id}/analyse`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        alert(data.error || 'Failed to analyse form')
-        return
-      }
-
-      if (data?.summary) {
-        setAnalysisSummary(data.summary)
-      } else {
-        const fieldCount = Array.isArray(data?.form_structure?.fields) ? data.form_structure.fields.length : 0
-        const hasSubmit = Boolean(data?.form_structure?.submitButton)
-        setAnalysisSummary(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
-      }
-    } catch {
-      alert('Failed to analyse form')
-    } finally {
-      setAnalysing(false)
     }
   }
 
@@ -276,13 +250,10 @@ function TestPanel({ project, token, onClose }) {
         <div className="panel-actions">
           {testCases.length === 0 ? (
             <>
-              <button className="panel-regenerate-btn" onClick={handleAnalyse} disabled={analysing || loading}>
-                {analysing ? <><span className="btn-spinner" /> Analysing...</> : 'Analyse Form'}
-              </button>
-              <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading || analysing}>
+              <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading}>
                 {loading ? <><span className="btn-spinner" /> Generating...</> : '✦ Generate'}
               </button>
-              <button className="panel-add-btn" type="button" onClick={() => setShowAddForm(true)} disabled={loading || analysing}>
+              <button className="panel-add-btn" type="button" onClick={() => setShowAddForm(true)} disabled={loading}>
                 + Add
               </button>
             </>
@@ -300,8 +271,8 @@ function TestPanel({ project, token, onClose }) {
             </>
           )}
         </div>
-        {analysisSummary && (
-          <p className="panel-subtitle">{analysisSummary}</p>
+        {formStructureHint && (
+          <p className="panel-subtitle">{formStructureHint}</p>
         )}
 
         {testCases.length > 0 && (

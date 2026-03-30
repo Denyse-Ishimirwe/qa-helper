@@ -6,7 +6,21 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const dbPath = process.env.DATABASE_PATH || path.join(__dirname, 'qahelper.db')
+
+function resolveDatabasePath() {
+  if (process.env.DATABASE_PATH) {
+    return path.resolve(process.env.DATABASE_PATH)
+  }
+  const localDefault = path.join(__dirname, 'qahelper.db')
+  // Production + persistent disk (e.g. Render volume mounted at /data) keeps DB across deploys
+  const dataRoot = '/data'
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(dataRoot)) {
+    return path.join(dataRoot, 'qahelper.db')
+  }
+  return localDefault
+}
+
+const dbPath = resolveDatabasePath()
 const dbDir = path.dirname(dbPath)
 if (!fs.existsSync(dbDir)) {
   fs.mkdirSync(dbDir, { recursive: true })
@@ -185,6 +199,6 @@ try {
   ).run('QA_review_3@ymail.com', bcrypt.hashSync('Try@123', 10))
 } catch {}
 
-console.log('Database ready')
+console.log('Database ready at', dbPath)
 
 export default db

@@ -4,7 +4,20 @@ import fs from 'fs'
 import { fileURLToPath } from 'url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const uploadDir = process.env.UPLOADS_DIR || path.join(__dirname, 'uploads')
+
+function resolveUploadDir() {
+  if (process.env.UPLOADS_DIR) {
+    return path.resolve(process.env.UPLOADS_DIR)
+  }
+  const localDefault = path.join(__dirname, 'uploads')
+  const dataRoot = '/data'
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(dataRoot)) {
+    return path.join(dataRoot, 'uploads')
+  }
+  return localDefault
+}
+
+const uploadDir = resolveUploadDir()
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true })
 }
