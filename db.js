@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import Database from 'better-sqlite3'
+import bcrypt from 'bcrypt'
 import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -169,19 +170,19 @@ try {
 try {
   db.prepare(
     'INSERT INTO users (email, password_hash) VALUES (?, ?)'
-  ).run('QA_review_1@ymail.com', 'Try@123')
+  ).run('QA_review_1@ymail.com', bcrypt.hashSync('Try@123', 10))
 } catch {}
 
 try {
   db.prepare(
     'INSERT INTO users (email, password_hash) VALUES (?, ?)'
-  ).run('QA_review_2@ymail.com', 'Try@123')
+  ).run('QA_review_2@ymail.com', bcrypt.hashSync('Try@123', 10))
 } catch {}
 
 try {
   db.prepare(
     'INSERT INTO users (email, password_hash) VALUES (?, ?)'
-  ).run('QA_review_3@ymail.com', 'Try@123')
+  ).run('QA_review_3@ymail.com', bcrypt.hashSync('Try@123', 10))
 } catch {}
 
 console.log('Database ready')

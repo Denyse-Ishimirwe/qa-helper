@@ -157,7 +157,17 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' })
     }
 
-    const passwordOk = await bcrypt.compare(password, user.password_hash)
+    let passwordOk = await bcrypt.compare(password, user.password_hash).catch(() => false)
+
+    // Backward compatibility: old seed rows stored plain text values in password_hash.
+    // Allow one successful login and then upgrade the stored value to bcrypt.
+    const isLegacyPlain = user.password_hash === password
+    if (!passwordOk && isLegacyPlain) {
+      passwordOk = true
+      const upgradedHash = await bcrypt.hash(password, 10)
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgradedHash, user.id)
+    }
+
     if (!passwordOk) {
       return res.status(401).json({ error: 'Invalid email or password' })
     }
