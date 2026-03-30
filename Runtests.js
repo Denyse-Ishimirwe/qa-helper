@@ -1,5 +1,5 @@
-import { chromium } from 'playwright'
 import Groq from 'groq-sdk'
+import { launchChromiumBrowser } from './playwright-launch.js'
 import 'dotenv/config'
 import db from './db.js'
 
@@ -212,7 +212,7 @@ async function runTests(projectId) {
   if (!project) throw new Error('Project not found')
   if (testCases.length === 0) throw new Error('No test cases found')
 
-  const browser = await chromium.launch({ headless: false })
+  const browser = await launchChromiumBrowser()
   const page = await browser.newPage()
   const results = []
 

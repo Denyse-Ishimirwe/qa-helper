@@ -13,7 +13,7 @@ import XLSX from 'xlsx'
 import ExcelJS from 'exceljs'
 import bcrypt from 'bcrypt'
 import jwt from 'jsonwebtoken'
-import { chromium } from 'playwright'
+import { launchChromiumBrowser } from './playwright-launch.js'
 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -350,7 +350,7 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Project not found' })
     }
 
-    browser = await chromium.launch({ headless: false })
+    browser = await launchChromiumBrowser()
     const page = await browser.newPage()
 
     await page.goto(project.form_url, { waitUntil: 'domcontentloaded' })
