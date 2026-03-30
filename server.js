@@ -181,8 +181,8 @@ app.post('/api/auth/login', async (req, res) => {
   }
 })
 
-app.get('/', (req, res) => {
-  res.send('QA Helper API is running')
+app.get('/api', (req, res) => {
+  res.json({ ok: true, message: 'QA Helper API is running' })
 })
 
 app.get('/api/projects', requireAuth, (req, res) => {
