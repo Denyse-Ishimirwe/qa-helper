@@ -917,8 +917,12 @@ if (fs.existsSync(distIndex)) {
   app.get('/testform.html', (req, res) => {
     res.sendFile(testFormPath)
   })
-  app.get('*', (req, res, next) => {
+  // Express 5 / path-to-regexp: bare '*' is invalid; use middleware SPA fallback instead of app.get('*')
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next()
     if (req.path.startsWith('/api')) return next()
+    const ext = path.extname(req.path)
+    if (ext !== '' && ext !== '.html') return next()
     res.sendFile(distIndex, err => {
       if (err) next(err)
     })
