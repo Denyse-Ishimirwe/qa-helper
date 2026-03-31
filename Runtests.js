@@ -206,8 +206,8 @@ async function goToForm(page, url) {
 // ─── Main runner ──────────────────────────────────────────────────────────────
 
 async function runTests(projectId) {
-  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId)
-  const testCases = db.prepare('SELECT * FROM test_cases WHERE project_id = ?').all(projectId)
+  const project = await db.get('SELECT * FROM projects WHERE id = ?', projectId)
+  const testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', projectId)
 
   if (!project) throw new Error('Project not found')
   if (testCases.length === 0) throw new Error('No test cases found')
@@ -241,8 +241,7 @@ async function runTests(projectId) {
         if (!validation.valid) {
           const note = `Failed: invalid test case — ${validation.reason}`
           testLog(`RESULT: ✗ Failed — ${validation.reason}`)
-          db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-            .run('Failed', note, tc.id)
+          await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
           results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
           continue
         }
@@ -259,8 +258,7 @@ async function runTests(projectId) {
       if (!loaded) {
         const note = 'Failed: page did not load'
         testLog('RESULT: ✗ Failed — page did not load')
-        db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-          .run('Failed', note, tc.id)
+        await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
         results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
         continue
       }
@@ -281,8 +279,7 @@ async function runTests(projectId) {
         if (!targetField) {
           const note = 'Failed: could not identify which field this test is about. Please mention the field name clearly in "What to test".'
           testLog('RESULT: ✗ Failed — no field matched')
-          db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-            .run('Failed', note, tc.id)
+          await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
           results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
           continue
         }
@@ -290,8 +287,7 @@ async function runTests(projectId) {
         if (targetField.optional) {
           const note = `Failed: "${targetField.label}" is optional on this form — leaving it empty does not show a required error. Update the test case or mark a required field instead.`
           testLog('RESULT: ✗ Failed — field is optional on form')
-          db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-            .run('Failed', note, tc.id)
+          await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
           results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
           continue
         }
@@ -339,8 +335,7 @@ async function runTests(projectId) {
         if (!targetField) {
           const note = 'Failed: could not identify which field to test format validation on. Please mention the field name in "What to test".'
           testLog('RESULT: ✗ Failed — no field matched')
-          db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-            .run('Failed', note, tc.id)
+          await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
           results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
           continue
         }
@@ -348,8 +343,7 @@ async function runTests(projectId) {
         if (targetField.optional) {
           const note = `Failed: "${targetField.label}" is optional on this form — it has no required/format error element to assert. Pick a required field for format tests.`
           testLog('RESULT: ✗ Failed — optional field')
-          db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-            .run('Failed', note, tc.id)
+          await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
           results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
           continue
         }
@@ -366,8 +360,7 @@ async function runTests(projectId) {
             const note =
               "Failed: Date of Birth automation needs wording like \"under 18\" or \"minor\" in the test. Plain date inputs cannot use fake text, so the runner must use a minor's date and assert the age error."
             testLog('RESULT: ✗ Failed — DOB format test not actionable without under-18/minor wording')
-            db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-              .run('Failed', note, tc.id)
+            await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
             results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
             continue
           }
@@ -461,22 +454,24 @@ async function runTests(projectId) {
       else {
         const note = `Failed: unknown test type "${testType}".`
         testLog(`RESULT: ✗ Failed — ${note}`)
-        db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-          .run('Failed', note, tc.id)
+        await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
         results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
         continue
       }
 
       // Save result
-      db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-        .run(passed ? 'Passed' : 'Failed', notes, tc.id)
+      await db.run(
+        "UPDATE test_cases SET status = ?, notes = ? WHERE id = ?",
+        passed ? 'Passed' : 'Failed',
+        notes,
+        tc.id
+      )
       results.push({ id: tc.id, name: tc.name, passed, notes })
 
     } catch (err) {
       const note = `Failed: runtime error — ${String(err?.message || 'Unknown error')}`
       testLog(`RESULT: ✗ Failed — ${note}`)
-      db.prepare("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?")
-        .run('Failed', note, tc.id)
+      await db.run("UPDATE test_cases SET status = ?, notes = ? WHERE id = ?", 'Failed', note, tc.id)
       results.push({ id: tc.id, name: tc.name, passed: false, notes: note })
     }
 
@@ -489,9 +484,7 @@ async function runTests(projectId) {
   const anyFailed = results.some(r => !r.passed)
   const newStatus = allPassed ? 'Passed' : anyFailed ? 'Failed' : 'In Progress'
 
-  db.prepare(
-    "UPDATE projects SET status = ?, last_tested = datetime('now') WHERE id = ?"
-  ).run(newStatus, projectId)
+  await db.run("UPDATE projects SET status = ?, last_tested = datetime('now') WHERE id = ?", newStatus, projectId)
 
   return results
 }

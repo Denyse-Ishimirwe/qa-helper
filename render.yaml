@@ -1,9 +1,11 @@
 # Render Blueprint: https://render.com/docs/blueprint-spec
 # Apply: Dashboard → New → Blueprint → connect this repo.
 #
-# Requires Starter (or higher) for persistent disk. For Free tier only:
-#   remove the entire `disk:` block and the DATABASE_PATH / UPLOADS_DIR lines
-#   (SQLite will reset on each deploy / spin-down).
+# Persistence: set LIBSQL_URL + LIBSQL_AUTH_TOKEN (Turso — free tier friendly, no disk needed).
+# Or use Starter+ disk below for SQLite files. Do not rely on both for the same data.
+#
+# Free tier without disk: remove `disk:`, remove DATABASE_PATH / UPLOADS_DIR, set plan: free,
+# and add Turso env vars in the dashboard.
 
 services:
   - type: web
@@ -26,6 +28,10 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: CORS_ORIGIN
+        sync: false
+      - key: LIBSQL_URL
+        sync: false
+      - key: LIBSQL_AUTH_TOKEN
         sync: false
     disk:
       name: qahelper-data

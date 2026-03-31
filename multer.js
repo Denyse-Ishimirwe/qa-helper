@@ -10,11 +10,19 @@ function resolveUploadDir() {
     return path.resolve(process.env.UPLOADS_DIR)
   }
   const localDefault = path.join(__dirname, 'uploads')
-  const dataRoot = '/data'
-  if (process.env.NODE_ENV === 'production' && fs.existsSync(dataRoot)) {
-    return path.join(dataRoot, 'uploads')
+  if (process.env.NODE_ENV !== 'production') {
+    return localDefault
   }
-  return localDefault
+  const dataRoot = '/data'
+  try {
+    if (!fs.existsSync(dataRoot)) {
+      fs.mkdirSync(dataRoot, { recursive: true })
+    }
+    return path.join(dataRoot, 'uploads')
+  } catch (err) {
+    console.error('Could not use /data/uploads, falling back to app directory:', err?.message || err)
+    return localDefault
+  }
 }
 
 const uploadDir = resolveUploadDir()
