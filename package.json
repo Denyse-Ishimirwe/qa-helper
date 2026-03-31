@@ -12,10 +12,12 @@
     "lint": "eslint .",
     "preview": "vite preview",
     "start": "node server.js",
-    "prod": "npm run build && node server.js"
+    "prod": "npm run build && node server.js",
+    "migrate:test-run-results-legacy": "node scripts/migrate-test-run-results-legacy.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
+    "@libsql/client": "^0.17.2",
     "bcrypt": "^6.0.0",
     "better-sqlite3": "^12.8.0",
     "cors": "^2.8.6",
