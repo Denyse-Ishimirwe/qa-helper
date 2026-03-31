@@ -160,16 +160,18 @@ function migrateTestRunResultsSqlite(db) {
 }
 
 async function seedUsersTurso() {
-  const countResult = await _turso.execute('SELECT COUNT(*) AS total FROM users')
-  const usersCount = Number(rowFromResultSet(countResult, 0)?.total || 0)
-  if (usersCount > 0) return
-
   const seeds = [
     ['QA_review_1@ymail.com', bcrypt.hashSync('Try@123', 10)],
     ['QA_review_2@ymail.com', bcrypt.hashSync('Try@123', 10)],
     ['QA_review_3@ymail.com', bcrypt.hashSync('Try@123', 10)]
   ]
   for (const [email, hash] of seeds) {
+    const existing = await _turso.execute({
+      sql: 'SELECT id FROM users WHERE email = ? LIMIT 1',
+      args: [email]
+    })
+    if (rowFromResultSet(existing, 0)) continue
+
     await _turso.execute({
       sql: 'INSERT INTO users (email, password_hash) VALUES (?, ?)',
       args: [email, hash]
@@ -269,13 +271,13 @@ async function initSqlite() {
 
   migrateTestRunResultsSqlite(_sqlite)
 
-  const usersCount = Number(_sqlite.prepare('SELECT COUNT(*) AS total FROM users').get()?.total || 0)
-  if (usersCount === 0) {
-    for (const [email, hash] of [
-      ['QA_review_1@ymail.com', bcrypt.hashSync('Try@123', 10)],
-      ['QA_review_2@ymail.com', bcrypt.hashSync('Try@123', 10)],
-      ['QA_review_3@ymail.com', bcrypt.hashSync('Try@123', 10)]
-    ]) {
+  for (const [email, hash] of [
+    ['QA_review_1@ymail.com', bcrypt.hashSync('Try@123', 10)],
+    ['QA_review_2@ymail.com', bcrypt.hashSync('Try@123', 10)],
+    ['QA_review_3@ymail.com', bcrypt.hashSync('Try@123', 10)]
+  ]) {
+    const existing = _sqlite.prepare('SELECT id FROM users WHERE email = ? LIMIT 1').get(email)
+    if (!existing) {
       _sqlite.prepare('INSERT INTO users (email, password_hash) VALUES (?, ?)').run(email, hash)
     }
   }
