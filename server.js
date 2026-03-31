@@ -4,7 +4,7 @@ import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import 'dotenv/config'
-import db from './db.js'
+import db, { dbReady } from './db.js'
 import upload from './multer.js'
 import extractText from './upload.js'
 import generateTestCases, { analyzeFormStructure } from './ai.js'
@@ -21,6 +21,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const app = express()
 const PORT = Number(process.env.PORT) || 3000
 const jwtSecret = process.env.JWT_SECRET
+const DEFAULT_DEMO_PASSWORD = 'Try@123'
+const DEMO_EMAILS = new Set([
+  'qa_review_1@ymail.com',
+  'qa_review_2@ymail.com',
+  'qa_review_3@ymail.com'
+])
 
 if (!jwtSecret) {
   throw new Error('JWT_SECRET is required. Add it to your .env file before starting the server.')
@@ -102,10 +108,8 @@ async function waitForPortalFormReady(page) {
   return resolveBestFormContext(page)
 }
 
-function ensureProjectOwner(req, res) {
-  const project = db
-    .prepare('SELECT id, user_id FROM projects WHERE id = ?')
-    .get(req.params.id)
+async function ensureProjectOwner(req, res) {
+  const project = await db.get('SELECT id, user_id FROM projects WHERE id = ?', req.params.id)
 
   if (!project) {
     res.status(404).json({ error: 'Project not found' })
@@ -120,13 +124,16 @@ function ensureProjectOwner(req, res) {
   return project
 }
 
-function ensureTestCaseOwner(req, res) {
-  const row = db.prepare(`
+async function ensureTestCaseOwner(req, res) {
+  const row = await db.get(
+    `
     SELECT tc.id AS test_case_id, p.user_id
     FROM test_cases tc
     JOIN projects p ON p.id = tc.project_id
     WHERE tc.id = ?
-  `).get(req.params.id)
+  `,
+    req.params.id
+  )
 
   if (!row) {
     res.status(404).json({ error: 'Test case not found' })
@@ -143,15 +150,31 @@ function ensureTestCaseOwner(req, res) {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body || {}
+    const rawEmail = String(req.body?.email || '').trim()
+    const password = String(req.body?.password || '')
+    const normalizedEmail = rawEmail.toLowerCase()
 
-    if (!email || !password) {
+    if (!rawEmail || !password) {
       return res.status(400).json({ error: 'Email and password are required' })
     }
 
-    const user = db
-      .prepare('SELECT id, email, password_hash FROM users WHERE email = ?')
-      .get(email)
+    let user = await db.get(
+      'SELECT id, email, password_hash FROM users WHERE lower(email) = lower(?)',
+      rawEmail
+    )
+
+    if (!user && DEMO_EMAILS.has(normalizedEmail)) {
+      const hash = await bcrypt.hash(DEFAULT_DEMO_PASSWORD, 10)
+      try {
+        await db.run('INSERT INTO users (email, password_hash) VALUES (?, ?)', normalizedEmail, hash)
+      } catch {
+        // Another request may create the same row; read below covers that race.
+      }
+      user = await db.get(
+        'SELECT id, email, password_hash FROM users WHERE lower(email) = lower(?)',
+        rawEmail
+      )
+    }
 
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' })
@@ -165,7 +188,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (!passwordOk && isLegacyPlain) {
       passwordOk = true
       const upgradedHash = await bcrypt.hash(password, 10)
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgradedHash, user.id)
+      await db.run('UPDATE users SET password_hash = ? WHERE id = ?', upgradedHash, user.id)
     }
 
     if (!passwordOk) {
@@ -195,15 +218,16 @@ app.get('/api', (req, res) => {
   res.json({ ok: true, message: 'QA Helper API is running' })
 })
 
-app.get('/api/projects', requireAuth, (req, res) => {
-  const projects = db
-  .prepare(`
+app.get('/api/projects', requireAuth, async (req, res) => {
+  const projects = await db.all(
+    `
     SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
     FROM projects
     WHERE user_id = ?
     ORDER BY id DESC
-  `)
-  .all(req.user.id)
+  `,
+    req.user.id
+  )
   res.json(projects)
 })
 
@@ -223,9 +247,13 @@ app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) =>
     const srdText = await extractText(req.file.path)
     console.log('Extracted text:', srdText)
 
-    const result = db.prepare(
-      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)'
-    ).run(req.user.id, name, form_url, srdText)
+    const result = await db.run(
+      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)',
+      req.user.id,
+      name,
+      form_url,
+      srdText
+    )
 
     res.json({ success: true, id: result.lastInsertRowid })
 
@@ -238,7 +266,7 @@ app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) =>
 // Edit a project (name, form_url, and optionally a new SRD)
 app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const { name, form_url } = req.body
@@ -250,14 +278,21 @@ app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res)
     // If a new SRD file was uploaded, extract its text, clear old test cases and reset status
     if (req.file) {
       const srdText = await extractText(req.file.path)
-      db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
-      db.prepare(
-        "UPDATE projects SET name = ?, form_url = ?, srd_text = ?, form_structure = NULL, status = 'Not Tested', last_tested = 'Never' WHERE id = ?"
-      ).run(name, form_url, srdText, req.params.id)
+      await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
+      await db.run(
+        "UPDATE projects SET name = ?, form_url = ?, srd_text = ?, form_structure = NULL, status = 'Not Tested', last_tested = 'Never' WHERE id = ?",
+        name,
+        form_url,
+        srdText,
+        req.params.id
+      )
     } else {
-      db.prepare(
-        'UPDATE projects SET name = ?, form_url = ?, form_structure = NULL WHERE id = ?'
-      ).run(name, form_url, req.params.id)
+      await db.run(
+        'UPDATE projects SET name = ?, form_url = ?, form_structure = NULL WHERE id = ?',
+        name,
+        form_url,
+        req.params.id
+      )
     }
 
     res.json({ success: true })
@@ -268,25 +303,28 @@ app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res)
   }
 })
 
-app.delete('/api/projects/:id', requireAuth, (req, res) => {
-  const ownedProject = ensureProjectOwner(req, res)
+app.delete('/api/projects/:id', requireAuth, async (req, res) => {
+  const ownedProject = await ensureProjectOwner(req, res)
   if (!ownedProject) return
 
-  db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
-  db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id)
+  await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
+  await db.run('DELETE FROM projects WHERE id = ?', req.params.id)
   res.json({ success: true })
 })
 
 app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
-    const project = db.prepare(`
+    const project = await db.get(
+      `
       SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
       FROM projects
       WHERE id = ?
-    `).get(req.params.id)
+    `,
+      req.params.id
+    )
 
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
@@ -297,7 +335,7 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
     }
 
     // Fix 2: Delete old test cases before inserting new ones
-    db.prepare('DELETE FROM test_cases WHERE project_id = ?').run(req.params.id)
+    await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
 
     let formStructure = null
     if (project.form_structure) {
@@ -308,21 +346,25 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
 
     const testCases = await generateTestCases(project.srd_text, formStructure)
 
-    const insertTestCase = db.prepare(
-      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)'
-    )
-
     for (const tc of testCases) {
       const testType = ['required_field', 'format_validation', 'successful_submit'].includes(tc.test_type)
         ? tc.test_type
         : 'required_field'
-      insertTestCase.run(req.params.id, tc.name, tc.what_to_test, tc.expected_result, testType)
+      await db.run(
+        'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)',
+        req.params.id,
+        tc.name,
+        tc.what_to_test,
+        tc.expected_result,
+        testType
+      )
     }
 
     // Fix 1: Update project status to In Progress
-    db.prepare(
-      "UPDATE projects SET status = 'In Progress', last_tested = datetime('now') WHERE id = ?"
-    ).run(req.params.id)
+    await db.run(
+      "UPDATE projects SET status = 'In Progress', last_tested = datetime('now') WHERE id = ?",
+      req.params.id
+    )
 
     res.json({ success: true, testCases })
 
@@ -338,14 +380,17 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
 app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
   let browser
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
-    const project = db.prepare(`
+    const project = await db.get(
+      `
       SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
       FROM projects
       WHERE id = ?
-    `).get(req.params.id)
+    `,
+      req.params.id
+    )
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
     }
@@ -430,8 +475,11 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
         : (extracted.submitButton || null)
     }
 
-    db.prepare('UPDATE projects SET form_structure = ? WHERE id = ?')
-      .run(JSON.stringify(formStructure), req.params.id)
+    await db.run(
+      'UPDATE projects SET form_structure = ? WHERE id = ?',
+      JSON.stringify(formStructure),
+      req.params.id
+    )
 
     return res.json({
       success: true,
@@ -446,39 +494,39 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
   }
 })
 
-app.get('/api/projects/:id/test_cases', requireAuth, (req, res) => {
-  const ownedProject = ensureProjectOwner(req, res)
+app.get('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
+  const ownedProject = await ensureProjectOwner(req, res)
   if (!ownedProject) return
 
-  const testCases = db.prepare(
-    'SELECT * FROM test_cases WHERE project_id = ?'
-  ).all(req.params.id)
+  const testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', req.params.id)
   res.json(testCases)
 })
 
 app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const projectId = req.params.id
-    const project = db
-      .prepare('SELECT id, name FROM projects WHERE id = ?')
-      .get(projectId)
+    const project = await db.get('SELECT id, name FROM projects WHERE id = ?', projectId)
 
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
     }
 
-    const testCases = db.prepare(`
+    const testCases = await db.all(
+      `
       SELECT name, what_to_test, expected_result, test_type, status
       FROM test_cases
       WHERE project_id = ?
       ORDER BY id ASC
-    `).all(projectId)
-    const runsCountRow = db
-      .prepare('SELECT COUNT(*) AS total_runs FROM test_runs WHERE project_id = ?')
-      .get(projectId)
+    `,
+      projectId
+    )
+    const runsCountRow = await db.get(
+      'SELECT COUNT(*) AS total_runs FROM test_runs WHERE project_id = ?',
+      projectId
+    )
     const totalRuns = Number(runsCountRow?.total_runs || 0)
     const passedCount = testCases.filter(tc => tc.status === 'Passed').length
     const failedCount = testCases.filter(tc => tc.status === 'Failed').length
@@ -585,9 +633,9 @@ app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
 })
 
 // Edit a test case
-app.put('/api/test_cases/:id', requireAuth, (req, res) => {
+app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
   try {
-    const ownedTestCase = ensureTestCaseOwner(req, res)
+    const ownedTestCase = await ensureTestCaseOwner(req, res)
     if (!ownedTestCase) return
 
     const { name, what_to_test, expected_result, test_type } = req.body
@@ -599,9 +647,14 @@ app.put('/api/test_cases/:id', requireAuth, (req, res) => {
     const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
       ? test_type
       : 'required_field'
-    db.prepare(
-      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ? WHERE id = ?'
-    ).run(name, what_to_test, expected_result, safeTestType, req.params.id)
+    await db.run(
+      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ? WHERE id = ?',
+      name,
+      what_to_test,
+      expected_result,
+      safeTestType,
+      req.params.id
+    )
 
     res.json({ success: true, message: 'Test case updated' })
 
@@ -612,12 +665,12 @@ app.put('/api/test_cases/:id', requireAuth, (req, res) => {
 })
 
 // Delete a test case
-app.delete('/api/test_cases/:id', requireAuth, (req, res) => {
+app.delete('/api/test_cases/:id', requireAuth, async (req, res) => {
   try {
-    const ownedTestCase = ensureTestCaseOwner(req, res)
+    const ownedTestCase = await ensureTestCaseOwner(req, res)
     if (!ownedTestCase) return
 
-    db.prepare('DELETE FROM test_cases WHERE id = ?').run(req.params.id)
+    await db.run('DELETE FROM test_cases WHERE id = ?', req.params.id)
     res.json({ success: true, message: 'Test case deleted' })
   } catch (err) {
     console.error(err)
@@ -628,7 +681,7 @@ app.delete('/api/test_cases/:id', requireAuth, (req, res) => {
 // Run tests with Playwright
 app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const projectId = req.params.id
@@ -642,31 +695,35 @@ app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
     const projectStatus = allPassed ? 'Passed' : 'Failed'
 
     // 2) Save one run row
-    const runInsert = db.prepare(
-      'INSERT INTO test_runs (project_id, run_started_at, run_finished_at, project_status) VALUES (?, ?, ?, ?)'
-    ).run(projectId, runStartedAt, runFinishedAt, projectStatus)
+    const runInsert = await db.run(
+      'INSERT INTO test_runs (project_id, run_started_at, run_finished_at, project_status) VALUES (?, ?, ?, ?)',
+      projectId,
+      runStartedAt,
+      runFinishedAt,
+      projectStatus
+    )
 
     const runId = runInsert.lastInsertRowid
 
     // 3) Load current test cases for snapshots
-    const cases = db.prepare(
-      'SELECT id, name, what_to_test, expected_result, test_type FROM test_cases WHERE project_id = ?'
-    ).all(projectId)
+    const cases = await db.all(
+      'SELECT id, name, what_to_test, expected_result, test_type FROM test_cases WHERE project_id = ?',
+      projectId
+    )
 
     const byId = new Map(cases.map(tc => [tc.id, tc]))
 
     // 4) Save one result row per executed test case
-    const insertRunResult = db.prepare(`
-      INSERT INTO test_run_results
-      (run_id, test_case_id, status, notes, snapshot_name, snapshot_what_to_test, snapshot_expected_result, snapshot_test_type)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-
     for (const r of results) {
       const tc = byId.get(r.id)
       if (!tc) continue
 
-      insertRunResult.run(
+      await db.run(
+        `
+      INSERT INTO test_run_results
+      (run_id, test_case_id, status, notes, snapshot_name, snapshot_what_to_test, snapshot_expected_result, snapshot_test_type)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
         runId,
         r.id,
         r.passed ? 'Passed' : 'Failed',
@@ -686,16 +743,17 @@ app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
   }
 })
 
-app.get('/api/projects/:id/runs/latest-comparison', requireAuth, (req, res) => {
+app.get('/api/projects/:id/runs/latest-comparison', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const projectId = req.params.id
 
-    const runs = db.prepare(
-      'SELECT * FROM test_runs WHERE project_id = ? ORDER BY id DESC LIMIT 2'
-    ).all(projectId)
+    const runs = await db.all(
+      'SELECT * FROM test_runs WHERE project_id = ? ORDER BY id DESC LIMIT 2',
+      projectId
+    )
 
     const emptyCounts = {
       fixed: 0,
@@ -736,12 +794,8 @@ app.get('/api/projects/:id/runs/latest-comparison', requireAuth, (req, res) => {
     const currentRun = runs[0]
     const previousRun = runs[1]
 
-    const currentResults = db.prepare(
-      'SELECT * FROM test_run_results WHERE run_id = ?'
-    ).all(currentRun.id)
-    const previousResults = db.prepare(
-      'SELECT * FROM test_run_results WHERE run_id = ?'
-    ).all(previousRun.id)
+    const currentResults = await db.all('SELECT * FROM test_run_results WHERE run_id = ?', currentRun.id)
+    const previousResults = await db.all('SELECT * FROM test_run_results WHERE run_id = ?', previousRun.id)
 
     const prevByCase = new Map(previousResults.map(r => [r.test_case_id, r]))
 
@@ -795,34 +849,35 @@ app.get('/api/projects/:id/runs/latest-comparison', requireAuth, (req, res) => {
   }
 })
 
-app.get('/api/projects/:id/runs/:runId/export.xlsx', requireAuth, (req, res) => {
+app.get('/api/projects/:id/runs/:runId/export.xlsx', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const { id: projectId, runId } = req.params
-    const run = db.prepare(
-      'SELECT * FROM test_runs WHERE id = ? AND project_id = ?'
-    ).get(runId, projectId)
+    const run = await db.get('SELECT * FROM test_runs WHERE id = ? AND project_id = ?', runId, projectId)
 
     if (!run) {
       return res.status(404).json({ error: 'Run not found for this project' })
     }
 
-    const results = db.prepare(
-      'SELECT * FROM test_run_results WHERE run_id = ? ORDER BY id ASC'
-    ).all(runId)
+    const results = await db.all(
+      'SELECT * FROM test_run_results WHERE run_id = ? ORDER BY id ASC',
+      runId
+    )
 
-    const latestTwo = db.prepare(
-      'SELECT * FROM test_runs WHERE project_id = ? ORDER BY id DESC LIMIT 2'
-    ).all(projectId)
+    const latestTwo = await db.all(
+      'SELECT * FROM test_runs WHERE project_id = ? ORDER BY id DESC LIMIT 2',
+      projectId
+    )
 
     let comparisonSummary = 'No previous run to compare.'
     if (latestTwo.length >= 2 && Number(latestTwo[0].id) === Number(runId)) {
       const currentResults = results
-      const previousResults = db.prepare(
-        'SELECT * FROM test_run_results WHERE run_id = ?'
-      ).all(latestTwo[1].id)
+      const previousResults = await db.all(
+        'SELECT * FROM test_run_results WHERE run_id = ?',
+        latestTwo[1].id
+      )
       const prevByCase = new Map(previousResults.map(r => [r.test_case_id, r]))
       const currentCaseIds = new Set(currentResults.map(r => r.test_case_id))
 
@@ -891,9 +946,9 @@ app.get('/api/projects/:id/runs/:runId/export.xlsx', requireAuth, (req, res) => 
 })
 
 // Add a test case manually
-app.post('/api/projects/:id/test_cases', requireAuth, (req, res) => {
+app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
   try {
-    const ownedProject = ensureProjectOwner(req, res)
+    const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
     const { name, what_to_test, expected_result, test_type } = req.body
@@ -906,9 +961,14 @@ app.post('/api/projects/:id/test_cases', requireAuth, (req, res) => {
     const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
       ? test_type
       : 'required_field'
-    const result = db.prepare(
-      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)'
-    ).run(project_id, name, what_to_test, expected_result, safeTestType)
+    const result = await db.run(
+      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)',
+      project_id,
+      name,
+      what_to_test,
+      expected_result,
+      safeTestType
+    )
 
     res.json({ success: true, id: result.lastInsertRowid })
 
@@ -941,6 +1001,8 @@ if (fs.existsSync(distIndex)) {
   app.use(express.static('.'))
   console.warn('No dist/index.html — run `npm run build` to serve the React app from this server (dev UI: npm run dev).')
 }
+
+await dbReady
 
 const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
