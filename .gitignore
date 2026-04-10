@@ -35,3 +35,7 @@ DEPLOY.md
 /blob-report/
 /playwright/.cache/
 /playwright/.auth/
+
+# Local generated artifacts
+docs/
+__pycache__/

@@ -56,7 +56,7 @@ function requireAuth(req, res, next) {
     }
 
     next()
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: 'Invalid or expired token' })
   }
 }
@@ -91,7 +91,9 @@ async function resolveBestFormContext(page) {
         bestScore = score
         best = frame
       }
-    } catch {}
+    } catch {
+      // Ignore frames that are not accessible/ready yet.
+    }
   }
 
   return best
@@ -304,12 +306,22 @@ app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res)
 })
 
 app.delete('/api/projects/:id', requireAuth, async (req, res) => {
-  const ownedProject = await ensureProjectOwner(req, res)
-  if (!ownedProject) return
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
 
-  await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
-  await db.run('DELETE FROM projects WHERE id = ?', req.params.id)
-  res.json({ success: true })
+    const runs = await db.all('SELECT id FROM test_runs WHERE project_id = ?', req.params.id)
+    for (const run of runs) {
+      await db.run('DELETE FROM test_run_results WHERE run_id = ?', run.id)
+    }
+    await db.run('DELETE FROM test_runs WHERE project_id = ?', req.params.id)
+    await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
+    await db.run('DELETE FROM projects WHERE id = ?', req.params.id)
+    res.json({ success: true })
+  } catch (err) {
+    console.error('Failed to delete project:', err)
+    res.status(500).json({ error: err.message || 'Failed to delete project' })
+  }
 })
 
 app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
@@ -341,7 +353,9 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
     if (project.form_structure) {
       try {
         formStructure = JSON.parse(project.form_structure)
-      } catch {}
+      } catch {
+        // Keep null form structure when saved JSON is malformed.
+      }
     }
 
     const testCases = await generateTestCases(project.srd_text, formStructure)

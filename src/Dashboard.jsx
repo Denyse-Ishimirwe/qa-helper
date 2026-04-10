@@ -156,14 +156,19 @@ function Dashboard({ email, token, onLogout }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`/api/projects/${id}`, {
+      const res = await fetch(`/api/projects/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || 'Failed to delete project')
+      }
       await fetchProjects()
       setConfirmDelete(null)
-    } catch {
-      console.error('Failed to delete project')
+    } catch (err) {
+      console.error('Failed to delete project:', err)
+      alert(err.message || 'Failed to delete project')
     }
   }
 
