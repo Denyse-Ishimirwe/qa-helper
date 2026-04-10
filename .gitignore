@@ -16,6 +16,7 @@ uploads/
 qahelper.db
 CONTEXT.md
 plan.md
+DEPLOY.md
 
 # Editor directories and files
 .vscode/*
