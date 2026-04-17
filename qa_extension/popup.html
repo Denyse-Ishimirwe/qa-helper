@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <style>
+      body {
+        width: 300px;
+        padding: 16px;
+        font-family: Arial, sans-serif;
+      }
+      input, select {
+        width: 100%;
+        box-sizing: border-box;
+        margin: 6px 0;
+        padding: 8px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        font-size: 12px;
+      }
+      button {
+        width: 100%;
+        padding: 10px;
+        background-color: #1F3864;
+        color: white;
+        border: none;
+        border-radius: 6px;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:hover {
+        background-color: #2E75B6;
+      }
+      #status {
+        margin-top: 12px;
+        font-size: 13px;
+        color: #555;
+      }
+      .status-wrap {
+        margin-top: 12px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #statusSpinner {
+        width: 12px;
+        height: 12px;
+        border: 2px solid #c7d2fe;
+        border-top-color: #1F3864;
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        display: none;
+      }
+      .running #statusSpinner {
+        display: inline-block;
+      }
+      @keyframes spin {
+        from { transform: rotate(0deg); }
+        to { transform: rotate(360deg); }
+      }
+      .muted {
+        color: #666;
+        font-size: 12px;
+      }
+      .section {
+        margin-top: 10px;
+        border-top: 1px solid #eee;
+        padding-top: 10px;
+      }
+      #results {
+        margin-top: 10px;
+        font-size: 12px;
+        color: #333;
+        max-height: 220px;
+        overflow: auto;
+        border-top: 1px solid #eee;
+        padding-top: 8px;
+      }
+      .check {
+        margin: 6px 0;
+        line-height: 1.35;
+      }
+      .pass {
+        color: #0f7b2d;
+      }
+      .fail {
+        color: #b42318;
+      }
+      #openAppBtn {
+        display: none;
+        margin-top: 8px;
+        background-color: #2E75B6;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loginSection">
+      <div class="muted">Backend Login</div>
+      <input id="email" type="email" placeholder="Email" />
+      <input id="password" type="password" placeholder="Password" />
+      <button id="loginBtn">Login</button>
+    </div>
+
+    <div id="runSection" class="section">
+      <div class="muted">Select Project</div>
+      <select id="projectSelect">
+        <option value="">Loading projects...</option>
+      </select>
+      <button id="runTest">Run Test</button>
+      <button id="viewResultsBtn" style="display:none; margin-top:8px;">View Full Results</button>
+    </div>
+
+    <div id="statusWrap" class="status-wrap">
+      <span id="statusSpinner"></span>
+      <div id="status"></div>
+    </div>
+    <button id="openAppBtn">Open QA Helper App</button>
+    <div id="results"></div>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -27,6 +27,7 @@ const DEMO_EMAILS = new Set([
   'qa_review_2@ymail.com',
   'qa_review_3@ymail.com'
 ])
+const extensionScanJobs = new Map()
 
 if (!jwtSecret) {
   throw new Error('JWT_SECRET is required. Add it to your .env file before starting the server.')
@@ -73,7 +74,7 @@ if (corsOrigin) {
 } else {
   app.use(cors())
 }
-app.use(express.json())
+app.use(express.json({ limit: '25mb' }))
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({ ok: true, time: new Date().toISOString() })
@@ -108,6 +109,256 @@ async function waitForPortalFormReady(page) {
     await page.waitForTimeout(500)
   }
   return resolveBestFormContext(page)
+}
+
+function extractNotionPageId(input) {
+  const raw = String(input || '').trim()
+  if (!raw) return null
+
+  const toDashedUuid = (hex32) => {
+    const compact = String(hex32 || '').replace(/-/g, '').toLowerCase()
+    if (!/^[a-f0-9]{32}$/.test(compact)) return null
+    return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`
+  }
+
+  // 1) Common Notion URL shape:
+  //    /Page-Title-34315c104265800886c2cfa7693363b6
+  //    or /34315c10-4265-8008-86c2-cfa7693363b6
+  let candidates = []
+  try {
+    const parsed = new URL(raw)
+    const parts = parsed.pathname.split('/').filter(Boolean)
+    const lastPart = parts.length ? decodeURIComponent(parts[parts.length - 1]) : ''
+    if (lastPart) candidates.push(lastPart)
+    candidates.push(parsed.pathname)
+  } catch {
+    candidates.push(raw)
+  }
+
+  // 2) Also scan the whole raw input as a fallback.
+  candidates.push(raw)
+
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '')
+    const dashed = normalized.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/i)
+    if (dashed?.[0]) return toDashedUuid(dashed[0])
+
+    // Use the LAST 32-hex match to avoid grabbing unrelated IDs in prefixes.
+    const compactMatches = normalized.match(/[a-f0-9]{32}/ig)
+    if (compactMatches?.length) {
+      return toDashedUuid(compactMatches[compactMatches.length - 1])
+    }
+  }
+
+  return null
+}
+
+async function fetchNotionSrdText(notionUrl) {
+  const token = String(process.env.NOTION_API_KEY || process.env.NOTION_TOKEN || '').trim()
+  if (!token) {
+    throw new Error('NOTION_API_KEY (or NOTION_TOKEN) is required for Notion SRD import')
+  }
+  const pageId = extractNotionPageId(notionUrl)
+  if (!pageId) throw new Error('Invalid Notion page URL')
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    'Notion-Version': '2022-06-28',
+    'Content-Type': 'application/json'
+  }
+
+  const richTextToString = (richText) => (
+    Array.isArray(richText)
+      ? richText.map(t => String(t?.plain_text || '').trim()).filter(Boolean).join(' ')
+      : ''
+  )
+
+  async function fetchBlockChildren(blockId) {
+    const children = []
+    let cursor = null
+    for (let i = 0; i < 20; i += 1) {
+      const url = new URL(`https://api.notion.com/v1/blocks/${blockId}/children`)
+      if (cursor) url.searchParams.set('start_cursor', cursor)
+      const res = await fetch(url, { headers })
+      if (!res.ok) {
+        const body = await res.text().catch(() => '')
+        throw new Error(`Notion API error (${res.status}): ${body || 'Unable to fetch page content'}`)
+      }
+      const data = await res.json()
+      children.push(...(Array.isArray(data.results) ? data.results : []))
+      if (!data.has_more || !data.next_cursor) break
+      cursor = data.next_cursor
+    }
+    return children
+  }
+
+  function extractBlockText(block) {
+    const type = String(block?.type || '')
+    if (!type) return []
+
+    const simpleRichTextTypes = new Set([
+      'paragraph',
+      'bulleted_list_item',
+      'numbered_list_item',
+      'toggle',
+      'heading_1',
+      'heading_2',
+      'heading_3',
+      'callout',
+      'quote'
+    ])
+
+    if (simpleRichTextTypes.has(type)) {
+      const content = block?.[type]
+      const line = richTextToString(content?.rich_text)
+      return line ? [line] : []
+    }
+
+    if (type === 'table_row') {
+      const cells = Array.isArray(block?.table_row?.cells) ? block.table_row.cells : []
+      const rowText = cells
+        .map(cell => richTextToString(cell))
+        .filter(Boolean)
+      return rowText.length ? [rowText.join(' | ')] : []
+    }
+
+    return []
+  }
+
+  async function walkBlocks(blockId) {
+    const blocks = await fetchBlockChildren(blockId)
+    const lines = []
+
+    for (const block of blocks) {
+      lines.push(...extractBlockText(block))
+
+      // Toggle and table content lives in child blocks.
+      if (block?.has_children) {
+        const nested = await walkBlocks(block.id)
+        lines.push(...nested)
+      }
+    }
+
+    return lines
+  }
+
+  const lines = await walkBlocks(pageId)
+  const text = lines
+    .map(line => String(line || '').trim())
+    .filter(Boolean)
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+
+  console.log('[notion] Extracted SRD text:\n', text)
+
+  if (!text) throw new Error('No readable text found in Notion page')
+  return text
+}
+
+async function persistRunResults(projectId, results) {
+  const runStartedAt = new Date().toISOString()
+  const runFinishedAt = new Date().toISOString()
+  const allPassed = results.every(r => r.passed)
+  const projectStatus = allPassed ? 'Passed' : 'Failed'
+
+  const runInsert = await db.run(
+    'INSERT INTO test_runs (project_id, run_started_at, run_finished_at, project_status) VALUES (?, ?, ?, ?)',
+    projectId,
+    runStartedAt,
+    runFinishedAt,
+    projectStatus
+  )
+  const runId = runInsert.lastInsertRowid
+
+  const cases = await db.all(
+    'SELECT id, name, what_to_test, expected_result, generation_reason, test_type, expected_outcome FROM test_cases WHERE project_id = ?',
+    projectId
+  )
+  const byId = new Map(cases.map(tc => [tc.id, tc]))
+
+  for (const r of results) {
+    const tc = byId.get(r.id)
+    if (!tc) continue
+    await db.run(
+      `
+      INSERT INTO test_run_results
+      (run_id, test_case_id, status, notes, screenshot_path, snapshot_name, snapshot_what_to_test, snapshot_expected_result, snapshot_generation_reason, snapshot_expected_outcome, snapshot_test_type)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      runId,
+      r.id,
+      r.passed ? 'Passed' : 'Failed',
+      r.notes || '',
+      r.screenshotPath || null,
+      tc.name,
+      tc.what_to_test,
+      tc.expected_result,
+      tc.generation_reason || '',
+      tc.expected_outcome || 'should_pass',
+      tc.test_type || 'required_field'
+    )
+  }
+
+  return { runId, projectStatus }
+}
+
+function ensureUploadsBaseDir() {
+  const base = process.env.UPLOADS_DIR
+    ? path.resolve(process.env.UPLOADS_DIR)
+    : path.join(process.cwd(), 'uploads')
+  fs.mkdirSync(base, { recursive: true })
+  return base
+}
+
+function saveExtensionScreenshot(runId, testCaseId, dataUrl) {
+  const m = String(dataUrl || '').match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/i)
+  if (!m) return null
+  const ext = String(m[1] || 'png').toLowerCase() === 'png' ? 'png' : 'jpg'
+  const baseDir = ensureUploadsBaseDir()
+  const dir = path.join(baseDir, 'screenshots', 'extension', `run-${runId}`)
+  fs.mkdirSync(dir, { recursive: true })
+  const fileName = `tc-${testCaseId}-${Date.now()}.${ext}`
+  const fullPath = path.join(dir, fileName)
+  fs.writeFileSync(fullPath, Buffer.from(m[2], 'base64'))
+  return `/uploads/screenshots/extension/run-${runId}/${fileName}`
+}
+
+async function applyExtensionScreenshotsToRun(runId, screenshots = []) {
+  let saved = 0
+  for (const item of screenshots) {
+    const testCaseId = Number(item?.testCaseId || 0)
+    const dataUrl = String(item?.imageDataUrl || '')
+    if (!testCaseId || !dataUrl) continue
+
+    const screenshotPath = saveExtensionScreenshot(runId, testCaseId, dataUrl)
+    if (!screenshotPath) continue
+
+    const row = await db.get(
+      'SELECT notes FROM test_run_results WHERE run_id = ? AND test_case_id = ?',
+      runId,
+      testCaseId
+    )
+    if (!row) continue
+
+    const cleanNotes = String(row.notes || '').replace(/\n?Screenshot:\s*\/uploads\/[^\s]+/g, '').trim()
+    const nextNotes = `${cleanNotes}${cleanNotes ? '\n' : ''}Screenshot: ${screenshotPath}`
+
+    await db.run(
+      'UPDATE test_run_results SET screenshot_path = ?, notes = ? WHERE run_id = ? AND test_case_id = ?',
+      screenshotPath,
+      nextNotes,
+      runId,
+      testCaseId
+    )
+    await db.run(
+      'UPDATE test_cases SET notes = ? WHERE id = ?',
+      nextNotes,
+      testCaseId
+    )
+    saved += 1
+  }
+  return saved
 }
 
 async function ensureProjectOwner(req, res) {
@@ -220,6 +471,252 @@ app.get('/api', (req, res) => {
   res.json({ ok: true, message: 'QA Helper API is running' })
 })
 
+app.post('/api/extension-scan', requireAuth, async (req, res) => {
+  try {
+    const { url, fields, projectId } = req.body || {}
+    const extensionUrl = String(url || '').trim()
+    const safeFields = Array.isArray(fields) ? fields : []
+    if (!projectId) {
+      return res.status(400).json({ ok: false, error: 'projectId is required' })
+    }
+    if (!extensionUrl) {
+      return res.status(400).json({ ok: false, error: 'Current page URL is required from extension scan' })
+    }
+    const project = await db.get(
+      'SELECT id, user_id, form_url, form_structure, srd_text FROM projects WHERE id = ?',
+      projectId
+    )
+    if (!project) return res.status(404).json({ ok: false, error: 'Project not found' })
+    if (project.user_id !== req.user.id) return res.status(403).json({ ok: false, error: 'Forbidden' })
+
+    if (!safeFields.length) {
+      return res.status(400).json({ ok: false, error: 'No fields were detected on current page' })
+    }
+
+    console.log('[extension-scan] URL:', extensionUrl || 'unknown')
+    console.log('[extension-scan] projectId:', projectId)
+    console.log('[extension-scan] Fields:', safeFields)
+
+    const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    extensionScanJobs.set(jobId, {
+      id: jobId,
+      userId: req.user.id,
+      projectId: Number(projectId),
+      status: 'running',
+      phase: 'running_tests',
+      message: 'Running tests...',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      progress: { total: 0, completed: 0 },
+      events: [],
+      pendingScreenshots: [],
+      nextEventSeq: 1,
+      result: null,
+      error: null
+    })
+
+    // Run in background so popup can poll live progress.
+    ;(async () => {
+      try {
+    // Extension must use the app's existing test cases only.
+        const existingCountRow = await db.get(
+          'SELECT COUNT(*) AS total FROM test_cases WHERE project_id = ?',
+          projectId
+        )
+        const existingCount = Number(existingCountRow?.total || 0)
+        if (existingCount === 0) {
+      throw new Error('No test cases found. Generate test cases in the app first.')
+        }
+
+        const results = await runTests(projectId, {
+          overrideUrl: extensionUrl,
+          scannedFields: safeFields,
+          source: 'extension',
+          screenshotSource: 'extension',
+          onProgress: (p) => {
+            const job = extensionScanJobs.get(jobId)
+            if (!job) return
+            const phase = String(p?.phase || '').trim() || job.phase
+            const message = String(p?.message || '').trim() || job.message
+            const total = Number.isFinite(Number(p?.total)) ? Number(p.total) : job.progress.total
+            const completed = Number.isFinite(Number(p?.completed)) ? Number(p.completed) : job.progress.completed
+            const events = Array.isArray(job.events) ? [...job.events] : []
+            if ((p?.phase === 'case_done' || p?.phase === 'capture_failure') && p?.caseResult) {
+              events.push({
+                seq: job.nextEventSeq || 1,
+                phase: p.phase,
+                caseResult: p.caseResult
+              })
+            }
+            extensionScanJobs.set(jobId, {
+              ...job,
+              phase,
+              message,
+              progress: { total, completed },
+              events: events.slice(-80),
+              nextEventSeq: (job.nextEventSeq || 1) + (((p?.phase === 'case_done' || p?.phase === 'capture_failure') && p?.caseResult) ? 1 : 0),
+              updatedAt: Date.now()
+            })
+          }
+        })
+
+        const jobAlmostDone = extensionScanJobs.get(jobId)
+        if (jobAlmostDone) {
+          extensionScanJobs.set(jobId, {
+            ...jobAlmostDone,
+            phase: 'finishing',
+            message: 'Almost done...',
+            updatedAt: Date.now()
+          })
+        }
+
+        const { runId } = await persistRunResults(projectId, results)
+        const jobForScreens = extensionScanJobs.get(jobId)
+        if (jobForScreens?.pendingScreenshots?.length) {
+          await applyExtensionScreenshotsToRun(runId, jobForScreens.pendingScreenshots)
+        }
+        const passed = results.filter(r => r.passed).length
+        const failed = results.length - passed
+        const summary = `Done - ${passed} passed, ${failed} failed`
+
+        const jobDone = extensionScanJobs.get(jobId)
+        if (jobDone) {
+          extensionScanJobs.set(jobId, {
+            ...jobDone,
+            status: 'done',
+            phase: 'done',
+            message: summary,
+            updatedAt: Date.now(),
+            result: {
+              ok: true,
+              projectId: Number(projectId),
+              runId,
+              summary,
+              passed,
+              failed,
+              checks: results.map(r => ({
+                id: r.id,
+                name: r.name,
+                passed: Boolean(r.passed),
+                notes: r.notes || '',
+                generation_reason: r.generationReason || ''
+              }))
+            }
+          })
+        }
+      } catch (err) {
+        const jobFailed = extensionScanJobs.get(jobId)
+        if (jobFailed) {
+          extensionScanJobs.set(jobId, {
+            ...jobFailed,
+            status: 'error',
+            phase: 'error',
+            message: String(err?.message || 'Extension scan failed'),
+            updatedAt: Date.now(),
+            error: String(err?.message || 'Extension scan failed')
+          })
+        }
+        console.error('extension-scan error:', err)
+      }
+    })()
+
+    return res.json({
+      ok: true,
+      jobId,
+      status: 'running',
+      message: 'Running tests...'
+    })
+  } catch (err) {
+    console.error('extension-scan error:', err)
+    return res.status(500).json({ ok: false, error: err.message || 'Failed to run extension scan' })
+  }
+})
+
+app.get('/api/extension-scan/status/:jobId', requireAuth, async (req, res) => {
+  const jobId = String(req.params?.jobId || '').trim()
+  const job = extensionScanJobs.get(jobId)
+  if (!job) {
+    return res.status(404).json({ ok: false, error: 'Scan job not found' })
+  }
+  if (job.userId !== req.user.id) {
+    return res.status(403).json({ ok: false, error: 'Forbidden' })
+  }
+
+  // Auto-clean stale completed jobs after 15 minutes.
+  if ((job.status === 'done' || job.status === 'error') && Date.now() - job.updatedAt > 15 * 60 * 1000) {
+    extensionScanJobs.delete(jobId)
+  }
+
+  return res.json({
+    ok: true,
+    jobId: job.id,
+    status: job.status,
+    phase: job.phase,
+    message: job.message,
+    progress: job.progress,
+    events: job.events || [],
+    result: job.result,
+    error: job.error
+  })
+})
+
+app.post('/api/extension-scan/:jobId/screenshot', requireAuth, async (req, res) => {
+  try {
+    const jobId = String(req.params?.jobId || '').trim()
+    const job = extensionScanJobs.get(jobId)
+    if (!job) return res.status(404).json({ ok: false, error: 'Scan job not found' })
+    if (job.userId !== req.user.id) return res.status(403).json({ ok: false, error: 'Forbidden' })
+
+    const testCaseId = Number(req.body?.testCaseId || 0)
+    const imageDataUrl = String(req.body?.imageDataUrl || '')
+    if (!testCaseId || !imageDataUrl) {
+      return res.status(400).json({ ok: false, error: 'testCaseId and imageDataUrl are required' })
+    }
+
+    const pending = Array.isArray(job.pendingScreenshots) ? [...job.pendingScreenshots] : []
+    pending.push({ testCaseId, imageDataUrl })
+    extensionScanJobs.set(jobId, {
+      ...job,
+      pendingScreenshots: pending.slice(-80),
+      updatedAt: Date.now()
+    })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('extension screenshot queue error:', err)
+    return res.status(500).json({ ok: false, error: err.message || 'Failed to queue extension screenshot' })
+  }
+})
+
+app.post('/api/runs/:runId/extension-screenshots', requireAuth, async (req, res) => {
+  try {
+    const runId = Number(req.params?.runId || 0)
+    const screenshots = Array.isArray(req.body?.screenshots) ? req.body.screenshots : []
+    if (!runId || screenshots.length === 0) {
+      return res.status(400).json({ ok: false, error: 'runId and screenshots are required' })
+    }
+
+    const owned = await db.get(
+      `
+      SELECT tr.id
+      FROM test_runs tr
+      JOIN projects p ON p.id = tr.project_id
+      WHERE tr.id = ? AND p.user_id = ?
+      `,
+      runId,
+      req.user.id
+    )
+    if (!owned) return res.status(403).json({ ok: false, error: 'Forbidden' })
+
+    const saved = await applyExtensionScreenshotsToRun(runId, screenshots)
+
+    return res.json({ ok: true, saved })
+  } catch (err) {
+    console.error('extension screenshot upload error:', err)
+    return res.status(500).json({ ok: false, error: err.message || 'Failed to save extension screenshots' })
+  }
+})
+
 app.get('/api/projects', requireAuth, async (req, res) => {
   const projects = await db.all(
     `
@@ -235,33 +732,43 @@ app.get('/api/projects', requireAuth, async (req, res) => {
 
 app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) => {
   try {
-    const name = req.body?.name
-    const form_url = req.body?.form_url
+    const name = String(req.body?.name || '').trim()
+    const form_url = String(req.body?.form_url || '').trim()
+    const notion_url = String(req.body?.notion_url || '').trim()
 
-    if (!name || !form_url) {
-      return res.status(400).json({ error: 'Name and URL are required' })
+    if (!name) {
+      return res.status(400).json({ error: 'Project name is required' })
     }
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'SRD document is required' })
+    if (!req.file && !notion_url) {
+      return res.status(400).json({ error: 'Upload an SRD file or provide a Notion URL' })
     }
 
-    const srdText = await extractText(req.file.path)
-    console.log('Extracted text:', srdText)
+    let srdText = ''
+    if (req.file) {
+      srdText = await extractText(req.file.path)
+    } else {
+      srdText = await fetchNotionSrdText(notion_url)
+    }
 
     const result = await db.run(
       'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)',
       req.user.id,
       name,
-      form_url,
+      form_url || '',
       srdText
     )
 
     res.json({ success: true, id: result.lastInsertRowid })
 
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    const msg = String(err?.message || 'Failed to create project')
+    console.error('Create project error:', msg)
+    // Notion errors are usually user-actionable (wrong URL / not shared / permissions).
+    if (msg.startsWith('Notion API error (') || msg.toLowerCase().includes('notion')) {
+      return res.status(400).json({ error: msg })
+    }
+    res.status(500).json({ error: msg })
   }
 })
 
@@ -271,28 +778,32 @@ app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res)
     const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
-    const { name, form_url } = req.body
+    const name = String(req.body?.name || '').trim()
+    const form_url = String(req.body?.form_url || '').trim()
+    const notion_url = String(req.body?.notion_url || '').trim()
 
-    if (!name || !form_url) {
-      return res.status(400).json({ error: 'Name and URL are required' })
+    if (!name) {
+      return res.status(400).json({ error: 'Project name is required' })
     }
 
-    // If a new SRD file was uploaded, extract its text, clear old test cases and reset status
-    if (req.file) {
-      const srdText = await extractText(req.file.path)
+    // If a new SRD source was provided, extract its text, clear old test cases and reset status
+    if (req.file || notion_url) {
+      const nextSrd = req.file
+        ? await extractText(req.file.path)
+        : await fetchNotionSrdText(notion_url)
       await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
       await db.run(
         "UPDATE projects SET name = ?, form_url = ?, srd_text = ?, form_structure = NULL, status = 'Not Tested', last_tested = 'Never' WHERE id = ?",
         name,
-        form_url,
-        srdText,
+        form_url || '',
+        nextSrd,
         req.params.id
       )
     } else {
       await db.run(
         'UPDATE projects SET name = ?, form_url = ?, form_structure = NULL WHERE id = ?',
         name,
-        form_url,
+        form_url || '',
         req.params.id
       )
     }
@@ -300,8 +811,12 @@ app.put('/api/projects/:id', requireAuth, upload.single('srd'), async (req, res)
     res.json({ success: true })
 
   } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: err.message })
+    const msg = String(err?.message || 'Failed to update project')
+    console.error('Update project error:', msg)
+    if (msg.startsWith('Notion API error (') || msg.toLowerCase().includes('notion')) {
+      return res.status(400).json({ error: msg })
+    }
+    res.status(500).json({ error: msg })
   }
 })
 
@@ -319,8 +834,13 @@ app.delete('/api/projects/:id', requireAuth, async (req, res) => {
     await db.run('DELETE FROM projects WHERE id = ?', req.params.id)
     res.json({ success: true })
   } catch (err) {
-    console.error('Failed to delete project:', err)
-    res.status(500).json({ error: err.message || 'Failed to delete project' })
+    const msg = String(err?.message || 'Failed to delete project')
+    console.error('Failed to delete project:', msg)
+    // Surface FK constraint errors clearly.
+    if (msg.toLowerCase().includes('foreign key') || msg.toLowerCase().includes('constraint')) {
+      return res.status(409).json({ error: msg })
+    }
+    res.status(500).json({ error: msg })
   }
 })
 
@@ -341,7 +861,6 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
     }
-
     if (!project.srd_text) {
       return res.status(400).json({ error: 'No SRD text found for this project' })
     }
@@ -699,57 +1218,8 @@ app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
     if (!ownedProject) return
 
     const projectId = req.params.id
-    const runStartedAt = new Date().toISOString()
-
-    // 1) Run Playwright tests (existing function)
     const results = await runTests(projectId)
-
-    const runFinishedAt = new Date().toISOString()
-    const allPassed = results.every(r => r.passed)
-    const projectStatus = allPassed ? 'Passed' : 'Failed'
-
-    // 2) Save one run row
-    const runInsert = await db.run(
-      'INSERT INTO test_runs (project_id, run_started_at, run_finished_at, project_status) VALUES (?, ?, ?, ?)',
-      projectId,
-      runStartedAt,
-      runFinishedAt,
-      projectStatus
-    )
-
-    const runId = runInsert.lastInsertRowid
-
-    // 3) Load current test cases for snapshots
-    const cases = await db.all(
-      'SELECT id, name, what_to_test, expected_result, test_type FROM test_cases WHERE project_id = ?',
-      projectId
-    )
-
-    const byId = new Map(cases.map(tc => [tc.id, tc]))
-
-    // 4) Save one result row per executed test case
-    for (const r of results) {
-      const tc = byId.get(r.id)
-      if (!tc) continue
-
-      await db.run(
-        `
-      INSERT INTO test_run_results
-      (run_id, test_case_id, status, notes, snapshot_name, snapshot_what_to_test, snapshot_expected_result, snapshot_test_type)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-        runId,
-        r.id,
-        r.passed ? 'Passed' : 'Failed',
-        r.notes || '',
-        tc.name,
-        tc.what_to_test,
-        tc.expected_result,
-        tc.test_type || 'required_field'
-      )
-    }
-
-    // 5) Return old + new data
+    const { runId } = await persistRunResults(projectId, results)
     res.json({ success: true, runId, results })
   } catch (err) {
     console.error(err)
@@ -995,6 +1465,13 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
 const distDir = path.join(__dirname, 'dist')
 const distIndex = path.join(distDir, 'index.html')
 const testFormPath = path.join(__dirname, 'testform.html')
+const uploadsPublicDir = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.join(__dirname, 'uploads')
+
+if (fs.existsSync(uploadsPublicDir)) {
+  app.use('/uploads', express.static(uploadsPublicDir))
+}
 
 if (fs.existsSync(distIndex)) {
   app.use(express.static(distDir))

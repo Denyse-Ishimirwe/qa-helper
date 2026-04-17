@@ -1,0 +1,149 @@
+
+
+QA Helper — Month 2
+
+Day by Day Plan
+
+April 2026
+
+
+The goal: A real QA tester, on a real Irembo form, gets accurate results in under 2 minutes. Manual testing takes 1 hour. The tool does the same thing in 60 seconds. That is the demo that matters.
+
+
+How to use this plan with Cursor: Each day has a &quot;What To Tell Cursor&quot; column. Copy that text and paste it into Cursor as your prompt. Don’t worry about the code — Cursor writes it. Your job is to understand what each step does and confirm it works before moving to the next day.
+
+
+Week 1 — Build the Chrome Extension
+
+This week you build the extension from scratch. You have never done this before so the first two days are about learning by doing. By Friday you will have an extension that reads a real Irembo staging form and triggers a test.
+
+
+Day
+What To Do
+What To Tell Cursor
+You Are Done When...
+Mon
+Understand what a Chrome extension is and set up the folder structure
+Create a basic Chrome extension folder with a manifest.json, a content script, and a popup. The extension should just show a button that says Run Test when I click the extension icon.
+You can load the extension in Chrome and see a popup with a button
+Tue
+Make the extension read form fields on any page
+Update the content script so that when I click Run Test in the popup, it finds all input fields on the current page and logs their names and types to the console.
+You open an Irembo staging form, click Run Test, and see the field names printed in the browser console
+Wed
+Send those form fields to your existing backend
+Make the extension send the list of form fields it found to my existing Node.js backend at /api/extension-scan. Create that endpoint in server.js to receive and log the data.
+Your backend terminal shows the form fields coming in from the extension
+Thu
+Backend triggers a test run from the extension data
+When /api/extension-scan receives form field data from the extension, use that data to trigger a Playwright test run the same way the dashboard currently does. Return the results to the extension.
+Clicking Run Test in the extension triggers a real test and you get a result back
+Fri — Manager Check-in
+Show the extension reading a real Irembo staging form and triggering a test
+No Cursor today — prepare your demo. Open the staging form, click the extension, show the test running.
+You can demo a real form being tested live in your Friday meeting
+
+
+
+
+Week 2 — Connect Everything Together
+
+The extension works. Now you connect it fully to your existing system — results in the dashboard, screenshots on failure, and Notion SRD support so testers don’t have to export PDFs.
+
+
+Day
+What To Do
+What To Tell Cursor
+You Are Done When...
+Mon
+Show test results in the extension popup
+After the test runs, display the results inside the extension popup — pass or fail for each field check, in plain English.
+Tester can see pass/fail results without opening the dashboard
+Tue
+Screenshots on failure
+When a Playwright test check fails, capture a screenshot at that exact moment. Save it and include a link to it in the results shown in the extension popup and in the dashboard.
+A failed check shows a screenshot of what the form looked like when it failed
+Wed
+Make sure results also show in the main dashboard
+Tests triggered from the extension should save to the database and appear in the main QA Helper dashboard the same way tests from the web app do.
+Extension test results appear in the dashboard with full run history
+Thu
+Support Notion SRDs
+Add a way for the tester to paste a Notion page URL in the extension or dashboard. The backend should fetch the text from that Notion page using the Notion API and use it the same way it uses an uploaded PDF.
+Tester can paste a Notion link instead of uploading a PDF and the AI still generates test cases
+Fri — Manager Check-in
+Show full end to end flow on a real Irembo form
+No Cursor — prepare demo. Extension reads form, test runs, screenshot captured on failure, results in dashboard.
+Full working loop on a real Irembo form shown live
+
+
+
+
+Week 3 — Accuracy and the Real Demo
+
+Features are done. This week is about making sure the results are trustworthy on real Irembo forms and preparing the side-by-side demo that shows real value. This is the week that impresses the super manager.
+
+
+Day
+What To Do
+What To Tell Cursor
+You Are Done When...
+Mon
+Test on multiple real Irembo services — fix anything wrong
+Test the tool on at least 3 different Irembo staging forms. Note anything that gives wrong results and fix it.
+Tool gives accurate results on at least 3 different real forms
+Tue
+Fix accuracy issues found on Monday
+Tell Cursor specifically what gave wrong results and ask it to fix those cases.
+No false passes or false failures on the forms you tested
+Wed
+Prepare the side by side demo
+No Cursor. Time a QA tester doing manual testing on one form. Then run the tool on the same form. Write down both times.
+You have a real number: manual = X minutes, tool = Y seconds
+Thu
+Polish — make the results report clear and readable
+Review the plain English report the tool produces. Make sure a non-technical person can read it and understand what passed, what failed, and why.
+Someone who has never seen the tool can read the report and understand it
+Fri — Manager Check-in
+The big demo — manual vs tool, real form, real numbers
+No Cursor — this is your main demo. Show the time comparison and accurate results.
+Manager sees real value with real numbers
+
+
+
+
+Week 4 — Fix, Polish, and Final Demo
+
+Buffer week. Fix anything that came up in Week 3. Polish the report. Write handover notes. Prepare the final demo.
+
+
+Day
+What To Do
+What To Tell Cursor
+You Are Done When...
+Mon–Tue
+Fix anything that came up in Week 3 demo feedback
+Address any issues your manager raised on Friday.
+All feedback from Week 3 addressed
+Wed
+Make sure the Excel export works with extension-triggered tests
+Confirm the Excel report downloads correctly for tests run through the extension.
+Tester can download a full Excel report for any test run
+Thu
+Final cleanup and write handover notes
+No Cursor. Write simple notes explaining what was built, what still needs work, and how to continue in Month 3.
+Someone else could pick this up and understand where it stands
+Fri — Final Review
+Final demo to manager and super manager
+No Cursor — full demo. Extension, real form, real numbers, clean report.
+Super manager sees a tool that solves the actual problem
+
+
+
+Manual testing: 1 hour per form.
+
+QA Helper: under 2 minutes. Same results.
+
+That is the problem being solved.
+
+

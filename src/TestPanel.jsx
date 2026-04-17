@@ -1,5 +1,5 @@
 import './TestPanel.css'
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 
 /** Normalize API/DB status so UI counts match each card. */
 function normalizeTestStatus(status) {
@@ -22,36 +22,48 @@ function TestPanel({ project, token, onClose }) {
   const [comparison, setComparison] = useState(null)
   const [downloading, setDownloading] = useState(false)
   const [formStructureHint, setFormStructureHint] = useState('')
+  const testCasesRequestRef = useRef(0)
+  const comparisonRequestRef = useRef(0)
 
   const fetchTestCases = useCallback(async () => {
+    const requestId = ++testCasesRequestRef.current
     try {
       const res = await fetch(`/api/projects/${project.id}/test_cases`, {
         headers: { Authorization: `Bearer ${token}` }
       })
       const data = await res.json()
+      if (requestId !== testCasesRequestRef.current) return
       setTestCases(Array.isArray(data) ? data : [])
     } catch (err) {
+      if (requestId !== testCasesRequestRef.current) return
       console.error('Failed to fetch test cases:', err)
       setTestCases([])
     }
   }, [project.id, token])
 
   useEffect(() => {
+    // Immediately clear previous project's data while new project is loading.
+    setTestCases([])
+    setComparison(null)
     fetchTestCases()
   }, [fetchTestCases])
 
   const fetchComparison = useCallback(async () => {
+    const requestId = ++comparisonRequestRef.current
     try {
       const res = await fetch(`/api/projects/${project.id}/runs/latest-comparison`, {
         headers: { Authorization: `Bearer ${token}` }
       })
+      if (requestId !== comparisonRequestRef.current) return
       if (!res.ok) {
         setComparison(null)
         return
       }
       const data = await res.json()
+      if (requestId !== comparisonRequestRef.current) return
       setComparison(data)
     } catch (err) {
+      if (requestId !== comparisonRequestRef.current) return
       console.error('Failed to fetch run comparison:', err)
       setComparison(null)
     }
@@ -472,10 +484,26 @@ function TestPanel({ project, token, onClose }) {
                         <span className="field-label">Expected result</span>
                         <span className="field-value">{tc.expected_result}</span>
                       </div>
+                      {tc.generation_reason && (
+                        <div className="card-field">
+                          <span className="field-label">Why this test was generated</span>
+                          <span className="field-value">{tc.generation_reason}</span>
+                        </div>
+                      )}
                       {tc.notes && (
                         <div className="card-field">
                           <span className="field-label">Run notes</span>
-                          <span className="field-value">{tc.notes}</span>
+                          <span className="field-value">
+                            {tc.notes}
+                            {String(tc.notes).includes('/uploads/') && (
+                              <>
+                                <br />
+                                <a href={String(tc.notes).match(/\/uploads\/[^\s]+/)?.[0] || '#'} target="_blank" rel="noreferrer">
+                                  View screenshot
+                                </a>
+                              </>
+                            )}
+                          </span>
                         </div>
                       )}
                     </div>

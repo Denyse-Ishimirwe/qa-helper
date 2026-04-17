@@ -44,7 +44,7 @@ const SCHEMA_SQL = `
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER,
   name TEXT NOT NULL,
-  form_url TEXT NOT NULL,
+  form_url TEXT,
   login_url TEXT,
   login_username TEXT,
   login_password TEXT,
@@ -62,6 +62,7 @@ const SCHEMA_SQL = `
     name TEXT NOT NULL,
     what_to_test TEXT NOT NULL,
     expected_result TEXT NOT NULL,
+    generation_reason TEXT DEFAULT '',
     notes TEXT,
     expected_outcome TEXT DEFAULT 'should_pass',
     status TEXT DEFAULT 'Not Run',
@@ -85,9 +86,11 @@ const SCHEMA_SQL = `
     test_case_id INTEGER,
     status TEXT NOT NULL,
     notes TEXT,
+    screenshot_path TEXT,
     snapshot_name TEXT NOT NULL,
     snapshot_what_to_test TEXT NOT NULL,
     snapshot_expected_result TEXT NOT NULL,
+    snapshot_generation_reason TEXT DEFAULT '',
     snapshot_expected_outcome TEXT DEFAULT 'should_pass',
     snapshot_test_type TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now')),
@@ -186,6 +189,7 @@ async function initTurso(url, authToken) {
 
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN test_type TEXT DEFAULT 'required_field'`)
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN expected_outcome TEXT DEFAULT 'should_pass'`)
+  await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN generation_reason TEXT DEFAULT ''`)
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN notes TEXT DEFAULT ''`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN user_id INTEGER`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN form_structure TEXT`)
@@ -195,6 +199,8 @@ async function initTurso(url, authToken) {
   await tryExecTurso(
     `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
   )
+  await tryExecTurso(`ALTER TABLE test_run_results ADD COLUMN snapshot_generation_reason TEXT DEFAULT ''`)
+  await tryExecTurso(`ALTER TABLE test_run_results ADD COLUMN screenshot_path TEXT`)
 
   try {
     await migrateTestRunResultsTurso()
@@ -233,41 +239,77 @@ async function initSqlite() {
 
   try {
     _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN test_type TEXT DEFAULT 'required_field'`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN expected_outcome TEXT DEFAULT 'should_pass'`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN generation_reason TEXT DEFAULT ''`)
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN notes TEXT DEFAULT ''`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN user_id INTEGER`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN form_structure TEXT`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN login_url TEXT`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN login_username TEXT`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
 
   try {
     _sqlite.exec(
       `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
     )
-  } catch {}
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE test_run_results ADD COLUMN snapshot_generation_reason TEXT DEFAULT ''`)
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE test_run_results ADD COLUMN screenshot_path TEXT`)
+  } catch {
+    // Column already exists.
+  }
 
   migrateTestRunResultsSqlite(_sqlite)
 

@@ -7,6 +7,7 @@ function Dashboard({ email, token, onLogout }) {
   const [projects, setProjects] = useState([])
   const [projectName, setProjectName] = useState('')
   const [formUrl, setFormUrl] = useState('')
+  const [notionUrl, setNotionUrl] = useState('')
   const [srdFile, setSrdFile] = useState(null)
   const [activeFilter, setActiveFilter] = useState('All Projects')
   const [loading, setLoading] = useState(false)
@@ -16,6 +17,7 @@ function Dashboard({ email, token, onLogout }) {
   const [editProject, setEditProject] = useState(null)
   const [editName, setEditName] = useState('')
   const [editUrl, setEditUrl] = useState('')
+  const [editNotionUrl, setEditNotionUrl] = useState('')
   const [editSrd, setEditSrd] = useState(null)
   const [editError, setEditError] = useState('')
   const [editLoading, setEditLoading] = useState(false)
@@ -26,6 +28,14 @@ function Dashboard({ email, token, onLogout }) {
   useEffect(() => {
     fetchProjects()
   }, [])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const projectId = Number(params.get('project') || 0)
+    if (!projectId || projects.length === 0) return
+    const match = projects.find(p => Number(p.id) === projectId)
+    if (match) setSelectedProject(match)
+  }, [projects])
 
   useEffect(() => {
     function handleClickOutside(e) {
@@ -63,12 +73,12 @@ function Dashboard({ email, token, onLogout }) {
   }
 
   async function handleCreateProject() {
-    if (projectName === '' || formUrl === '') {
-      setError('Project name and form URL are required')
+    if (projectName === '') {
+      setError('Project name is required')
       return
     }
-    if (!srdFile) {
-      setError('Please upload an SRD document')
+    if (!srdFile && notionUrl.trim() === '') {
+      setError('Upload an SRD document or provide a Notion URL')
       return
     }
 
@@ -79,7 +89,8 @@ function Dashboard({ email, token, onLogout }) {
       const formData = new FormData()
       formData.append('name', projectName)
       formData.append('form_url', formUrl)
-      formData.append('srd', srdFile)
+      if (srdFile) formData.append('srd', srdFile)
+      if (notionUrl.trim()) formData.append('notion_url', notionUrl.trim())
 
       const res = await fetch('/api/projects', {
         method: 'POST',
@@ -97,6 +108,7 @@ function Dashboard({ email, token, onLogout }) {
       await fetchProjects()
       setProjectName('')
       setFormUrl('')
+      setNotionUrl('')
       setSrdFile(null)
       setShowModal(false)
 
@@ -110,15 +122,16 @@ function Dashboard({ email, token, onLogout }) {
   function openEditModal(project) {
     setEditProject(project)
     setEditName(project.name)
-    setEditUrl(project.form_url)
+    setEditUrl(project.form_url || '')
+    setEditNotionUrl('')
     setEditSrd(null)
     setEditError('')
     setOpenMenu(null)
   }
 
   async function handleEditProject() {
-    if (!editName || !editUrl) {
-      setEditError('Project name and form URL are required')
+    if (!editName) {
+      setEditError('Project name is required')
       return
     }
 
@@ -130,6 +143,7 @@ function Dashboard({ email, token, onLogout }) {
       formData.append('name', editName)
       formData.append('form_url', editUrl)
       if (editSrd) formData.append('srd', editSrd)
+      if (editNotionUrl.trim()) formData.append('notion_url', editNotionUrl.trim())
 
       const res = await fetch(`/api/projects/${editProject.id}`, {
         method: 'PUT',
@@ -235,7 +249,7 @@ function Dashboard({ email, token, onLogout }) {
           filteredProjects.map((project) => (
             <div className="table-row" key={project.id}>
               <span>{project.name}</span>
-              <span className="url-cell">{project.form_url}</span>
+              <span className="url-cell">{project.form_url || 'Portal / no direct URL'}</span>
               <span>{project.last_tested}</span>
               <span className={`status-badge ${project.status.toLowerCase().replace(' ', '-')}`}>
                 {project.status}
@@ -332,6 +346,13 @@ function Dashboard({ email, token, onLogout }) {
               accept=".pdf,.doc,.docx"
               onChange={e => setEditSrd(e.target.files[0])}
             />
+            <label>Or Notion SRD URL</label>
+            <input
+              type="text"
+              value={editNotionUrl}
+              onChange={e => setEditNotionUrl(e.target.value)}
+              placeholder="https://www.notion.so/..."
+            />
             {editError && <p className="error-msg">{editError}</p>}
             <div className="modal-buttons">
               <button onClick={() => setEditProject(null)}>Cancel</button>
@@ -362,7 +383,7 @@ function Dashboard({ email, token, onLogout }) {
             <label>Form URL</label>
             <input
               type="text"
-              placeholder="https://example.com/form"
+              placeholder="https://example.com/form (optional)"
               value={formUrl}
               onChange={(e) => setFormUrl(e.target.value)}
             />
@@ -371,6 +392,13 @@ function Dashboard({ email, token, onLogout }) {
               type="file"
               accept=".pdf,.doc,.docx"
               onChange={(e) => setSrdFile(e.target.files[0])}
+            />
+            <label>Or Notion SRD URL</label>
+            <input
+              type="text"
+              placeholder="https://www.notion.so/..."
+              value={notionUrl}
+              onChange={(e) => setNotionUrl(e.target.value)}
             />
             {error && <p className="error-msg">{error}</p>}
             <div className="modal-buttons">
