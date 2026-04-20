@@ -517,28 +517,13 @@ async function runTests(projectId, options = {}) {
   if (testCases.length === 0) throw new Error('No test cases found')
 
   const browser = await launchChromiumBrowser()
-
-  // If the tester saved their session from the extension, load it here so
-  // Playwright starts already logged in and opens the real form directly
-  // instead of bouncing to the portal login page.
-  const authStatePath = process.env.AUTH_STATE_PATH
-    ? path.resolve(process.env.AUTH_STATE_PATH)
-    : path.join(process.cwd(), 'auth-state.json')
-  let contextOptions = {}
-  if (fs.existsSync(authStatePath)) {
-    try {
-      contextOptions = { storageState: authStatePath }
-      testLog(`Using saved session from ${authStatePath}`)
-    } catch (err) {
-      testLog(`Could not load saved session (${String(err?.message || err)}). Continuing without it.`)
-    }
-  }
-  const context = await browser.newContext(contextOptions)
-  const page = await context.newPage()
+  const page = await browser.newPage()
   const results = []
   let hasLoadedOnce = false
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null
+  const useExtensionScreenshots = String(options.screenshotSource || '').toLowerCase() === 'extension'
   const captureAtFailure = async (testCaseId, selectorHints = []) => {
+    if (useExtensionScreenshots) return null
     const hints = Array.isArray(selectorHints) ? selectorHints.filter(Boolean) : []
     for (const sel of hints) {
       try {
@@ -643,9 +628,20 @@ async function runTests(projectId, options = {}) {
       async function saveCaseResult(assertionPassed, baseNotes, screenshotOverride = null) {
         const { finalPassed, finalNotes } = finalizeByExpected(assertionPassed, baseNotes)
         let notesToSave = finalNotes
-        const screenshotPath = screenshotOverride
-        if (!finalPassed && screenshotPath) {
-          notesToSave = `${notesToSave}\nScreenshot: ${screenshotPath}`
+        let screenshotPath = screenshotOverride
+        if (!finalPassed && !useExtensionScreenshots && screenshotPath) {
+          if (screenshotPath) notesToSave = `${notesToSave}\nScreenshot: ${screenshotPath}`
+        }
+        if (!finalPassed && useExtensionScreenshots) {
+          // Tell extension to capture immediately while failed values/errors are still visible.
+          emitProgress({
+            phase: 'capture_failure',
+            message: `Capture failure: ${tc.name}`,
+            total: testCases.length,
+            completed: index + 1,
+            caseResult: { id: tc.id, name: tc.name, passed: false }
+          })
+          await page.waitForTimeout(1500)
         }
         await db.run(
           "UPDATE test_cases SET status = ?, notes = ? WHERE id = ?",
@@ -941,7 +937,6 @@ async function runTests(projectId, options = {}) {
     testLog('─────────────────────────────────────────')
   }
 
-  try { await context.close() } catch { /* ignore */ }
   await browser.close()
 
   const allPassed = results.every(r => r.passed)

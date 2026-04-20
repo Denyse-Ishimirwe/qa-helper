@@ -311,69 +311,6 @@ function ensureUploadsBaseDir() {
   return base
 }
 
-// Path where we keep the tester's saved browser session so Playwright can
-// reuse it and open protected pages without hitting the login screen.
-function getAuthStatePath() {
-  if (process.env.AUTH_STATE_PATH) return path.resolve(process.env.AUTH_STATE_PATH)
-  return path.join(process.cwd(), 'auth-state.json')
-}
-
-// Chrome cookies and Playwright cookies use slightly different shapes.
-// This converts the data the extension sends into the Playwright storageState
-// format so Playwright can start browsers already logged in as the tester.
-function buildPlaywrightStorageState(payload = {}) {
-  const mapSameSite = (value) => {
-    const v = String(value || '').toLowerCase()
-    if (v === 'strict') return 'Strict'
-    if (v === 'lax') return 'Lax'
-    if (v === 'no_restriction' || v === 'none') return 'None'
-    return 'Lax'
-  }
-
-  const rawCookies = Array.isArray(payload?.cookies) ? payload.cookies : []
-  const cookies = rawCookies
-    .map((c) => {
-      const name = String(c?.name || '')
-      const value = String(c?.value ?? '')
-      const domain = String(c?.domain || '')
-      const cookiePath = String(c?.path || '/')
-      if (!name || !domain) return null
-
-      // Chrome reports expirationDate in seconds; Playwright expects the same.
-      // Session cookies have no expirationDate — map them to -1.
-      const expires = Number.isFinite(Number(c?.expirationDate))
-        ? Math.floor(Number(c.expirationDate))
-        : -1
-
-      return {
-        name,
-        value,
-        domain,
-        path: cookiePath,
-        expires,
-        httpOnly: Boolean(c?.httpOnly),
-        secure: Boolean(c?.secure),
-        sameSite: mapSameSite(c?.sameSite)
-      }
-    })
-    .filter(Boolean)
-
-  const rawOrigins = Array.isArray(payload?.origins) ? payload.origins : []
-  const origins = rawOrigins
-    .map((o) => {
-      const origin = String(o?.origin || '').trim()
-      if (!origin) return null
-      const items = Array.isArray(o?.localStorage) ? o.localStorage : []
-      const localStorage = items
-        .map((kv) => ({ name: String(kv?.name || ''), value: String(kv?.value ?? '') }))
-        .filter((kv) => kv.name)
-      return { origin, localStorage }
-    })
-    .filter(Boolean)
-
-  return { cookies, origins }
-}
-
 function saveExtensionScreenshot(runId, testCaseId, dataUrl) {
   const m = String(dataUrl || '').match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/i)
   if (!m) return null
@@ -534,59 +471,6 @@ app.get('/api', (req, res) => {
   res.json({ ok: true, message: 'QA Helper API is running' })
 })
 
-// Save the tester's current browser session so Playwright can reuse it.
-// The extension sends cookies (from chrome.cookies) and any localStorage
-// captured from the active tab. We convert that into Playwright's
-// storageState JSON and write it to auth-state.json.
-app.post('/api/save-auth', requireAuth, async (req, res) => {
-  try {
-    const cookies = Array.isArray(req.body?.cookies) ? req.body.cookies : []
-    const origins = Array.isArray(req.body?.origins) ? req.body.origins : []
-    if (cookies.length === 0) {
-      return res.status(400).json({ ok: false, error: 'No cookies were provided — open the form in your browser and try again.' })
-    }
-
-    const storageState = buildPlaywrightStorageState({ cookies, origins })
-    if (storageState.cookies.length === 0) {
-      return res.status(400).json({ ok: false, error: 'No valid cookies were found to save.' })
-    }
-
-    const filePath = getAuthStatePath()
-    fs.mkdirSync(path.dirname(filePath), { recursive: true })
-    fs.writeFileSync(filePath, JSON.stringify(storageState, null, 2))
-
-    return res.json({
-      ok: true,
-      savedAt: new Date().toISOString(),
-      cookieCount: storageState.cookies.length,
-      originCount: storageState.origins.length
-    })
-  } catch (err) {
-    console.error('save-auth error:', err)
-    return res.status(500).json({ ok: false, error: err.message || 'Failed to save session' })
-  }
-})
-
-// Simple check so the extension can tell the tester whether a session is
-// already stored on the backend (green/red indicator in the popup).
-app.get('/api/save-auth/status', requireAuth, async (req, res) => {
-  try {
-    const filePath = getAuthStatePath()
-    if (!fs.existsSync(filePath)) {
-      return res.json({ ok: true, exists: false })
-    }
-    const stat = fs.statSync(filePath)
-    return res.json({
-      ok: true,
-      exists: true,
-      savedAt: new Date(stat.mtimeMs).toISOString(),
-      sizeBytes: stat.size
-    })
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message || 'Failed to read session status' })
-  }
-})
-
 app.post('/api/extension-scan', requireAuth, async (req, res) => {
   try {
     const { url, fields, projectId } = req.body || {}
@@ -648,6 +532,7 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
           overrideUrl: extensionUrl,
           scannedFields: safeFields,
           source: 'extension',
+          screenshotSource: 'extension',
           onProgress: (p) => {
             const job = extensionScanJobs.get(jobId)
             if (!job) return

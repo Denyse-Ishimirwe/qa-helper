@@ -3,7 +3,7 @@
   "name": "QA Helper",
   "version": "1.0",
   "description": "Tests Irembo forms automatically",
-  "permissions": ["activeTab", "scripting", "tabs", "storage", "cookies"],
+  "permissions": ["activeTab", "scripting", "tabs", "storage"],
   "host_permissions": [
     "http://localhost:3000/*",
     "http://localhost:5173/*",
@@ -16,7 +16,6 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "all_frames": true,
       "js": ["content.js"]
     }
   ]
