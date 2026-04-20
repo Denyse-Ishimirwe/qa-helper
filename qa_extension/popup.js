@@ -195,6 +195,67 @@ function scanFieldsFromTab(tabId) {
   })
 }
 
+async function scanFieldsViaInjection(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const getLabelText = (el) => {
+          const id = el.id
+          if (id) {
+            const byFor = document.querySelector(`label[for="${id}"]`)
+            if (byFor?.textContent?.trim()) return byFor.textContent.trim()
+          }
+          const wrapped = el.closest('label')
+          if (wrapped?.textContent?.trim()) return wrapped.textContent.trim()
+          return (el.getAttribute('aria-label') || '').trim()
+        }
+        const nodes = Array.from(document.querySelectorAll('input, select, textarea, button'))
+        return nodes.map((el, idx) => ({
+          index: idx + 1,
+          element: el.tagName.toLowerCase(),
+          type: String(el.getAttribute('type') || '').toLowerCase() || el.tagName.toLowerCase(),
+          id: el.id || '',
+          name: el.getAttribute('name') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          label: getLabelText(el),
+          required: Boolean(el.required) || String(el.getAttribute('aria-required') || '').toLowerCase() === 'true'
+        }))
+      }
+    })
+    const merged = []
+    for (const r of (Array.isArray(results) ? results : [])) {
+      const arr = Array.isArray(r?.result) ? r.result : []
+      merged.push(...arr)
+    }
+    return merged
+  } catch {
+    return []
+  }
+}
+
+async function fetchProjectTestCases(projectId) {
+  try {
+    const res = await fetch(`${API_BASE}/api/projects/${projectId}/test_cases`, {
+      headers: authHeaders()
+    })
+    if (!res.ok) return []
+    const data = await res.json().catch(() => [])
+    return Array.isArray(data) ? data : []
+  } catch {
+    return []
+  }
+}
+
+function indexTestCasesById(list = []) {
+  const map = new Map()
+  for (const tc of list) {
+    const id = Number(tc?.id || 0)
+    if (id) map.set(id, tc)
+  }
+  return map
+}
+
 async function runFromExtension() {
   els.results.innerHTML = ''
   els.viewBtn.style.display = 'none'
@@ -213,8 +274,13 @@ async function runFromExtension() {
     try {
       if (!tabs || !tabs[0]?.id) throw new Error('Could not access active tab')
       setStatus('Reading form fields...', true)
-      const fields = await scanFieldsFromTab(tabs[0].id)
+      let fields = await scanFieldsFromTab(tabs[0].id)
+      if (!fields.length) {
+        fields = await scanFieldsViaInjection(tabs[0].id)
+      }
       if (!fields.length) throw new Error('No fields found on active page')
+      const projectTestCases = await fetchProjectTestCases(projectId)
+      const testCaseMap = indexTestCasesById(projectTestCases)
 
       setStatus('Connecting to QA Helper...', true)
       const res = await fetch(`${API_BASE}/api/extension-scan`, {
@@ -236,11 +302,21 @@ async function runFromExtension() {
 
       const jobId = String(data.jobId || '').trim()
       if (!jobId) throw new Error('No scan job id returned from backend')
-      setActiveJob({ jobId, projectId, startedAt: Date.now() })
+      setActiveJob({
+        jobId,
+        projectId,
+        startedAt: Date.now(),
+        tabId: Number(tabs[0].id),
+        windowId: Number(tabs[0].windowId || 0)
+      })
 
       lastEventSeq = 0
       const pendingScreenshots = []
-      const finalResult = await pollJobUntilDone(jobId, pendingScreenshots)
+      const finalResult = await pollJobUntilDone(jobId, pendingScreenshots, {
+        tabId: Number(tabs[0].id),
+        windowId: Number(tabs[0].windowId || 0),
+        testCaseMap
+      })
       if (!finalResult) {
         setStatus('Still running in background... reopen popup to continue tracking.', false)
         els.results.innerHTML = '<div class="check">Run is still active. You can close and reopen the popup to continue tracking progress.</div>'
@@ -265,17 +341,51 @@ async function runFromExtension() {
   })
 }
 
-async function captureCurrentPagePng() {
+async function captureCurrentPagePng(captureContext = {}) {
   return new Promise((resolve, reject) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const winId = tabs?.[0]?.windowId
+    const targetTabId = Number(captureContext?.tabId || 0)
+    const targetWindowId = Number(captureContext?.windowId || 0)
+
+    const captureFromWindow = (winId) => {
       if (!winId) return reject(new Error('No active window for screenshot capture'))
       chrome.tabs.captureVisibleTab(winId, { format: 'jpeg', quality: 55 }, (dataUrl) => {
         if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
         if (!dataUrl) return reject(new Error('Screenshot capture returned empty data'))
         resolve(dataUrl)
       })
+    }
+
+    // Capture from the same tab/window that started the run.
+    if (targetTabId) {
+      chrome.tabs.update(targetTabId, { active: true }, (tab) => {
+        if (chrome.runtime.lastError) {
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            captureFromWindow(tabs?.[0]?.windowId || targetWindowId)
+          })
+          return
+        }
+        captureFromWindow(Number(tab?.windowId || targetWindowId))
+      })
+      return
+    }
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      captureFromWindow(tabs?.[0]?.windowId || targetWindowId)
     })
+  })
+}
+
+async function stageFailureViewOnTab(tabId, testCase) {
+  if (!tabId || !testCase) return
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(
+      tabId,
+      { type: 'QA_HELPER_STAGE_FAILURE_VIEW', testCase },
+      (response) => {
+        if (chrome.runtime.lastError) return resolve(false)
+        resolve(Boolean(response?.ok))
+      }
+    )
   })
 }
 
@@ -307,7 +417,7 @@ async function uploadFailureScreenshotForJob(jobId, testCaseId, imageDataUrl) {
   }
 }
 
-async function pollJobUntilDone(jobId, pendingScreenshots = []) {
+async function pollJobUntilDone(jobId, pendingScreenshots = [], captureContext = {}) {
   let finalResult = null
   const pollStarted = Date.now()
   const pollTimeoutMs = 25 * 60 * 1000
@@ -342,7 +452,11 @@ async function pollJobUntilDone(jobId, pendingScreenshots = []) {
       lastEventSeq = seq
       if (ev?.phase === 'capture_failure' && ev?.caseResult && ev.caseResult.passed === false) {
         try {
-          const imageDataUrl = await captureCurrentPagePng()
+          const tc = captureContext?.testCaseMap?.get(Number(ev.caseResult.id))
+          if (tc && captureContext?.tabId) {
+            await stageFailureViewOnTab(captureContext.tabId, tc)
+          }
+          const imageDataUrl = await captureCurrentPagePng(captureContext)
           const testCaseId = Number(ev.caseResult.id)
           const uploaded = await uploadFailureScreenshotForJob(jobId, testCaseId, imageDataUrl)
           if (!uploaded) {
@@ -377,7 +491,14 @@ async function resumeActiveJobIfAny() {
   try {
     setStatus('Resuming running test...', true)
     const pendingScreenshots = []
-    const result = await pollJobUntilDone(String(active.jobId), pendingScreenshots)
+    const projectTestCases = await fetchProjectTestCases(Number(active.projectId || 0))
+    const testCaseMap = indexTestCasesById(projectTestCases)
+
+    const result = await pollJobUntilDone(String(active.jobId), pendingScreenshots, {
+      tabId: Number(active?.tabId || 0),
+      windowId: Number(active?.windowId || 0),
+      testCaseMap
+    })
     if (!result) {
       setStatus('Still running in background... reopen popup to continue tracking.', false)
       return
