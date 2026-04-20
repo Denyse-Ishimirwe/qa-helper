@@ -14,6 +14,7 @@ dist-ssr
 .env
 uploads/
 qahelper.db
+auth-state.json
 CONTEXT.md
 plan.md
 DEPLOY.md
