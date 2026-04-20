@@ -1,7 +1,7 @@
-/* global chrome */
-const API_BASE = 'http://localhost:3000'
-const APP_BASE = 'http://localhost:5173'
-const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com']
+/* global chrome, CONFIG, resolveApiUrl */
+let API_BASE = CONFIG.API_URL
+let APP_BASE = CONFIG.API_URL
+const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com', CONFIG.LOCAL_URL, CONFIG.PRODUCTION_URL]
 const ACTIVE_JOB_KEY = 'qa_ext_active_job'
 let lastEventSeq = 0
 
@@ -404,5 +404,16 @@ if (els.openAppBtn) {
   els.openAppBtn.addEventListener('click', openApp)
 }
 
-loadProjects()
-resumeActiveJobIfAny()
+async function initExtension() {
+  try {
+    const resolved = await resolveApiUrl()
+    API_BASE = resolved
+    APP_BASE = resolved
+  } catch {
+    // Fallback to whatever CONFIG.API_URL already points at.
+  }
+  loadProjects()
+  resumeActiveJobIfAny()
+}
+
+initExtension()
