@@ -53,26 +53,6 @@ function authHeaders() {
   }
 }
 
-async function fetchWithRetry(url, options = {}, attempts = 3) {
-  let lastErr = null
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      const res = await fetch(url, options)
-      if (res.status === 502 || res.status === 503 || res.status === 504) {
-        // Render cold-start or gateway hiccup — back off and retry.
-        await new Promise(r => setTimeout(r, 1500 * (i + 1)))
-        continue
-      }
-      return res
-    } catch (err) {
-      lastErr = err
-      await new Promise(r => setTimeout(r, 1500 * (i + 1)))
-    }
-  }
-  if (lastErr) throw lastErr
-  throw new Error('Backend is waking up, please try again in a few seconds.')
-}
-
 function setStatus(text, running = false) {
   if (els.status) els.status.textContent = text
   if (els.statusWrap) {
@@ -152,7 +132,7 @@ async function loadProjects() {
       showOpenApp('Please log in to QA Helper first')
       return
     }
-    const res = await fetchWithRetry(`${API_BASE}/api/projects`, { headers: authHeaders() })
+    const res = await fetch(`${API_BASE}/api/projects`, { headers: authHeaders() })
     if (res.status === 401 || res.status === 403) {
       setStoredToken('')
       showOpenApp('Please log in to QA Helper first')
@@ -183,7 +163,7 @@ async function login() {
     return
   }
   try {
-    const res = await fetchWithRetry(`${API_BASE}/api/auth/login`, {
+    const res = await fetch(`${API_BASE}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password })
@@ -237,7 +217,7 @@ async function runFromExtension() {
       if (!fields.length) throw new Error('No fields found on active page')
 
       setStatus('Connecting to QA Helper...', true)
-      const res = await fetchWithRetry(`${API_BASE}/api/extension-scan`, {
+      const res = await fetch(`${API_BASE}/api/extension-scan`, {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({
@@ -332,7 +312,7 @@ async function pollJobUntilDone(jobId, pendingScreenshots = []) {
   const pollStarted = Date.now()
   const pollTimeoutMs = 25 * 60 * 1000
   while (Date.now() - pollStarted < pollTimeoutMs) {
-    const statusRes = await fetchWithRetry(`${API_BASE}/api/extension-scan/status/${jobId}`, {
+    const statusRes = await fetch(`${API_BASE}/api/extension-scan/status/${jobId}`, {
       headers: authHeaders()
     })
     const statusData = await statusRes.json().catch(() => ({}))
