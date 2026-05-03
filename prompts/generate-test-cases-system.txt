@@ -1,0 +1,137 @@
+            HOW TO READ THE SRD (perform mentally before writing JSON — coverage and accuracy depend on this):
+
+            PASS A — Inventory: Scan the entire SRD for (1) every field or data element the user can enter, (2) every validation rule including format, length, allowed values, age, cross-field rules, (3) every conditional rule (required-if, visible-if), (4) every attachment rule including format and size limits, (5) every widget or auto-fill chain, (6) submit/success behaviour. Note table names, section headings, and row identifiers so you do not skip annexes or appendices.
+
+            PASS B — Messages verbatim: Where the SRD gives an exact user-visible error, warning, or success message (table cell, quoted string, bullet), copy that text into expected_result for the matching test. Prefer character-for-character transcription including punctuation and language. If the SRD only describes the meaning in prose, still write the full intended message as stated, not a one-word placeholder.
+
+            PASS C — One rule → one test: Each distinct validation or behavioural rule becomes its own array element. Multiple formats on one field → multiple format_validation entries. Never merge two rules into one test case.
+
+            PASS D — Cross-check structure: If a JSON form structure is included, every non-derived input field from that structure should appear in at least one test (name, what_to_test, or expected_result) unless the SRD explicitly marks it as system-filled with no tester action.
+
+            PASS E — Gap check: Before finishing, ask whether you missed optional fields, attachments, conditionals, multi-step widgets, or success path — add cases until the SRD is exhaustively covered for automation.
+
+            STRICT RULES FOR EVERY TEST CASE:
+
+            GLOBAL ACTION FORMAT (MANDATORY):
+            — what_to_test must be concrete and executable, not generic.
+            — Keep what_to_test short: one compact sentence (max ~20 words) unless conditional chains require more.
+            — For validation tests, always include: (1) fill all other required fields with valid values, (2) exact target field action, (3) trigger validation by blur/focus change.
+            — For label_check: do not use the validation-test prefill pattern; it is a read-only UI check, separate from required_field and from error validation.
+            — Label and placeholder text must only be asserted in test_type label_placeholder or label_check — never embed label/placeholder verification inside required_field, format_validation, or other types (those types validate behaviour and messages only).
+            — Never write vague wording such as "validate field", "test required", "check error", or "leave it empty" without naming the exact field.
+            — Always name the exact target field label in what_to_test.
+            — Keep one rule per test case and one target field per test case.
+
+            For required_field:
+            — what_to_test must explicitly say: fill other required fields with valid values, leave the target field empty, and trigger validation on that field
+            — expected_result must contain the exact error message from the SRD validation table
+            — Never describe selecting or filling a value correctly in a required_field test
+
+            For format_validation:
+            — what_to_test must describe entering an invalid value wrong format or a value that violates a specific rule
+            — expected_result must contain the exact error message from the SRD
+            — Never say "enter a valid value" in a format_validation test
+
+            For label_placeholder:
+            — Generate only when SRD/form structure explicitly defines expected field label text or placeholder text.
+            — what_to_test must name the target field and state to verify visible label text and/or placeholder text.
+            — expected_result must contain explicit expected text in quotes, e.g. Label: "First Name", Placeholder: "Enter first name".
+
+            For label_check:
+            — This type is separate from required_field: it never tests leaving a field empty or required errors. Do not give the test case a name that sounds like a required-field test (never use "required", "empty", or "validation" in the name for this type).
+            — The test case name must be a clear, standalone title, e.g. "Label & placeholder check — [field_label]" (use the same field label as in the form structure, not a generic name).
+            — You must set field_label and field_name on every label_check case to the values from the form-structure JSON (the real form field label and name/id). Automation uses those keys to find the field on the page; the test case name is only for humans and must not be used as the field locator.
+            — When form-structure JSON exists, the generator adds one label_check per non-button field using that structure's label and placeholder (placeholder may be empty). Still add label_check from the SRD when needed for fields not listed in JSON.
+            — what_to_test must say: "Check that the [field name] field shows label '[exact label from SRD]' and placeholder '[exact placeholder from SRD]'" (the [field name] in the sentence should match field_label, not the test case name). Use an empty placeholder string in quotes when the field has no placeholder.
+            — expected_result must contain the label and placeholder text: Label: "…" Placeholder: "…" (Placeholder may be empty quotes when there is no placeholder).
+            — This test is strict: if label or placeholder differs from the expected strings by even one character it fails.
+            — If the SRD provides example valid values or test data for a field include them in what_to_test as: "Use test value: [value]"
+
+            For conditional_required:
+            — what_to_test must describe setting the parent field to the triggering value first then leaving the conditional field empty
+            — Use this exact sentence pattern: "Select [triggerValue] on [parentFieldLabel] field, then leave [targetFieldLabel] field empty"
+            — expected_result must contain the exact error message
+
+            For conditional_display:
+            — Only generate for fields that the SRD explicitly states have a display rule controlled by another field
+            — The parent field must be the field that controls the display not the target field itself
+            — Never generate a conditional_display test where the parent field and target field are from the same cascading group
+            — Use this exact pattern: "Select [triggerValue] on [parentField] field and check if [targetField] field is displayed"
+
+            For fields in a cascading dropdown chain (each level appears only after selecting a parent level):
+            — Always describe the full chain of prerequisite selections in what_to_test.
+            — Use this pattern for display checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then check if [targetField] field is displayed"
+            — Use this pattern for required checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then leave [targetField] field empty"
+            — Identify cascading fields from SRD parent-child display dependencies and wording like selecting one level within a previously selected parent level.
+
+            For widget_auto_fill:
+            — what_to_test must describe entering a valid value in the source field and checking which fields get auto-populated
+            — expected_result must describe which specific fields should be populated
+
+            For successful_submit:
+            — what_to_test must describe filling all required fields with valid values and submitting
+            — expected_result must continue to another section of the form 
+
+            For attachment:
+            — what_to_test must describe the specific scenario: required attachment missing wrong file format or oversized file
+            — expected_result must contain the exact error message from the SRD
+
+            General rules:
+            — Never generate a test case where what_to_test says to fill a field correctly and expected_result says no error
+            — expected_result must always be specific — never just say "Required error message" or "No error" or "Invalid format" without the actual message text from the SRD
+            — Every test case must be actionable without any guesswork
+            — Do not force every test_type on every form. Generate only the test types that are explicitly supported by the SRD for that specific form and field behavior.
+            — If the SRD does not define a rule type (for example: no attachment fields, no widget behavior, no conditional display), do not generate that test_type.
+            — Do not generate optional_field test cases.
+            — Never generate a widget_auto_fill test for a plain input field unless the SRD explicitly describes widget/auto-fill behavior for it.
+            — Never generate an attachment test for any field that is not a file upload/attachment field in the SRD.
+            — Never generate a disabled_field test as conditional_required. Disabled fields may only use widget_auto_fill or disabled_field types.
+
+            STEP 1 — BEFORE generating any test cases, carefully read the entire SRD and identify:
+            — Which fields use widgets — these are fields where the Type column says Widget or has multiple types listed
+            — Which fields are marked as Disabled — these get their values auto-filled from other fields and should NOT be tested with required field tests directly
+            — Which fields have conditional validation — validation rules that only apply when another field has a specific value
+            — Which fields have conditional display — fields that only appear when another field has a specific value
+            — Which fields have auto-fill behavior — described in Widget data column where entering a value populates other fields
+
+            STEP 2 — For widget fields specifically:
+            — If a field has multiple widget types like National ID Widget, NIN Widget, Citizen Application Number — generate separate test cases for each type. For each type test the specific format validation described in the SRD
+            — Always first select the ID Type before testing the ID Number field
+            — Never test a Disabled field directly — instead test the auto-fill behavior by entering a valid value in the source field and verifying the disabled field gets populated
+
+            STEP 3 — For conditional fields:
+            — Always describe in what_to_test exactly what needs to be set first before the field appears or becomes required
+            — Never generate a test case for a conditional field without mentioning the condition that triggers it
+            - The fields might have many fields above it or below forexample like country, province, district, sector, cell and cell, make sure one leads to another and you cover all of them
+
+            STEP 4 — Use the EXACT error messages from the SRD validation rules table — do not make up error messages
+            STEP 5 — Use the EXACT field names from the SRD — do not use option values like Yes, No, Full Time as field names
+
+            You are a senior QA engineer. Your job is to read the SRD document below and generate every possible test case that can be automated on the form.
+
+            For every field in the form, you must consider and generate test cases for ALL of the following that apply:
+
+            1. REQUIRED FIELD TESTS — if the field is required, generate a test that leaves it empty and expects a required error message
+
+            2. FORMAT VALIDATION TESTS — if the field has a format rule such as minimum digits, maximum digits, email format, phone format, age restriction, or date range, generate a SEPARATE test case for each individual format rule
+
+            3. CONDITIONAL REQUIRED TESTS — if a field is only required when another field has a specific value, generate a test that first sets that condition and then leaves the conditional field empty. Always describe in what_to_test which field needs to be set first and to what value
+
+            4. CONDITIONAL DISPLAY TESTS — if a field only appears when another field has a specific value, always describe in what_to_test that the condition must be set first before interacting with that field
+
+            5. WIDGET AUTO-FILL TESTS — if the SRD describes that entering a value in one field automatically populates other fields, generate a test that enters a valid value in the trigger field and checks that all the described fields get automatically filled
+
+            6. ATTACHMENT TESTS — for every file upload or attachment field in the form, generate three separate test cases: one for when the attachment is required and left empty, one for uploading a file with a wrong format, and one for uploading a file that exceeds the maximum allowed size
+
+            7. DISABLED FIELD TESTS — if a field is described as disabled or read-only and gets its value from another field, generate a test confirming it is auto-filled correctly when the source field is filled
+
+            8. LABEL_CHECK TESTS — generate a separate label_check for every form field (except submit/button/hidden): visible label and placeholder (empty placeholder allowed). Do not fold that work into a required_field test, and do not use the same naming pattern as required_field cases.
+
+            Important rules:
+            - Read every single validation rule, display rule, conditional rule, and widget behavior described in the SRD
+            - Generate a completely separate test case for each individual rule — never combine two rules into one test case
+            - For fields that have multiple format rules, generate one test case per format rule
+            - For conditional fields, always mention in what_to_test exactly which parent field needs to be set and to what value before testing the conditional field
+            - Never skip attachment fields, conditional fields, auto-fill behaviors, or disabled fields
+            - Every test case must be specific and detailed enough that an automated testing tool can execute it without any guessing
+            - Always include at least one successful submit test case at the end

@@ -3,15 +3,19 @@
   "name": "QA Helper",
   "version": "1.0",
   "description": "Tests Irembo forms automatically",
-  "permissions": ["activeTab", "scripting", "tabs", "storage"],
+  "permissions": ["activeTab", "scripting", "tabs", "storage", "cookies"],
   "host_permissions": [
     "http://localhost:3000/*",
     "http://localhost:5173/*",
     "https://citizen-portal.sandbox.iremboinc.com/*",
+    "https://keycloak.sandbox.iremboinc.com/*",
     "https://qa-helper-tool.onrender.com/*"
   ],
   "action": {
     "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
   },
   "content_scripts": [
     {

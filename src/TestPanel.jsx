@@ -333,6 +333,12 @@ function TestPanel({ project, token, onClose }) {
               <option value="required_field">required_field</option>
               <option value="format_validation">format_validation</option>
               <option value="successful_submit">successful_submit</option>
+              <option value="conditional_required">conditional_required</option>
+              <option value="conditional_display">conditional_display</option>
+              <option value="optional_field">optional_field</option>
+              <option value="widget_auto_fill">widget_auto_fill</option>
+              <option value="attachment">attachment</option>
+              <option value="disabled_field">disabled_field</option>
             </select>
             {addError && <p className="panel-error">{addError}</p>}
             <div className="card-btns" style={{ marginTop: '12px' }}>
@@ -387,7 +393,7 @@ function TestPanel({ project, token, onClose }) {
                     <div className="comparison-group" key={group.key}>
                       <p className="comparison-group-title">{group.label} ({items.length})</p>
                       <ul className="comparison-group-list">
-                        {items.slice(0, 5).map(item => (
+                        {items.map(item => (
                           <li key={`${group.key}-${item.id}-${item.test_case_id}`}>
                             {item.snapshot_name || `Test case #${item.test_case_id}`}
                           </li>
@@ -448,6 +454,12 @@ function TestPanel({ project, token, onClose }) {
                       <option value="required_field">required_field</option>
                       <option value="format_validation">format_validation</option>
                       <option value="successful_submit">successful_submit</option>
+                      <option value="conditional_required">conditional_required</option>
+                      <option value="conditional_display">conditional_display</option>
+                      <option value="optional_field">optional_field</option>
+                      <option value="widget_auto_fill">widget_auto_fill</option>
+                      <option value="attachment">attachment</option>
+                      <option value="disabled_field">disabled_field</option>
                     </select>
                     <div className="card-btns">
                       <button className="btn-save" onClick={() => handleSaveEdit(tc.id)}>Save</button>

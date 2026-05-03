@@ -9,6 +9,7 @@ function Dashboard({ email, token, onLogout }) {
   const [formUrl, setFormUrl] = useState('')
   const [notionUrl, setNotionUrl] = useState('')
   const [srdFile, setSrdFile] = useState(null)
+  const [testDataFile, setTestDataFile] = useState(null)
   const [activeFilter, setActiveFilter] = useState('All Projects')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -90,6 +91,7 @@ function Dashboard({ email, token, onLogout }) {
       formData.append('name', projectName)
       formData.append('form_url', formUrl)
       if (srdFile) formData.append('srd', srdFile)
+      if (testDataFile) formData.append('test_data_file', testDataFile)
       if (notionUrl.trim()) formData.append('notion_url', notionUrl.trim())
 
       const res = await fetch('/api/projects', {
@@ -110,6 +112,7 @@ function Dashboard({ email, token, onLogout }) {
       setFormUrl('')
       setNotionUrl('')
       setSrdFile(null)
+      setTestDataFile(null)
       setShowModal(false)
 
     } catch {
@@ -119,7 +122,7 @@ function Dashboard({ email, token, onLogout }) {
     }
   }
 
-  function openEditModal(project) {
+  async function openEditModal(project) {
     setEditProject(project)
     setEditName(project.name)
     setEditUrl(project.form_url || '')
@@ -392,6 +395,13 @@ function Dashboard({ email, token, onLogout }) {
               type="file"
               accept=".pdf,.doc,.docx"
               onChange={(e) => setSrdFile(e.target.files[0])}
+            />
+            <label>Test Data Document (optional)</label>
+            <p className="srd-note">Upload a file with values like: First Name: John, National ID: 123..., DOB: 01/01/1990</p>
+            <input
+              type="file"
+              accept=".txt,.json,.csv,.pdf,.doc,.docx"
+              onChange={(e) => setTestDataFile(e.target.files[0] || null)}
             />
             <label>Or Notion SRD URL</label>
             <input

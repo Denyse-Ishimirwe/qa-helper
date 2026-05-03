@@ -1,14 +1,57 @@
-import Groq from 'groq-sdk'
-import { launchChromiumBrowser } from './playwright-launch.js'
 import 'dotenv/config'
+import { launchChromiumBrowser } from './playwright-launch.js'
+import { groqChatCompletionsCreate, GROQ_PRIMARY_MODEL } from './ai.js'
 import db from './db.js'
 import fs from 'node:fs'
 import path from 'node:path'
+
+const SUPPORTED_TEST_TYPES = [
+  'required_field',
+  'format_validation',
+  'successful_submit',
+  'conditional_required',
+  'conditional_display',
+  'optional_field',
+  'widget_auto_fill',
+  'attachment',
+  'disabled_field'
+]
+
+function normalizeTestType(rawType) {
+  const t = String(rawType || '').toLowerCase().trim()
+  if (!t) return 'required_field'
+  if (SUPPORTED_TEST_TYPES.includes(t)) return t
+  if (t === 'conditional_displayed' || t === 'conditional' || t === 'display_conditional') return 'conditional_display'
+  if (t === 'widget_autofill' || t === 'auto_fill' || t === 'autofill') return 'widget_auto_fill'
+  if (t === 'optional' || t === 'optional_validation') return 'optional_field'
+  if (t === 'conditional_required_field' || t === 'required_if') return 'conditional_required'
+  if (t === 'file_attachment' || t === 'attachment_validation') return 'attachment'
+  return 'required_field'
+}
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
 function testLog(line) {
   console.log(`[TEST] ${line}`)
+}
+
+async function isOnLoginPage(page) {
+  try {
+    const url = page.url()
+    if (url.includes('login') || url.includes('signin') || url.includes('auth')) return true
+    const loginSignals = await page.evaluate(() => {
+      const text = document.body.innerText.toLowerCase()
+      return (
+        text.includes('sign in with irembo') ||
+        text.includes('enter your details to continue') ||
+        text.includes('invalid username or password') ||
+        (text.includes('phone number') && text.includes('password') && text.includes('sign in'))
+      )
+    })
+    return Boolean(loginSignals)
+  } catch {
+    return false
+  }
 }
 
 // ─── AI validation — ONLY for manually added test cases ──────────────────────
@@ -18,7 +61,6 @@ async function validateManualTestCase({ name, what_to_test, expected_result }) {
   const key = process.env.GROQ_API_KEY
   if (!key) return { valid: false, test_type: 'required_field', reason: 'GROQ_API_KEY not set' }
 
-  const groq = new Groq({ apiKey: key })
   const content = `
 You are a strict QA validator. A tester manually wrote this test case for a registration form:
 Name: ${name}
@@ -31,15 +73,15 @@ Return JSON only — no other text:
 Rules:
 - Return valid: false if the test case is vague, nonsensical, contradicts itself, or cannot be automated by filling a form and clicking submit
 - Return valid: true if it clearly describes a specific automatable form test
-- test_type must be exactly one of: required_field, format_validation, successful_submit
+- test_type must be exactly one of: required_field, format_validation, successful_submit, conditional_required, conditional_display, optional_field, widget_auto_fill, attachment, disabled_field
 - required_field: tests that an error appears when a required field is left empty
 - format_validation: tests that an error appears when a field has wrong format (e.g. wrong ID number)
 - successful_submit: tests that the form submits successfully when all fields are correct
 `.trim()
 
   try {
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+    const completion = await groqChatCompletionsCreate({
+      model: GROQ_PRIMARY_MODEL,
       messages: [{ role: 'user', content }]
     })
     const response = completion.choices?.[0]?.message?.content || '{}'
@@ -47,7 +89,7 @@ Rules:
     const parsed = JSON.parse(cleaned)
     const valid = Boolean(parsed?.valid)
     const rawType = String(parsed?.test_type || '')
-    const test_type = ['required_field', 'format_validation', 'successful_submit'].includes(rawType)
+    const test_type = SUPPORTED_TEST_TYPES.includes(rawType)
       ? rawType : 'required_field'
     const reason = String(parsed?.reason || '').trim() || (valid ? 'Valid test case' : 'Invalid test case')
     return { valid, test_type, reason }
@@ -187,8 +229,16 @@ function deriveInvalidValueForTestCase(tc, field, fallbackValue) {
 
 async function fillAllFields(page, fields = KNOWN_FIELDS, options = {}) {
   const exclude = new Set(Array.isArray(options?.excludeSelectors) ? options.excludeSelectors : [])
+  const excludeNames = new Set(
+    Array.isArray(options?.excludeNames)
+      ? options.excludeNames.map(v => String(v || '').trim()).filter(Boolean)
+      : []
+  )
+  const excludePredicate = typeof options?.excludePredicate === 'function' ? options.excludePredicate : null
   for (const f of fields) {
     if (exclude.has(f.selector)) continue
+    if (excludeNames.has(String(f?.name || '').trim())) continue
+    if (excludePredicate && excludePredicate(f)) continue
     try {
       const loc = page.locator(f.selector).first()
       const type = normalizeType(f.type)
@@ -234,6 +284,7 @@ function matchFieldFromTestCaseInSet(tc, fields) {
   const quotedParts = Array.from(quotedRaw.matchAll(/"([^"]{2,80})"/g))
     .map(m => toNormalizedText(m[1]))
     .filter(Boolean)
+    .filter(qp => !['yes', 'no', 'male', 'female', 'full time', 'part time'].includes(qp))
   let best = null
   let bestScore = 0
   let bestLabel = ''
@@ -392,6 +443,252 @@ async function isVisible(page, selector) {
   }
 }
 
+function normalizeForCompare(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function tokenizeForCompare(value) {
+  const stop = new Set(['the', 'is', 'are', 'a', 'an', 'to', 'of', 'for', 'and', 'or', 'field', 'please'])
+  return normalizeForCompare(value)
+    .split(' ')
+    .filter(Boolean)
+    .filter(t => !stop.has(t))
+}
+
+function tokenOverlapScore(a, b) {
+  const as = new Set(tokenizeForCompare(a))
+  const bs = new Set(tokenizeForCompare(b))
+  if (as.size === 0 || bs.size === 0) return 0
+  let hits = 0
+  for (const t of as) if (bs.has(t)) hits += 1
+  return hits / Math.max(1, Math.min(as.size, bs.size))
+}
+
+async function collectVisibleValidationMessages(page) {
+  try {
+    const msgs = await page.evaluate(() => {
+      const candidates = Array.from(document.querySelectorAll(`
+        [role="alert"],
+        [aria-live],
+        .error,
+        .errors,
+        .invalid-feedback,
+        .text-danger,
+        .mat-error,
+        .ant-form-item-explain-error,
+        .help-block,
+        .form-error,
+        .field-error,
+        .validation-message,
+        .error-message,
+        small,
+        p,
+        span,
+        div
+      `))
+      const visible = (el) => {
+        const style = window.getComputedStyle(el)
+        const rect = el.getBoundingClientRect()
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      }
+      const looksLikeValidation = (txt) => {
+        const t = String(txt || '').trim().toLowerCase()
+        if (!t || t.length < 3 || t.length > 220) return false
+        return /required|invalid|must|missing|mandatory|please|select|enter|choose|upload|format|larger than|not allowed|error/.test(t)
+      }
+      return candidates
+        .filter(visible)
+        .map(el => String(el.textContent || '').trim())
+        .filter(looksLikeValidation)
+        .filter((msg, idx, arr) => arr.indexOf(msg) === idx)
+        .slice(0, 20)
+    })
+    return Array.isArray(msgs) ? msgs : []
+  } catch {
+    return []
+  }
+}
+
+function pickBestMessageMatch(expected, messages = []) {
+  const expectedNorm = normalizeForCompare(expected)
+  let best = ''
+  let bestScore = 0
+  for (const msg of messages) {
+    const msgNorm = normalizeForCompare(msg)
+    let score = tokenOverlapScore(expectedNorm, msgNorm)
+    if (expectedNorm && msgNorm.includes(expectedNorm)) score = Math.max(score, 0.95)
+    if (score > bestScore) {
+      bestScore = score
+      best = msg
+    }
+  }
+  return { bestMessage: best, score: bestScore }
+}
+
+function isLikelyGlobalMessage(msg) {
+  const t = normalizeForCompare(msg)
+  return (
+    t.includes('invalid username or password') ||
+    t.includes('enter your details to continue') ||
+    t.includes('sign in') ||
+    t.includes('log in') ||
+    t.includes('session expired')
+  )
+}
+
+async function detectFieldInvalidState(page, field) {
+  if (!field?.selector) return false
+  try {
+    return await page.locator(field.selector).first().evaluate((el) => {
+      const selfInvalid =
+        el.getAttribute('aria-invalid') === 'true' ||
+        el.classList.contains('is-invalid') ||
+        el.classList.contains('ng-invalid') ||
+        el.classList.contains('error')
+      if (selfInvalid) return true
+      const group = el.closest('[role="group"], .form-group, .field-group, .mat-form-field, .radio-group')
+      if (!group) return false
+      return (
+        group.classList.contains('is-invalid') ||
+        group.classList.contains('ng-invalid') ||
+        group.classList.contains('error') ||
+        group.getAttribute('aria-invalid') === 'true'
+      )
+    })
+  } catch {
+    return false
+  }
+}
+
+function evaluateValidationEvidence({ expectedText, field, visibleMessages, fieldError, invalidState }) {
+  const { bestMessage, score } = pickBestMessageMatch(expectedText || '', visibleMessages || [])
+  const fieldLabelNorm = normalizeForCompare(field?.label || '')
+  const mentionsTarget = (visibleMessages || []).some(msg => {
+    const m = normalizeForCompare(msg)
+    return Boolean(fieldLabelNorm) && m.includes(fieldLabelNorm)
+  })
+  const hasValidationLike = (visibleMessages || []).some(msg => /required|must|missing|mandatory|invalid|error|choose|select/i.test(msg))
+  const strongSemanticMatch = score >= 0.6
+  const targetLinkedMessage = mentionsTarget && hasValidationLike
+  const semanticMatch = strongSemanticMatch || targetLinkedMessage
+  const hasEvidence = Boolean(fieldError) || Boolean(invalidState) || semanticMatch
+  return { hasEvidence, bestMessage, semanticMatch, mentionsTarget, hasValidationLike, strongSemanticMatch, targetLinkedMessage, score }
+}
+
+function detectConditionValueToken(tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (/\bfull\s*time\b/.test(text)) return 'full time'
+  if (/\bpart\s*time\b/.test(text)) return 'part time'
+  if (/\bnational\s*id\b/.test(text)) return 'national id'
+  if (/\bcitizen application number\b/.test(text)) return 'citizen application number'
+  if (/\bnin\b/.test(text)) return 'nin'
+  if (/\byes\b/.test(text)) return 'yes'
+  if (/\bno\b/.test(text)) return 'no'
+  return ''
+}
+
+function findConditionControllerField(tc, runtimeFields) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  const keywordGroups = [
+    ['live in rwanda', 'residence'],
+    ['contract type', 'employment'],
+    ['id type', 'identification']
+  ]
+  for (const group of keywordGroups) {
+    if (!group.some(k => text.includes(k))) continue
+    const hit = runtimeFields.find((f) => {
+      const label = String(f?.label || '').toLowerCase()
+      const name = String(f?.name || '').toLowerCase()
+      return group.some(k => label.includes(k) || name.includes(k))
+    })
+    if (hit) return hit
+  }
+  return null
+}
+
+async function applyConditionValue(page, controllerField, valueToken) {
+  if (!controllerField || !valueToken) return false
+  const type = normalizeType(controllerField.type)
+  try {
+    if (type === 'select') {
+      const done = await page.locator(controllerField.selector).first().evaluate((el, token) => {
+        const select = el
+        const wanted = String(token || '').toLowerCase().trim()
+        const options = Array.from(select.options || [])
+        const match = options.find(opt => {
+          const label = String(opt.textContent || '').toLowerCase().trim()
+          const value = String(opt.value || '').toLowerCase().trim()
+          return label === wanted || value === wanted || label.includes(wanted)
+        })
+        if (!match) return false
+        select.value = match.value
+        select.dispatchEvent(new Event('input', { bubbles: true }))
+        select.dispatchEvent(new Event('change', { bubbles: true }))
+        return true
+      }, valueToken)
+      if (done) return true
+    }
+  } catch { /* fall through to generic click strategy */ }
+
+  try {
+    const clicked = await page.evaluate((token) => {
+      const wanted = String(token || '').toLowerCase().trim()
+      const labels = Array.from(document.querySelectorAll('label'))
+      for (const lb of labels) {
+        const txt = String(lb.textContent || '').toLowerCase().trim()
+        if (!txt || !txt.includes(wanted)) continue
+        const forId = lb.getAttribute('for')
+        const byFor = forId ? document.getElementById(forId) : null
+        const nested = lb.querySelector('input[type="radio"], input[type="checkbox"]')
+        const input = byFor || nested
+        if (input) {
+          input.click()
+          return true
+        }
+      }
+      return false
+    }, valueToken)
+    return clicked
+  } catch {
+    return false
+  }
+}
+
+function detectAttachmentCaseKind(tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (text.includes('larger than') || text.includes('500kb') || text.includes('size')) return 'size_limit'
+  if (text.includes('wrong format') || text.includes('allowed file format') || text.includes('file format')) return 'invalid_format'
+  if (text.includes('required') || text.includes('left empty') || text.includes('without attachment')) return 'required'
+  return 'required'
+}
+
+function findAttachmentField(tc, runtimeFields) {
+  const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
+  if (match.field) return match.field
+  return runtimeFields.find((f) => {
+    const t = normalizeType(f?.type)
+    const label = String(f?.label || '').toLowerCase()
+    return t === 'file' || label.includes('attachment') || label.includes('document') || label.includes('contract')
+  }) || null
+}
+
+function buildAttachmentFixtures(projectId) {
+  const base = process.env.UPLOADS_DIR
+    ? path.resolve(process.env.UPLOADS_DIR)
+    : path.join(process.cwd(), 'uploads')
+  const dir = path.join(base, 'fixtures', `project-${projectId}`)
+  fs.mkdirSync(dir, { recursive: true })
+  const invalidFormatPath = path.join(dir, 'invalid-format.txt')
+  const oversizedPdfPath = path.join(dir, 'oversized.pdf')
+  if (!fs.existsSync(invalidFormatPath)) fs.writeFileSync(invalidFormatPath, 'invalid format fixture')
+  if (!fs.existsSync(oversizedPdfPath)) fs.writeFileSync(oversizedPdfPath, Buffer.alloc(520 * 1024, 65))
+  return { invalidFormatPath, oversizedPdfPath }
+}
+
 async function waitForPostSubmitSignals(page, selectors = [], timeoutMs = 1200) {
   const deadline = Date.now() + timeoutMs
   const unique = Array.from(new Set((selectors || []).filter(Boolean)))
@@ -406,19 +703,24 @@ async function waitForPostSubmitSignals(page, selectors = [], timeoutMs = 1200) 
 
 async function clickSubmit(page) {
   const candidates = [
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
     '#submitBtn',
     'button[type="submit"]',
     'input[type="submit"]',
-    'button:has-text("Submit")'
+    'button:has-text("Submit")',
+    'button:has-text("Apply")',
+    'button:has-text("Save")'
   ]
   for (const sel of candidates) {
     const el = page.locator(sel).first()
     if (await el.count()) {
+      try { await el.scrollIntoViewIfNeeded({ timeout: 1000 }) } catch { /* ignore */ }
       await el.click()
       return
     }
   }
-  throw new Error('Submit button not found')
+  throw new Error('Continue/Next/Submit button not found')
 }
 
 async function goToForm(page, url) {
@@ -518,6 +820,57 @@ async function runTests(projectId, options = {}) {
 
   const browser = await launchChromiumBrowser()
   const page = await browser.newPage()
+  const context = page.context()
+  const extensionCookies = Array.isArray(options.sessionCookies) ? options.sessionCookies : []
+  const targetUrlForSession = String(options.overrideUrl || project.form_url || '').trim()
+  // #region agent log
+  fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:initCookies',message:'Runner received session cookies',data:{targetUrlHost:(()=>{try{return new URL(targetUrlForSession).host}catch{return''}})(),sessionCookiesCount:extensionCookies.length,cookieDomains:Array.from(new Set(extensionCookies.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
+  if (extensionCookies.length > 0 && targetUrlForSession) {
+    try {
+      const mapped = extensionCookies
+        .map((c) => {
+          const name = String(c?.name || '').trim()
+          const value = String(c?.value || '')
+          if (!name) return null
+          const domain = String(c?.domain || '').trim()
+          const pathValue = String(c?.path || '/').trim() || '/'
+          const secure = Boolean(c?.secure)
+          const httpOnly = Boolean(c?.httpOnly)
+          const sameSiteRaw = String(c?.sameSite || '').toLowerCase()
+          let sameSite = 'Lax'
+          if (sameSiteRaw === 'strict') sameSite = 'Strict'
+          else if (sameSiteRaw === 'no_restriction' || sameSiteRaw === 'none') sameSite = 'None'
+          const expiresRaw = Number(c?.expirationDate)
+          const cookie = {
+            name,
+            value,
+            domain: domain || undefined,
+            path: pathValue,
+            secure,
+            httpOnly,
+            sameSite
+          }
+          if (Number.isFinite(expiresRaw) && expiresRaw > 0) cookie.expires = expiresRaw
+          if (!cookie.domain) {
+            cookie.url = targetUrlForSession
+          }
+          return cookie
+        })
+        .filter(Boolean)
+      if (mapped.length > 0) {
+        await context.addCookies(mapped)
+        // #region agent log
+        fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:addCookies',message:'Runner added cookies to browser context',data:{mappedCookiesCount:mapped.length,mappedDomains:Array.from(new Set(mapped.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+      }
+    } catch (err) {
+      testLog(`Session cookie import skipped: ${String(err?.message || err)}`)
+      // #region agent log
+      fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:addCookies:catch',message:'Runner failed to add cookies',data:{error:String(err?.message||err)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    }
+  }
   const results = []
   let hasLoadedOnce = false
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null
@@ -568,10 +921,10 @@ async function runTests(projectId, options = {}) {
       // ── Determine test type ────────────────────────────────────────────────
       // If the test case already has a test_type (AI-generated), use it directly.
       // Only run AI validation for manually added ones (no test_type set).
-      let testType = tc.test_type
+      let testType = normalizeTestType(tc.test_type)
 
       const isManualTestCase = !tc.test_type ||
-        !['required_field', 'format_validation', 'successful_submit'].includes(tc.test_type)
+        !SUPPORTED_TEST_TYPES.includes(normalizeTestType(tc.test_type))
 
       if (isManualTestCase) {
         testLog('Type: manually added — validating with AI...')
@@ -607,6 +960,11 @@ async function runTests(projectId, options = {}) {
         continue
       }
       hasLoadedOnce = true
+      if (index === 0) {
+        // #region agent log
+        fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H4',location:'Runtests.js:runTests:firstNavigation',message:'Runner first loaded URL',data:{currentUrl:page.url()},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+      }
 
       const scannedRuntimeFields = mapScannedFieldsToRuntime(options.scannedFields || [])
       const liveFields = scannedRuntimeFields.length > 0 ? [] : await discoverLiveFields(page)
@@ -666,6 +1024,14 @@ async function runTests(projectId, options = {}) {
         })
       }
 
+      const onLogin = await isOnLoginPage(page)
+      if (onLogin) {
+        const note = 'Skipped: Playwright landed on the login page instead of the form. This form requires authentication. Use the extension Run Test button while logged into the portal.'
+        testLog('RESULT: Skipped, landed on login page')
+        await saveCaseResult(false, note, null)
+        continue
+      }
+
       let passed = false
       let notes = ''
       let failureWaitSelectors = []
@@ -703,35 +1069,65 @@ async function runTests(projectId, options = {}) {
           continue
         }
 
+        const targetType = normalizeType(targetField.type)
+        const targetLabelNorm = toNormalizedText(targetField.label || '')
         testLog(`Step: filling all fields except "${targetField.label}"`)
-        await fillAllFields(page, runtimeFields, { excludeSelectors: [targetField.selector] })
+        await fillAllFields(page, runtimeFields, {
+          excludeSelectors: [targetField.selector],
+          excludeNames: targetField.name ? [targetField.name] : [],
+          excludePredicate: (f) => {
+            const fType = normalizeType(f?.type)
+            if (targetType === 'radio' && fType === 'radio') {
+              const sameName = Boolean(targetField.name) && String(f?.name || '') === String(targetField.name)
+              const sameLabel = toNormalizedText(f?.label || '') === targetLabelNorm
+              return sameName || sameLabel
+            }
+            return false
+          }
+        })
         await clearField(page, targetField)
 
         testLog('Step: clicking submit')
         await clickSubmit(page)
-        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector], 1200)
+        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1500)
 
         testLog('Step: checking results')
-        const [fieldError, success] = await Promise.all([
+          const [fieldError, success] = await Promise.all([
           targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
           isVisible(page, '#successMsg')
         ])
+        const visibleMessages = await collectVisibleValidationMessages(page)
+        const invalidState = await detectFieldInvalidState(page, targetField)
+        const evidence = evaluateValidationEvidence({
+          expectedText: tc.expected_result,
+          field: targetField,
+          visibleMessages,
+          fieldError,
+          invalidState
+        })
 
         testLog(`"${targetField.label}" error visible: ${fieldError}`)
         testLog(`Success visible: ${success}`)
 
-        // STRICT: if no known error selector, fallback to "did not submit".
-        passed = targetField.errorSelector ? (fieldError === true && success === false) : (success === false)
+        // Required-field pass must be tied to target field evidence, not unrelated page errors.
+        passed = success === false && evidence.hasEvidence
 
         if (passed) {
-          notes = `Passed: when "${targetField.label}" was left empty, the form showed the expected required message and did not submit.`
+          notes = `Passed: when "${targetField.label}" was left empty, the form blocked submission and showed a validation message.`
+          const shownMessage = evidence.bestMessage || visibleMessages[0] || ''
+          if (shownMessage) {
+            notes += `\nValidation shown: "${shownMessage}"`
+          } else {
+            notes += '\nValidation shown: (no readable message text captured)'
+          }
           testLog(`RESULT: ✓ Passed`)
         } else if (success === true) {
           notes = `Failed: "${targetField.label}" was left empty, but the form still submitted. This means required validation did not block submission as expected.`
           testLog(`RESULT: ✗ Failed — form submitted with empty "${targetField.label}"`)
           failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
         } else {
-          notes = `Failed: "${targetField.label}" was left empty and the form did not submit, but no clear required message appeared for that field.`
+          notes = `Failed: "${targetField.label}" was left empty and the form did not submit, but no clear validation message could be matched to the expected result.`
+          if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
           testLog(`RESULT: ✗ Failed — no error appeared for "${targetField.label}"`)
           failureWaitSelectors = [targetField.errorSelector, targetField.selector]
         }
@@ -793,45 +1189,89 @@ async function runTests(projectId, options = {}) {
         await fillAllFields(page, runtimeFields)
 
         if (targetField.type === 'select' || targetField.type === 'radio' || targetField.type === 'checkbox') {
-          const note = `Failed: format_validation test type is not executable for option field "${targetField.label}". Use required_field or conditional behavior tests for this field.`
-          testLog('RESULT: ✗ Failed — format_validation not executable for option field')
-          const screenshotPath = await captureAtFailure(tc.id, [targetField.selector])
-          await saveCaseResult(false, note, screenshotPath)
-          continue
+          const combined = `${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase()
+          const expectsNoError =
+            /no error|without error|should pass|valid|accepted|does not show/i.test(combined)
+
+          if (expectsNoError) {
+            testLog(`Step: option-field validation for "${targetField.label}" (expecting no error)`)
+            await clickSubmit(page).catch(() => {})
+            await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector], 1200)
+            const [fieldError, success] = await Promise.all([
+              targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
+              isVisible(page, '#successMsg')
+            ])
+            passed = fieldError === false
+            if (passed) {
+              notes = `Passed: "${targetField.label}" used a valid option and no validation message appeared, which matches the expected behavior.`
+              testLog('RESULT: ✓ Passed — valid option accepted without error')
+            } else {
+              notes = `Failed: "${targetField.label}" used a valid option, but a validation message still appeared.`
+              testLog('RESULT: ✗ Failed — unexpected validation error for valid option')
+              failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+            }
+            // Keep success signal in notes for troubleshooting without forcing it.
+            notes += success ? '\nSubmission signal: success message visible.' : '\nSubmission signal: success message not visible.'
+            // Skip default text-input format path for option fields.
+            invalidVal = null
+          } else {
+            const note = `Failed: format_validation test type is not executable for option field "${targetField.label}". Use conditional or required behavior wording for this field.`
+            testLog('RESULT: ✗ Failed — format_validation not executable for option field')
+            const screenshotPath = await captureAtFailure(tc.id, [targetField.selector])
+            await saveCaseResult(false, note, screenshotPath)
+            continue
+          }
         } else {
           await page.locator(targetField.selector).first().fill(invalidVal, { timeout: 700 }).catch(() => {})
         }
 
-        testLog('Step: clicking submit')
-        await clickSubmit(page)
-        await waitForPostSubmitSignals(page, ['#successMsg', formatErrorSelector, targetField.errorSelector], 1200)
-
-        testLog('Step: checking results')
-        const [formatError, success] = await Promise.all([
-          formatErrorSelector ? isVisible(page, formatErrorSelector) : Promise.resolve(false),
-          isVisible(page, '#successMsg')
-        ])
-
-        testLog(`Format error for "${targetField.label}" visible: ${formatError}`)
-        testLog(`Success visible: ${success}`)
-
-        // If there is no known format error selector, fallback to "did not submit".
-        passed = formatErrorSelector ? (formatError === true && success === false) : (success === false)
-
-        if (passed) {
-          notes =
-            targetField.type === 'date' && formatErrorSelector === '#dobAgeError'
-              ? `Passed: Date of Birth rejected the minor date "${invalidVal}" and showed the age restriction message.`
-              : `Passed: "${targetField.label}" rejected invalid input "${invalidVal}" and prevented successful submission.`
-          testLog(`RESULT: ✓ Passed`)
-        } else if (success === true) {
-          notes = `Failed: "${targetField.label}" accepted invalid input "${invalidVal}" and the form submitted successfully.`
-          testLog(`RESULT: ✗ Failed — form accepted invalid value for "${targetField.label}"`)
-          failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector, '#successMsg']
+        if (invalidVal === null && (targetField.type === 'select' || targetField.type === 'radio' || targetField.type === 'checkbox')) {
+          // Option-field path already evaluated and saved in passed/notes.
+          // Do not run generic format submit assertions below.
         } else {
-          notes = `Failed: "${targetField.label}" used invalid input "${invalidVal}", but no clear validation message appeared for that field.`
-          testLog(`RESULT: ✗ Failed — no format error for "${targetField.label}"`)
-          failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector]
+
+          testLog('Step: clicking submit')
+          await clickSubmit(page)
+          await waitForPostSubmitSignals(page, ['#successMsg', formatErrorSelector, targetField.errorSelector], 1200)
+
+          testLog('Step: checking results')
+          const [formatError, success] = await Promise.all([
+            formatErrorSelector ? isVisible(page, formatErrorSelector) : Promise.resolve(false),
+            isVisible(page, '#successMsg')
+          ])
+          const visibleMessages = await collectVisibleValidationMessages(page)
+          const invalidState = await detectFieldInvalidState(page, targetField)
+          const evidence = evaluateValidationEvidence({
+            expectedText: tc.expected_result,
+            field: targetField,
+            visibleMessages,
+            fieldError: formatError,
+            invalidState
+          })
+
+          testLog(`Format error for "${targetField.label}" visible: ${formatError}`)
+          testLog(`Success visible: ${success}`)
+
+          // If there is no known format error selector, fallback to "did not submit".
+          passed = success === false && evidence.hasEvidence
+
+          if (passed) {
+            notes =
+              targetField.type === 'date' && formatErrorSelector === '#dobAgeError'
+                ? `Passed: Date of Birth rejected the minor date "${invalidVal}" and showed the age restriction message.`
+                : `Passed: "${targetField.label}" rejected invalid input "${invalidVal}" and prevented successful submission.`
+            if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
+            testLog(`RESULT: ✓ Passed`)
+          } else if (success === true) {
+            notes = `Failed: "${targetField.label}" accepted invalid input "${invalidVal}" and the form submitted successfully.`
+            testLog(`RESULT: ✗ Failed — form accepted invalid value for "${targetField.label}"`)
+            failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector, '#successMsg']
+          } else {
+            notes = `Failed: "${targetField.label}" used invalid input "${invalidVal}", but no clear validation message appeared for that field.`
+            if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
+            testLog(`RESULT: ✗ Failed — no format error for "${targetField.label}"`)
+            failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector]
+          }
         }
       }
 
@@ -880,6 +1320,265 @@ async function runTests(projectId, options = {}) {
         } else {
           notes = 'Failed: success message did not appear after submitting valid data. The form may not be submitting correctly.'
           testLog('RESULT: ✗ Failed — no success message appeared')
+        }
+      }
+
+      // CONDITIONAL DISPLAY
+      else if (testType === 'conditional_display') {
+        const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
+        const targetField = match.field
+        if (!targetField) {
+          const note = 'Failed: could not identify the conditional target field on the live form.'
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+
+        const conditionValue = detectConditionValueToken(tc)
+        const controllerField = findConditionControllerField(tc, runtimeFields)
+        const targetType = normalizeType(targetField.type)
+        const targetLabelNorm = toNormalizedText(targetField.label || '')
+        await fillAllFields(page, runtimeFields, {
+          excludeSelectors: [targetField.selector],
+          excludeNames: targetField.name ? [targetField.name] : [],
+          excludePredicate: (f) => {
+            const fType = normalizeType(f?.type)
+            if (targetType === 'radio' && fType === 'radio') {
+              const sameName = Boolean(targetField.name) && String(f?.name || '') === String(targetField.name)
+              const sameLabel = toNormalizedText(f?.label || '') === targetLabelNorm
+              return sameName || sameLabel
+            }
+            return false
+          }
+        })
+        await applyConditionValue(page, controllerField, conditionValue)
+        await page.waitForTimeout(500)
+
+        const expectedVisible = !/not\s+appear|does\s+not\s+appear|hidden|hide|not\s+visible/i
+          .test(`${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase())
+        const visible = await isVisible(page, targetField.selector)
+        passed = expectedVisible ? visible : !visible
+
+        if (passed) {
+          notes = expectedVisible
+            ? `Passed: "${targetField.label}" appeared after applying the condition as expected.`
+            : `Passed: "${targetField.label}" stayed hidden after applying the condition as expected.`
+        } else {
+          notes = expectedVisible
+            ? `Failed: "${targetField.label}" did not appear after applying the condition.`
+            : `Failed: "${targetField.label}" appeared, but it was expected to stay hidden for this condition.`
+          failureWaitSelectors = [targetField.selector]
+        }
+      }
+
+      else if (testType === 'conditional_required') {
+        const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
+        const targetField = match.field
+        if (!targetField) {
+          const note = 'Failed: could not identify the conditional required field on the live form.'
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+
+        const conditionValue = detectConditionValueToken(tc)
+        const controllerField = findConditionControllerField(tc, runtimeFields)
+        const targetType = normalizeType(targetField.type)
+        const targetLabelNorm = toNormalizedText(targetField.label || '')
+        await fillAllFields(page, runtimeFields, {
+          excludeSelectors: [targetField.selector],
+          excludeNames: targetField.name ? [targetField.name] : [],
+          excludePredicate: (f) => {
+            const fType = normalizeType(f?.type)
+            if (targetType === 'radio' && fType === 'radio') {
+              const sameName = Boolean(targetField.name) && String(f?.name || '') === String(targetField.name)
+              const sameLabel = toNormalizedText(f?.label || '') === targetLabelNorm
+              return sameName || sameLabel
+            }
+            return false
+          }
+        })
+        await applyConditionValue(page, controllerField, conditionValue)
+        await clearField(page, targetField)
+        await clickSubmit(page).catch(() => {})
+        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
+
+        const [fieldError, success] = await Promise.all([
+          targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
+          isVisible(page, '#successMsg')
+        ])
+        const visibleMessages = await collectVisibleValidationMessages(page)
+        const invalidState = await detectFieldInvalidState(page, targetField)
+        const evidence = evaluateValidationEvidence({
+          expectedText: tc.expected_result,
+          field: targetField,
+          visibleMessages,
+          fieldError,
+          invalidState
+        })
+        passed = success === false && evidence.hasEvidence
+
+        if (passed) {
+          notes = `Passed: when the condition was applied, leaving "${targetField.label}" empty correctly triggered validation and blocked submission.`
+          if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
+        } else {
+          notes = `Failed: conditional required behavior for "${targetField.label}" was not enforced as expected.`
+          if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
+          failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+        }
+      }
+
+      else if (testType === 'optional_field') {
+        const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
+        const targetField = match.field
+        if (!targetField) {
+          const note = 'Failed: could not identify the optional field on the live form.'
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+
+        await fillAllFields(page, runtimeFields, { excludeSelectors: [targetField.selector] })
+        await clearField(page, targetField)
+        await clickSubmit(page).catch(() => {})
+        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector], 1200)
+        const [fieldError, success] = await Promise.all([
+          targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
+          isVisible(page, '#successMsg')
+        ])
+        const visibleMessages = (await collectVisibleValidationMessages(page))
+          .filter(msg => !isLikelyGlobalMessage(msg))
+        const invalidState = await detectFieldInvalidState(page, targetField)
+        const evidence = evaluateValidationEvidence({
+          expectedText: tc.expected_result,
+          field: targetField,
+          visibleMessages,
+          fieldError,
+          invalidState
+        })
+        const targetRequiredMessage = visibleMessages.some(msg => {
+          const m = normalizeForCompare(msg)
+          const label = normalizeForCompare(targetField.label)
+          return Boolean(label) && m.includes(label) && /required|must|missing|mandatory|enter|select|choose/i.test(m)
+        })
+        const strongSemanticMatch = evidence.score >= 0.6 && evidence.mentionsTarget
+        const optionalFieldHasError = Boolean(fieldError) || Boolean(invalidState) || targetRequiredMessage || strongSemanticMatch
+        passed = optionalFieldHasError === false
+
+        if (passed) {
+          notes = `Passed: "${targetField.label}" was left empty and no required validation appeared for that field, which matches optional behavior.`
+          notes += success ? '\nSubmission signal: success message visible.' : '\nSubmission signal: success message not visible.'
+        } else {
+          notes = `Failed: "${targetField.label}" appears to be treated as required, but this test expects it to be optional.`
+          if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
+          failureWaitSelectors = [targetField.errorSelector, targetField.selector]
+        }
+      }
+
+      else if (testType === 'widget_auto_fill') {
+        const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
+        const sourceField = match.field || runtimeFields.find((f) => {
+          const label = String(f?.label || '').toLowerCase()
+          const name = String(f?.name || '').toLowerCase()
+          return label.includes('id number') || name.includes('id')
+        })
+
+        if (!sourceField) {
+          const note = 'Failed: could not identify the widget source field for auto-fill validation.'
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+
+        const targetCandidates = runtimeFields.filter((f) => {
+          if (!f?.selector || f.selector === sourceField.selector) return false
+          const label = String(f?.label || '').toLowerCase()
+          const name = String(f?.name || '').toLowerCase()
+          return (
+            label.includes('first name') ||
+            label.includes('last name') ||
+            label.includes('gender') ||
+            label.includes('date of birth') ||
+            label.includes('nationality') ||
+            name.includes('first') ||
+            name.includes('last') ||
+            name.includes('gender') ||
+            name.includes('birth') ||
+            name.includes('nation')
+          )
+        })
+
+        await fillAllFields(page, runtimeFields)
+        for (const t of targetCandidates) {
+          await clearField(page, t)
+        }
+        await page.locator(sourceField.selector).first().fill(guessValidValue(sourceField), { timeout: 900 }).catch(() => {})
+        await page.waitForTimeout(700)
+
+        let populatedCount = 0
+        for (const t of targetCandidates) {
+          try {
+            const val = await page.locator(t.selector).first().inputValue({ timeout: 400 })
+            if (String(val || '').trim()) populatedCount += 1
+          } catch {
+            // Non-text targets can still be considered populated if visible and checked/selected.
+            try {
+              const checked = await page.locator(t.selector).first().isChecked({ timeout: 300 })
+              if (checked) populatedCount += 1
+            } catch { /* ignore */ }
+          }
+        }
+        passed = populatedCount > 0
+        if (passed) {
+          notes = `Passed: entering a valid value in "${sourceField.label}" auto-populated ${populatedCount} dependent field(s).`
+        } else {
+          notes = `Failed: entering a valid value in "${sourceField.label}" did not auto-populate the expected dependent fields.`
+          failureWaitSelectors = [sourceField.selector, ...targetCandidates.map(f => f.selector)]
+        }
+      }
+
+      else if (testType === 'attachment') {
+        const targetField = findAttachmentField(tc, runtimeFields)
+        if (!targetField) {
+          const note = 'Failed: could not identify the attachment field for this test case.'
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+
+        const kind = detectAttachmentCaseKind(tc)
+        const fixtures = buildAttachmentFixtures(projectId)
+        await fillAllFields(page, runtimeFields, { excludeSelectors: [targetField.selector] })
+
+        if (kind === 'invalid_format') {
+          await page.locator(targetField.selector).first().setInputFiles(fixtures.invalidFormatPath).catch(() => {})
+        } else if (kind === 'size_limit') {
+          await page.locator(targetField.selector).first().setInputFiles(fixtures.oversizedPdfPath).catch(() => {})
+        }
+
+        await clickSubmit(page).catch(() => {})
+        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
+
+        const success = await isVisible(page, '#successMsg')
+        const fieldError = targetField.errorSelector ? await isVisible(page, targetField.errorSelector) : false
+        passed = success === false || fieldError === true
+        if (passed) {
+          if (kind === 'required') {
+            notes = `Passed: attachment validation blocked submission when "${targetField.label}" was left empty.`
+          } else if (kind === 'invalid_format') {
+            notes = `Passed: attachment validation rejected invalid file format for "${targetField.label}".`
+          } else {
+            notes = `Passed: attachment validation rejected oversized file for "${targetField.label}".`
+          }
+        } else {
+          if (kind === 'required') {
+            notes = `Failed: form submitted even though required attachment "${targetField.label}" was not provided.`
+          } else if (kind === 'invalid_format') {
+            notes = `Failed: form accepted an invalid file format for "${targetField.label}".`
+          } else {
+            notes = `Failed: form accepted an oversized file for "${targetField.label}".`
+          }
+          failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
         }
       }
 

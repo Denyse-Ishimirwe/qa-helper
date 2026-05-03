@@ -27,6 +27,17 @@ const DEMO_EMAILS = new Set([
   'qa_review_2@ymail.com',
   'qa_review_3@ymail.com'
 ])
+const ALLOWED_TEST_TYPES = [
+  'required_field',
+  'format_validation',
+  'successful_submit',
+  'conditional_required',
+  'conditional_display',
+  'optional_field',
+  'widget_auto_fill',
+  'attachment',
+  'disabled_field'
+]
 const extensionScanJobs = new Map()
 
 if (!jwtSecret) {
@@ -473,7 +484,7 @@ app.get('/api', (req, res) => {
 
 app.post('/api/extension-scan', requireAuth, async (req, res) => {
   try {
-    const { url, fields, projectId } = req.body || {}
+    const { url, fields, projectId, sessionCookies } = req.body || {}
     const extensionUrl = String(url || '').trim()
     const safeFields = Array.isArray(fields) ? fields : []
     if (!projectId) {
@@ -496,6 +507,9 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
     console.log('[extension-scan] URL:', extensionUrl || 'unknown')
     console.log('[extension-scan] projectId:', projectId)
     console.log('[extension-scan] Fields:', safeFields)
+    // #region agent log
+    fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H2',location:'server.js:/api/extension-scan',message:'Received extension scan payload',data:{projectId:Number(projectId),fieldsCount:safeFields.length,sessionCookiesCount:Array.isArray(sessionCookies)?sessionCookies.length:0,sessionCookieDomains:Array.from(new Set((Array.isArray(sessionCookies)?sessionCookies:[]).map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
 
     const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
     extensionScanJobs.set(jobId, {
@@ -531,6 +545,7 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
         const results = await runTests(projectId, {
           overrideUrl: extensionUrl,
           scannedFields: safeFields,
+          sessionCookies: Array.isArray(sessionCookies) ? sessionCookies : [],
           source: 'extension',
           screenshotSource: 'extension',
           onProgress: (p) => {
@@ -730,33 +745,42 @@ app.get('/api/projects', requireAuth, async (req, res) => {
   res.json(projects)
 })
 
-app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) => {
+app.post('/api/projects', requireAuth, upload.fields([{ name: 'srd', maxCount: 1 }, { name: 'test_data_file', maxCount: 1 }]), async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim()
     const form_url = String(req.body?.form_url || '').trim()
     const notion_url = String(req.body?.notion_url || '').trim()
+    const srdFile = req.files?.srd?.[0] || null
+    const testDataFile = req.files?.test_data_file?.[0] || null
 
     if (!name) {
       return res.status(400).json({ error: 'Project name is required' })
     }
 
-    if (!req.file && !notion_url) {
+    if (!srdFile && !notion_url) {
       return res.status(400).json({ error: 'Upload an SRD file or provide a Notion URL' })
     }
 
     let srdText = ''
-    if (req.file) {
-      srdText = await extractText(req.file.path)
+    if (srdFile) {
+      srdText = await extractText(srdFile.path)
     } else {
       srdText = await fetchNotionSrdText(notion_url)
     }
 
+    let testDataProfileText = '{}'
+    if (testDataFile?.path) {
+      const imported = parseImportedTestDataText(await extractText(testDataFile.path))
+      testDataProfileText = JSON.stringify(imported)
+    }
+
     const result = await db.run(
-      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)',
+      'INSERT INTO projects (user_id, name, form_url, srd_text, test_data_profile) VALUES (?, ?, ?, ?, ?)',
       req.user.id,
       name,
       form_url || '',
-      srdText
+      srdText,
+      testDataProfileText
     )
 
     res.json({ success: true, id: result.lastInsertRowid })
@@ -880,7 +904,7 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
     const testCases = await generateTestCases(project.srd_text, formStructure)
 
     for (const tc of testCases) {
-      const testType = ['required_field', 'format_validation', 'successful_submit'].includes(tc.test_type)
+      const testType = ALLOWED_TEST_TYPES.includes(tc.test_type)
         ? tc.test_type
         : 'required_field'
       await db.run(
@@ -903,10 +927,14 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
 
   } catch (err) {
     console.error(err)
-    if (String(err?.message || '').includes('AI service is temporarily unavailable')) {
-      return res.status(503).json({ error: err.message })
+    const em = String(err?.message || '')
+    if (em.includes('AI service is temporarily unavailable')) {
+      return res.status(503).json({ error: em })
     }
-    res.status(500).json({ error: err.message })
+    if (/Groq rate limit|daily tokens for this model/i.test(em)) {
+      return res.status(429).json({ error: em })
+    }
+    res.status(500).json({ error: em })
   }
 })
 
@@ -1035,6 +1063,446 @@ app.get('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
   res.json(testCases)
 })
 
+function parseProjectTestDataProfile(raw) {
+  const text = String(raw || '').trim()
+  if (!text) return {}
+  try {
+    const parsed = JSON.parse(text)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return parsed
+  } catch {
+    return {}
+  }
+}
+
+function parseImportedTestDataText(rawText) {
+  const text = String(rawText || '').trim()
+  if (!text) return {}
+
+  // 1) Try JSON object directly.
+  try {
+    const parsed = JSON.parse(text)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const out = {}
+      for (const [k, v] of Object.entries(parsed)) {
+        const key = String(k || '').trim()
+        const value = String(v ?? '').trim()
+        if (key && value) out[key] = value
+      }
+      return out
+    }
+  } catch {
+    // Continue with line parsing.
+  }
+
+  // 2) Parse "Key: Value", "Key - Value", "Key = Value" lines.
+  const out = {}
+  const lines = text.split(/\r?\n/).map(l => String(l || '').trim()).filter(Boolean)
+  for (const line of lines) {
+    const m = line.match(/^([^:=-]{2,80})\s*[:=-]\s*(.+)$/)
+    if (!m) continue
+    const rawKey = String(m[1] || '').trim()
+    const rawValue = String(m[2] || '').trim()
+    if (!rawKey || !rawValue) continue
+    const key = rawKey
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+    if (!key) continue
+    out[key] = rawValue
+  }
+  return out
+}
+
+function deriveSuggestedTestDataKeys(testCases = []) {
+  const keys = new Set([
+    'first_name',
+    'last_name',
+    'phone',
+    'email',
+    'id_type',
+    'national_id',
+    'nin',
+    'application_number',
+    'dob_adult',
+    'dob_under_18',
+    'live_in_rwanda',
+    'district',
+    'sector',
+    'cell',
+    'village'
+  ])
+  const mapping = [
+    { re: /\bfirst name\b/i, key: 'first_name' },
+    { re: /\blast name|surname\b/i, key: 'last_name' },
+    { re: /\bphone|mobile|tel\b/i, key: 'phone' },
+    { re: /\bemail\b/i, key: 'email' },
+    { re: /\bid type\b/i, key: 'id_type' },
+    { re: /\bnational id|id number\b/i, key: 'national_id' },
+    { re: /\bnin\b/i, key: 'nin' },
+    { re: /\bapplication number|citizen application\b/i, key: 'application_number' },
+    { re: /\bdate of birth|dob\b/i, key: 'dob_adult' },
+    { re: /\blive in rwanda\b/i, key: 'live_in_rwanda' },
+    { re: /\bdistrict\b/i, key: 'district' },
+    { re: /\bsector\b/i, key: 'sector' },
+    { re: /\bcell\b/i, key: 'cell' },
+    { re: /\bvillage\b/i, key: 'village' }
+  ]
+  for (const tc of testCases) {
+    const blob = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`
+    for (const item of mapping) {
+      if (item.re.test(blob)) keys.add(item.key)
+    }
+  }
+  return [...keys]
+}
+
+app.get('/api/projects/:id/test-data', requireAuth, async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+    const project = await db.get('SELECT test_data_profile FROM projects WHERE id = ?', req.params.id)
+    const testCases = await db.all(
+      'SELECT name, what_to_test, expected_result FROM test_cases WHERE project_id = ?',
+      req.params.id
+    )
+    return res.json({
+      profile: parseProjectTestDataProfile(project?.test_data_profile),
+      suggested_keys: deriveSuggestedTestDataKeys(testCases)
+    })
+  } catch (err) {
+    console.error('project test-data fetch error:', err)
+    return res.status(500).json({ error: err.message || 'Failed to fetch project test data' })
+  }
+})
+
+app.put('/api/projects/:id/test-data', requireAuth, async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+    const rawProfile = req.body?.profile
+    if (!rawProfile || typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
+      return res.status(400).json({ error: 'profile object is required' })
+    }
+    const cleaned = {}
+    for (const [k, v] of Object.entries(rawProfile)) {
+      const key = String(k || '').trim()
+      if (!key) continue
+      const value = String(v ?? '').trim()
+      if (value) cleaned[key] = value
+    }
+    await db.run(
+      'UPDATE projects SET test_data_profile = ? WHERE id = ?',
+      JSON.stringify(cleaned),
+      req.params.id
+    )
+    return res.json({ success: true, profile: cleaned })
+  } catch (err) {
+    console.error('project test-data save error:', err)
+    return res.status(500).json({ error: err.message || 'Failed to save project test data' })
+  }
+})
+
+app.post('/api/projects/:id/test-data/import', requireAuth, upload.single('test_data_file'), async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+    if (!req.file?.path) {
+      return res.status(400).json({ error: 'test_data_file is required' })
+    }
+    const extracted = await extractText(req.file.path)
+    const imported = parseImportedTestDataText(extracted)
+    const existingRow = await db.get('SELECT test_data_profile FROM projects WHERE id = ?', req.params.id)
+    const existing = parseProjectTestDataProfile(existingRow?.test_data_profile)
+    const merged = { ...existing, ...imported }
+    await db.run(
+      'UPDATE projects SET test_data_profile = ? WHERE id = ?',
+      JSON.stringify(merged),
+      req.params.id
+    )
+    return res.json({ success: true, imported_count: Object.keys(imported).length, profile: merged })
+  } catch (err) {
+    console.error('project test-data import error:', err)
+    return res.status(500).json({ error: err.message || 'Failed to import test data file' })
+  }
+})
+
+/**
+ * Derive field label from test name for any project — no per-form field lists.
+ * Strips standard suffixes (… required test, … format validation test) and trailing context
+ * (e.g. National ID / NIN) so "ID Number National ID format …" resolves to "ID Number".
+ */
+function inferFromTestNameAndType(name, testType) {
+  const n = String(name || '').trim()
+  if (!n || n.length > 220) return null
+  if (/^(successful submit|widget auto-fill)\b/i.test(n)) return null
+  if (/^attachment\b/i.test(n)) return null
+
+  let head = n
+  head = head.replace(/^test\s+(required\s+field|format\s+validation|optional\s+field|conditional\s+(required|display)|widget\s+auto\s+fill|attachment|disabled\s+field)\s*:\s*/i, '').trim()
+  head = head.replace(/^(required|format|optional|conditional|widget|attachment|disabled)\s+(field|validation|display|required|auto\s+fill)\s*:\s*/i, '').trim()
+  const tt = String(testType || '').toLowerCase()
+  if (/\bformat_validation\b/.test(tt) || /\s+format\s+/i.test(head)) {
+    const parts = head.split(/\s+format\s+/i)
+    head = parts[0].trim()
+  }
+  head = head.replace(/\s+(age|format)\s+validation\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+when\s+.+/i, '').trim()
+  head = head.replace(/\s+for\s+processing\s+office\s*$/i, '').trim()
+  head = head.replace(/\s+required\s+field\s+test(\s+for\s+[^\s.]+)?\s*$/i, '').trim()
+  head = head.replace(/\s+optional\s+field\s+test(\s+for\s+[^\s.]+)?\s*$/i, '').trim()
+  head = head.replace(/\s+required\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+optional\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+wrong\s+format\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+size\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+display\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+for\s+(national id|nin|citizen application number)\s*$/i, '').trim()
+  head = head.replace(/\s+(national id|nin|citizen application number)\s*$/i, '').trim()
+  head = head.replace(/\s+field\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+test\s*$/i, '').trim()
+  head = head.replace(/\s+required\s+field\s*$/i, '').trim()
+  head = head.replace(/\s+optional\s+field\s*$/i, '').trim()
+
+  head = head
+    .replace(/\s+(required|invalid|missing|more\s+than|too\s+long|less\s+than|invalid\s+email|invalid\s+phone|invalid\s+format)\b.*$/i, '')
+    .trim()
+  head = head.replace(/\s+error\s*$/i, '').trim()
+  head = trimLeadingArticles(head)
+
+  if (head.length < 2 || head.length > 120) return null
+  return {
+    field_label: head,
+    field_name: head.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+  }
+}
+
+/** Strip a trailing word "field" from "ID Type field" → "ID Type". */
+function trimFieldWordSuffix(label) {
+  return String(label || '')
+    .trim()
+    .replace(/\s+field\s*$/i, '')
+    .trim()
+}
+
+/** "the First Name" / "a National ID" → "First Name" / "National ID" for DOM matching. */
+function trimLeadingArticles(label) {
+  return String(label || '')
+    .trim()
+    .replace(/^(the|a|an)\s+/i, '')
+    .trim()
+}
+
+function cleanInferredLabel(label) {
+  return trimLeadingArticles(trimFieldWordSuffix(String(label || '').trim()))
+}
+
+function inferFromWhatToTest(what) {
+  const w = String(what || '').trim()
+  if (!w) return null
+  const mLeaveEmpty = w.match(/\bleave\s+(.+?)\s+field\s+empty\b/i)
+  if (mLeaveEmpty?.[1]) {
+    const label = cleanInferredLabel(mLeaveEmpty[1])
+    if (label.length > 0 && label.length < 120) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+  const mEnterInField = w.match(/\b(?:enter|put)\s+.+?\s+in\s+(?:the|a|an)\s+(.+?)\s+field\b/i)
+  if (mEnterInField?.[1]) {
+    const label = cleanInferredLabel(mEnterInField[1])
+    if (label.length > 0 && label.length < 120) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+  const mFieldWith = w.match(/^(.+?)\s+field\s+with\b/i)
+  if (mFieldWith?.[1]) {
+    const label = cleanInferredLabel(String(mFieldWith[1]).trim())
+    if (label.length > 0 && label.length < 120) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+  const mFieldReq = w.match(/^(.+?)\s+field\s+is\s+required\b/i)
+  if (mFieldReq?.[1]) {
+    const label = cleanInferredLabel(mFieldReq[1])
+    if (label.length > 0 && label.length < 120) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+  const mFieldOpt = w.match(/^(.+?)\s+field\s+is\s+optional\b/i)
+  if (mFieldOpt?.[1]) {
+    const label = cleanInferredLabel(mFieldOpt[1])
+    if (label.length > 0 && label.length < 120) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+  return null
+}
+
+function inferFieldLabelAndName(testCase) {
+  const what = String(testCase?.what_to_test || '')
+  const name = String(testCase?.name || '')
+  const expected = String(testCase?.expected_result || '')
+  const joined = `${name} ${what} ${expected}`
+
+  const quoted = joined.match(/"([^"]+)"/)
+  if (quoted?.[1]) {
+    const label = cleanInferredLabel(String(quoted[1]).trim())
+    return {
+      field_label: label,
+      field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+    }
+  }
+
+  const fromWhatPhrase = inferFromWhatToTest(what)
+  if (fromWhatPhrase) return fromWhatPhrase
+
+  const fromGenericName = inferFromTestNameAndType(name, testCase?.test_type)
+  if (fromGenericName?.field_label) return fromGenericName
+
+  const subject = name.match(/^(.+?)\s+(required|optional|format|validation|test)/i)
+  if (subject?.[1]) {
+    const label = cleanInferredLabel(String(subject[1]).trim())
+    return {
+      field_label: label,
+      field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+    }
+  }
+
+  const fromWhat = what.match(/(?:leave|enter|set|fill|clear)\s+(.+?)\s+(?:empty|with|to|and)/i)
+  if (fromWhat?.[1]) {
+    const label = cleanInferredLabel(String(fromWhat[1]).trim())
+    return {
+      field_label: label,
+      field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+    }
+  }
+
+  return { field_label: '', field_name: '' }
+}
+
+app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const rows = await db.all(
+      `
+      SELECT id, name, test_type, what_to_test, expected_result
+      FROM test_cases
+      WHERE project_id = ?
+      ORDER BY id ASC
+      `,
+      req.params.id
+    )
+
+    const formatted = rows.map(tc => {
+      const inferred = inferFieldLabelAndName(tc)
+      return {
+        id: tc.id,
+        name: tc.name,
+        test_type: tc.test_type || 'required_field',
+        what_to_test: tc.what_to_test || '',
+        expected_result: tc.expected_result || '',
+        field_label: inferred.field_label,
+        field_name: inferred.field_name
+      }
+    })
+
+    return res.json(formatted)
+  } catch (err) {
+    console.error('extension-test-cases error:', err)
+    return res.status(500).json({ error: err.message || 'Failed to fetch extension test cases' })
+  }
+})
+
+app.post('/api/projects/:id/extension-run', requireAuth, async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const rawResults = Array.isArray(req.body?.results) ? req.body.results : []
+    if (rawResults.length === 0) {
+      return res.status(400).json({ error: 'results array is required' })
+    }
+
+    const testCases = await db.all(
+      'SELECT id FROM test_cases WHERE project_id = ?',
+      req.params.id
+    )
+    const caseIds = new Set(testCases.map(tc => Number(tc.id)))
+
+    const normalized = rawResults
+      .map(item => ({
+        id: Number(item?.id || 0),
+        name: String(item?.name || ''),
+        passed: Boolean(item?.passed),
+        notes: String(item?.notes || ''),
+        screenshotDataUrl: String(item?.screenshotDataUrl || '')
+      }))
+      .filter(item => caseIds.has(item.id))
+
+    if (normalized.length === 0) {
+      return res.status(400).json({ error: 'No valid project test case results found in payload' })
+    }
+
+    const persistPayload = normalized.map(r => ({
+      id: r.id,
+      name: r.name,
+      passed: r.passed,
+      notes: r.notes,
+      screenshotPath: null
+    }))
+
+    const { runId } = await persistRunResults(req.params.id, persistPayload)
+
+    for (const result of normalized) {
+      let notes = result.notes
+      let screenshotPath = null
+      if (result.screenshotDataUrl) {
+        screenshotPath = saveExtensionScreenshot(runId, result.id, result.screenshotDataUrl)
+        if (screenshotPath) {
+          notes = `${notes}${notes ? '\n' : ''}Screenshot: ${screenshotPath}`
+        }
+      }
+
+      const status = result.passed ? 'Passed' : (String(result.notes || '').toLowerCase().startsWith('skipped:') ? 'Skipped' : 'Failed')
+      await db.run(
+        'UPDATE test_cases SET status = ?, notes = ? WHERE id = ?',
+        status,
+        notes,
+        result.id
+      )
+      await db.run(
+        'UPDATE test_run_results SET status = ?, notes = ?, screenshot_path = ? WHERE run_id = ? AND test_case_id = ?',
+        status,
+        notes,
+        screenshotPath,
+        runId,
+        result.id
+      )
+    }
+
+    return res.json({ ok: true, runId: Number(runId) })
+  } catch (err) {
+    console.error('extension-run error:', err)
+    return res.status(500).json({ error: err.message || 'Failed to save extension run results' })
+  }
+})
+
 app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
   try {
     const ownedProject = await ensureProjectOwner(req, res)
@@ -1103,6 +1571,12 @@ app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
       if (type === 'required_field') return 'Required Field'
       if (type === 'format_validation') return 'Format Validation'
       if (type === 'successful_submit') return 'Successful Submit'
+      if (type === 'conditional_required') return 'Conditional Required'
+      if (type === 'conditional_display') return 'Conditional Display'
+      if (type === 'optional_field') return 'Optional Field'
+      if (type === 'widget_auto_fill') return 'Widget Auto Fill'
+      if (type === 'attachment') return 'Attachment'
+      if (type === 'disabled_field') return 'Disabled Field'
       return 'Required Field'
     }
 
@@ -1177,7 +1651,7 @@ app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'All fields are required' })
     }
 
-    const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
+    const safeTestType = ALLOWED_TEST_TYPES.includes(test_type)
       ? test_type
       : 'required_field'
     await db.run(
@@ -1442,7 +1916,7 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'All fields are required' })
     }
 
-    const safeTestType = ['required_field', 'format_validation', 'successful_submit'].includes(test_type)
+    const safeTestType = ALLOWED_TEST_TYPES.includes(test_type)
       ? test_type
       : 'required_field'
     const result = await db.run(

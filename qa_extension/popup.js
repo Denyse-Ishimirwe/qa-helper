@@ -5,6 +5,13 @@ const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com
 const ACTIVE_JOB_KEY = 'qa_ext_active_job'
 let lastEventSeq = 0
 
+function deriveAppBase(apiBase) {
+  const base = String(apiBase || '').trim()
+  if (!base) return CONFIG.PRODUCTION_URL
+  if (/^https?:\/\/localhost:3000\b/i.test(base)) return 'http://localhost:5173'
+  return base
+}
+
 const els = {
   email: document.getElementById('email'),
   password: document.getElementById('password'),
@@ -124,6 +131,42 @@ function renderResults(data) {
   els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>${rows}`
 }
 
+function renderProgress(current, total, label = '') {
+  const safeTotal = Number(total || 0)
+  const safeCurrent = Number(current || 0)
+  const pct = safeTotal > 0 ? Math.max(0, Math.min(100, Math.round((safeCurrent / safeTotal) * 100))) : 0
+  const title = label ? `<div class="check"><strong>${label}</strong></div>` : ''
+  els.results.innerHTML = `${title}
+    <div class="check">
+      <div style="margin-bottom:6px;">Progress: ${safeCurrent}/${safeTotal} (${pct}%)</div>
+      <div style="height:10px;background:#e5e7eb;border-radius:5px;overflow:hidden;">
+        <div style="height:10px;width:${pct}%;background:#2563eb;"></div>
+      </div>
+    </div>`
+}
+
+function _sendTabMessageWithTimeout(tabId, payload, timeoutMs = 45000) {
+  return new Promise((resolve, reject) => {
+    let done = false
+    const timer = setTimeout(() => {
+      if (done) return
+      done = true
+      reject(new Error(`Test timed out after ${Math.round(timeoutMs / 1000)} seconds`))
+    }, timeoutMs)
+
+    chrome.tabs.sendMessage(tabId, payload, (response) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message))
+        return
+      }
+      resolve(response)
+    })
+  })
+}
+
 async function loadProjects() {
   try {
     hideOpenApp()
@@ -195,6 +238,55 @@ function scanFieldsFromTab(tabId) {
   })
 }
 
+function readCookiesForUrl(url) {
+  return new Promise((resolve) => {
+    try {
+      chrome.cookies.getAll({ url }, (cookies) => {
+        if (chrome.runtime.lastError) {
+          resolve([])
+          return
+        }
+        resolve(Array.isArray(cookies) ? cookies : [])
+      })
+    } catch {
+      resolve([])
+    }
+  })
+}
+
+async function collectSessionCookies(activeUrl) {
+  const seen = new Set()
+  const targets = []
+  const safeActive = String(activeUrl || '').trim()
+  if (safeActive) {
+    targets.push(safeActive)
+    try {
+      const u = new URL(safeActive)
+      targets.push(`${u.protocol}//${u.host}/`)
+    } catch {
+      // ignore malformed URL and continue with default targets
+    }
+  }
+  targets.push('https://keycloak.sandbox.iremboinc.com/')
+
+  const merged = []
+  for (const target of targets) {
+    if (!target || seen.has(target)) continue
+    seen.add(target)
+    const cookies = await readCookiesForUrl(target)
+    for (const c of cookies) {
+      const key = `${c?.domain || ''}|${c?.path || ''}|${c?.name || ''}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      merged.push(c)
+    }
+  }
+  // #region agent log
+  fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H1',location:'qa_extension/popup.js:collectSessionCookies',message:'Collected extension session cookies',data:{targetCount:targets.length,totalCookies:merged.length,domains:Array.from(new Set(merged.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
+  return merged
+}
+
 async function runFromExtension() {
   els.results.innerHTML = ''
   els.viewBtn.style.display = 'none'
@@ -215,6 +307,10 @@ async function runFromExtension() {
       setStatus('Reading form fields...', true)
       const fields = await scanFieldsFromTab(tabs[0].id)
       if (!fields.length) throw new Error('No fields found on active page')
+      const sessionCookies = await collectSessionCookies(String(tabs[0].url || ''))
+      // #region agent log
+      fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H2',location:'qa_extension/popup.js:runFromExtension',message:'Sending extension-scan request',data:{projectId,urlHost:(()=>{try{return new URL(String(tabs[0].url||'')).host}catch{return''}})(),sessionCookiesCount:sessionCookies.length},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
 
       setStatus('Connecting to QA Helper...', true)
       const res = await fetch(`${API_BASE}/api/extension-scan`, {
@@ -223,7 +319,8 @@ async function runFromExtension() {
         body: JSON.stringify({
           url: tabs[0].url,
           projectId,
-          fields
+          fields,
+          sessionCookies
         })
       })
       const data = await res.json().catch(() => ({}))
@@ -263,6 +360,87 @@ async function runFromExtension() {
       setActiveJob(null)
     }
   })
+}
+
+async function runExtensionTests() {
+  els.results.innerHTML = ''
+  els.viewBtn.style.display = 'none'
+
+  const token = await ensureExtensionToken()
+  if (!token) {
+    showOpenApp('Please log in to QA Helper first')
+    return
+  }
+
+  const projectId = Number(els.projectSelect.value || 0)
+  if (!projectId) {
+    setStatus('Select a project first')
+    return
+  }
+
+  try {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
+    const activeTab = tabs?.[0]
+    if (!activeTab?.id) throw new Error('Could not access active tab')
+
+    setStatus('Starting background run...', true)
+    renderProgress(0, 1, 'Preparing tests...')
+
+    const started = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        {
+          type: 'QA_HELPER_START_EXTENSION_RUN',
+          projectId,
+          apiBase: API_BASE,
+          token: getStoredToken(),
+          tabId: activeTab.id
+        },
+        (resp) => {
+          if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+          resolve(resp || {})
+        }
+      )
+    })
+    if (!started?.ok) throw new Error(started?.error || 'Failed to start background run')
+
+    const pollStarted = Date.now()
+    const pollTimeoutMs = 45 * 60 * 1000
+    while (Date.now() - pollStarted < pollTimeoutMs) {
+      const statusResp = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'QA_HELPER_GET_EXTENSION_RUN_STATE' }, (resp) => {
+          if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+          resolve(resp || {})
+        })
+      })
+      const st = statusResp?.state || {}
+      const total = Number(st.total || 0)
+      const current = Number(st.current || 0)
+      const msg = String(st.message || '')
+      if (msg) setStatus(msg, st.status === 'running')
+      renderProgress(Math.min(current, total), Math.max(total, 1), msg || 'Running tests...')
+
+      if (st.status === 'done') {
+        const summary = String(st.summary || 'Done')
+        setStatus(summary, false)
+        els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        if (st.runId) {
+          els.viewBtn.style.display = 'block'
+          els.viewBtn.onclick = () => {
+            chrome.tabs.create({ url: `${APP_BASE}/?project=${projectId}&run=${st.runId}` })
+          }
+        }
+        return
+      }
+      if (st.status === 'error') {
+        throw new Error(String(st.message || 'Background run failed'))
+      }
+      await new Promise(resolve => setTimeout(resolve, 350))
+    }
+    throw new Error('Background run timed out')
+  } catch (err) {
+    setStatus(err.message || 'Failed to run extension tests', false)
+    els.results.innerHTML = `<div class="check fail">${err.message || 'Unknown extension error'}</div>`
+  }
 }
 
 async function captureCurrentPagePng() {
@@ -399,7 +577,7 @@ async function resumeActiveJobIfAny() {
 }
 
 els.loginBtn.addEventListener('click', login)
-els.runBtn.addEventListener('click', runFromExtension)
+els.runBtn.addEventListener('click', runExtensionTests)
 if (els.openAppBtn) {
   els.openAppBtn.addEventListener('click', openApp)
 }
@@ -408,12 +586,34 @@ async function initExtension() {
   try {
     const resolved = await resolveApiUrl()
     API_BASE = resolved
-    APP_BASE = resolved
+    APP_BASE = deriveAppBase(resolved)
   } catch {
     // Fallback to whatever CONFIG.API_URL already points at.
   }
   loadProjects()
   resumeActiveJobIfAny()
 }
+
+// Keep a debug handle to legacy backend-driven flow without wiring it to Run Test.
+globalThis.qaHelperLegacyRunFromExtension = runFromExtension
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type !== 'QA_HELPER_CAPTURE_VISIBLE_TAB') return false
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const winId = tabs?.[0]?.windowId
+    if (!winId) {
+      sendResponse({ ok: false, dataUrl: '' })
+      return
+    }
+    chrome.tabs.captureVisibleTab(winId, { format: 'jpeg', quality: 55 }, (dataUrl) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ ok: false, dataUrl: '' })
+        return
+      }
+      sendResponse({ ok: true, dataUrl: String(dataUrl || '') })
+    })
+  })
+  return true
+})
 
 initExtension()

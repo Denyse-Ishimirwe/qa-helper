@@ -196,6 +196,7 @@ async function initTurso(url, authToken) {
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_url TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_username TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
+  await tryExecTurso(`ALTER TABLE projects ADD COLUMN test_data_profile TEXT`)
   await tryExecTurso(
     `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
   )
@@ -287,6 +288,12 @@ async function initSqlite() {
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE projects ADD COLUMN test_data_profile TEXT`)
   } catch {
     // Column already exists.
   }
