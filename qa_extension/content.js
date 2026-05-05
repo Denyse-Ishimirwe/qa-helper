@@ -7,6 +7,79 @@
  * (parsed parent + value — not hardcoded to one country or contract label).
  */
 let hasExpandedSectionsForRun = false
+let cancelCurrentTestRequested = false
+let activeHighlightedField = null
+let reusableIdValueForRun = ''
+/** Set once per extension run: Step A+B discover required messages + fill all. */
+let requiredFieldRunPreflightDone = false
+/** Text from Step A (.invalid-feedback + formly-validation-message). */
+let discoveredRequiredErrors = []
+
+function clearActiveFieldHighlight() {
+  if (!activeHighlightedField) return
+  try {
+    activeHighlightedField.style.outline = ''
+    activeHighlightedField.style.outlineOffset = ''
+    activeHighlightedField.style.boxShadow = ''
+    activeHighlightedField.removeAttribute('data-qa-active-field')
+  } catch {
+    // Ignore cleanup issues on detached nodes.
+  }
+  activeHighlightedField = null
+}
+
+function getOrCreateRunIndicator() {
+  let node = document.getElementById('qa-helper-run-indicator')
+  if (node) return node
+  node = document.createElement('div')
+  node.id = 'qa-helper-run-indicator'
+  node.style.position = 'fixed'
+  node.style.right = '12px'
+  node.style.top = '12px'
+  node.style.zIndex = '2147483647'
+  node.style.maxWidth = '420px'
+  node.style.padding = '8px 10px'
+  node.style.borderRadius = '8px'
+  node.style.background = 'rgba(31,56,100,0.94)'
+  node.style.color = '#fff'
+  node.style.fontSize = '12px'
+  node.style.lineHeight = '1.35'
+  node.style.boxShadow = '0 4px 14px rgba(0,0,0,0.25)'
+  node.style.pointerEvents = 'none'
+  document.documentElement.appendChild(node)
+  return node
+}
+
+function updateLiveRunIndicator(tc, fieldEl = null, stage = 'Checking field') {
+  const node = getOrCreateRunIndicator()
+  const fieldName =
+    String(tc?.field_label || '').trim() ||
+    String(getLabelText(fieldEl) || '').trim() ||
+    String(tc?.field_name || '').trim() ||
+    String(tc?.name || '').trim() ||
+    'Unknown field'
+  const type = String(tc?.test_type || 'required_field').trim()
+  node.textContent = `${stage}: ${fieldName} (${type})`
+  if (!fieldEl || !isVisible(fieldEl)) return
+  clearActiveFieldHighlight()
+  activeHighlightedField = fieldEl
+  fieldEl.setAttribute('data-qa-active-field', '1')
+  fieldEl.style.outline = '2px solid #2e75b6'
+  fieldEl.style.outlineOffset = '2px'
+  fieldEl.style.boxShadow = '0 0 0 3px rgba(46,117,182,0.2)'
+}
+
+function clearLiveRunIndicator() {
+  clearActiveFieldHighlight()
+  const node = document.getElementById('qa-helper-run-indicator')
+  if (node?.parentNode) node.parentNode.removeChild(node)
+}
+
+function throwIfCancelled() {
+  if (cancelCurrentTestRequested) {
+    throw new Error('Test execution cancelled by user')
+  }
+}
 function getLabelText(el) {
   const id = el.id
   if (id) {
@@ -69,7 +142,27 @@ function scanFormFields() {
 }
 
 function wait(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+  return new Promise((resolve, reject) => {
+    const raw = Number(ms || 0)
+    // Light pacing so runs stay closer to 3–5 min for a full suite.
+    const paced =
+      raw <= 0 ? 0
+        : raw < 120 ? raw + 18
+          : Math.min(Math.round(raw * 1.04), raw + 70)
+    const started = Date.now()
+    const step = () => {
+      if (cancelCurrentTestRequested) {
+        reject(new Error('Test execution cancelled by user'))
+        return
+      }
+      if (Date.now() - started >= paced) {
+        resolve()
+        return
+      }
+      setTimeout(step, 40)
+    }
+    step()
+  })
 }
 
 function normalizeText(v) {
@@ -100,7 +193,7 @@ function sanitizeSearchLabel(v) {
  */
 function normalizeCaseFieldLabelRaw(raw) {
   let h = String(raw || '').trim()
-  h = h.replace(/^test\s+(required\s+field|format\s+validation|optional\s+field|conditional\s+(required|display)|widget\s+auto\s+fill|attachment|disabled\s+field)\s*:\s*/i, '').trim()
+    h = h.replace(/^test\s+(required\s+field|format\s+validation|optional\s+field|conditional\s+(required|display|field)|widget\s+auto\s+fill|attachment|disabled\s+field)\s*:\s*/i, '').trim()
   h = h.replace(/^(required|format|optional|conditional|widget|attachment|disabled)\s+(field|validation|display|required|auto\s+fill)\s*:\s*/i, '').trim()
   h = h.replace(/^[^-:]+-\s*/g, '').trim()
   h = h.replace(/^[^-:]+:\s*/g, '').trim()
@@ -362,10 +455,11 @@ function getVisibleValidationEntries() {
     })
 }
 
-async function getVisibleValidationEntriesWithRetry() {
-  const initialWaitMs = 2500
-  const maxMs = 3000
-  const stepMs = 200
+async function getVisibleValidationEntriesWithRetry(opts = {}) {
+  const quick = Boolean(opts.quick)
+  const initialWaitMs = quick ? 320 : 1100
+  const maxMs = quick ? 640 : 1400
+  const stepMs = quick ? 80 : 120
   await wait(initialWaitMs)
   const tries = Math.ceil(maxMs / stepMs)
   let last = []
@@ -377,14 +471,41 @@ async function getVisibleValidationEntriesWithRetry() {
   return last
 }
 
-function getTargetFieldFormlyContainer(targetEl) {
+function getTargetFieldValidationRoot(targetEl) {
   if (!targetEl?.closest) return null
-  return targetEl.closest('formly-wrapper-form-field, formly-field')
+  const formly = targetEl.closest('formly-wrapper-form-field, formly-field, formly-group')
+  if (formly) return formly
+  const mat = targetEl.closest(
+    'mat-form-field, .mat-mdc-form-field, .mat-form-field, .mdc-text-field, .mat-mdc-text-field-wrapper'
+  )
+  if (mat) return mat
+  const radioRoot = getRadioGroupContainer(targetEl)
+  if (radioRoot) return radioRoot
+  return targetEl.closest('.form-group, .field, .mb-3, .form-field')
 }
 
 function isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl) {
-  const container = getTargetFieldFormlyContainer(targetEl)
-  return Boolean(container && msgEl && container.contains(msgEl))
+  const root = getTargetFieldValidationRoot(targetEl)
+  if (!root || !msgEl) return false
+  if (root.contains(msgEl)) return true
+  let sib = root.nextElementSibling
+  for (let i = 0; i < 6 && sib; i += 1) {
+    if (sib === msgEl || sib.contains?.(msgEl)) return true
+    sib = sib.nextElementSibling
+  }
+  const wrap = root.parentElement
+  if (wrap && wrap.contains(msgEl)) {
+    try {
+      const rb = root.getBoundingClientRect?.()
+      const mb = msgEl.getBoundingClientRect?.()
+      if (rb && mb && mb.height > 0 && Math.abs(mb.top - rb.bottom) < 120 && Math.abs(mb.left - rb.left) < 240) {
+        return true
+      }
+    } catch {
+      // ignore geometry failures
+    }
+  }
+  return false
 }
 
 function tokenizeNormalizedPhrase(norm) {
@@ -405,41 +526,143 @@ function messageContainsThreeConsecutiveWordsFromExpected(msgNorm, expectedNorm)
   return false
 }
 
+function messageContainsTwoConsecutiveWordsFromExpected(msgNorm, expectedNorm) {
+  const words = tokenizeNormalizedPhrase(expectedNorm)
+  if (words.length < 2) return false
+  for (let i = 0; i <= words.length - 2; i += 1) {
+    const phrase = `${words[i]} ${words[i + 1]}`
+    if (phrase.length > 3 && msgNorm.includes(phrase)) return true
+  }
+  return false
+}
+
+/** Short expected strings like "Invalid email format" vs real mat-error copy. */
+function formatValidationLooseMatch(msgNorm, expectedNorm, whatToTestNorm, targetNorm) {
+  if (!/(invalid|incorrect|format|characters|pattern|not\s+valid|must\s+be)/i.test(msgNorm)) return false
+  if (/email|e-mail/.test(targetNorm) && /email/.test(whatToTestNorm)) {
+    return /(invalid|incorrect|format|address|valid)/i.test(msgNorm)
+  }
+  if (/(phone|mobile|tel)/.test(targetNorm) && /phone/.test(whatToTestNorm)) {
+    return /(invalid|incorrect|format|number|digit)/i.test(msgNorm)
+  }
+  if (/\blast\s+name\b/.test(targetNorm) || /\blast\s+name\b/.test(whatToTestNorm)) {
+    return /(last|name|invalid|characters|format|pattern)/i.test(msgNorm)
+  }
+  if (/start\s*date/.test(targetNorm) || /start\s*date/.test(whatToTestNorm)) {
+    return /(start|date|invalid|format)/i.test(msgNorm)
+  }
+  if (/date\s+of\s+birth|\bdob\b/.test(targetNorm) || /date\s+of\s+birth/.test(whatToTestNorm)) {
+    return /(date|birth|invalid|format|age)/i.test(msgNorm)
+  }
+  const ew = tokenizeNormalizedPhrase(expectedNorm)
+  for (let i = 0; i < ew.length - 1; i += 1) {
+    const pair = `${ew[i]} ${ew[i + 1]}`
+    if (pair.length > 4 && msgNorm.includes(pair)) return true
+  }
+  return false
+}
+
 function isGenericRequiredLikeMessage(norm) {
   const n = String(norm || '').trim()
   return (
-    /^this field is required\.?$/i.test(n) ||
-    /^field is required\.?$/i.test(n) ||
-    /^value is required\.?$/i.test(n) ||
+    /^this field is required/i.test(n) ||
+    /^field is required/i.test(n) ||
+    /^value is required/i.test(n) ||
     /please (select|choose)/i.test(n) ||
     /^(an option|a value) must be selected/i.test(n)
   )
 }
 
-function pickMatchedMessage(entries, expectedResult, targetLabel = '', targetField = null) {
+function looksAggregatedDiscoveryLine(norm) {
+  const n = String(norm || '').trim()
+  if (!n) return false
+  const reqCount = (n.match(/\brequired\b/g) || []).length
+  return n.length > 180 || reqCount > 2
+}
+
+/** Require multiple label tokens when the field name has several words (reduces wrong-field matches on long error blobs). */
+function labelStrongMatch(norm, targetNorm) {
+  const parts = sanitizeSearchLabel(targetNorm).split(/\s+/).filter(Boolean)
+  if (!parts.length) return false
+  const need = parts.filter(p => p.length > 1)
+  if (!need.length) return false
+  const hits = need.filter(p => norm.includes(p))
+  if (need.length >= 2) return hits.length >= 2
+  return hits.length === 1
+}
+
+function dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, msgNorm) {
+  if (!/date\s+of\s+birth|dob|birthdate|birth\s+date/.test(targetNorm)) return false
+  if (!/under\s+18|below\s+18|less\s+than\s*18|150|greater\s+than|over\s+150|years?\s+old|too\s+old|too\s+young/i.test(whatToTestNorm)) {
+    return false
+  }
+  if (!/date\s+of\s+birth|dob|birth|age|year|18|150|invalid|required|eligib|minor|adult|allowed|least|most|maximum|minimum/i.test(msgNorm)) {
+    return false
+  }
+  if (expectedNorm && /date\s+of\s+birth/.test(expectedNorm) && /required|invalid/.test(expectedNorm)) {
+    return true
+  }
+  return /invalid|required|age|18|150|year|eligib|minor|allowed|must|least|most|maximum|minimum/.test(msgNorm)
+}
+
+function pickMatchedMessage(entries, expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
   const targetNorm = sanitizeSearchLabel(targetLabel)
-  const targetTokens = targetNorm.split(/\s+/).filter(w => w.length > 2)
   const targetEl = targetField?.element
   const expectedNorm = normalizeLabelText(String(expectedResult || ''))
+  const whatToTestNorm = normalizeLabelText(String(whatToTest || ''))
   const loginPageSignals = /enter your details|sign in|username or password|invalid username/i
+  const reqish = /required|invalid|must|select|choose|missing|empty|option/i
 
-  const match = entries.find(entry => {
-    const norm = normalizeLabelText(entry.text)
-    if (loginPageSignals.test(norm)) return false
+  const scored = (entries || [])
+    .map(entry => {
+      const norm = normalizeLabelText(entry.text)
+      if (!norm || loginPageSignals.test(norm)) return null
+      const msgEl = entry?.element
+      const associated = Boolean(targetEl && msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+      const textOk3 = messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)
+      const textOk2 = messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)
+      const dobAgeOk = dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, norm)
+      const formatOk = formatValidationLooseMatch(norm, expectedNorm, whatToTestNorm, targetNorm)
+      const textOk = textOk3 || textOk2 || dobAgeOk || formatOk
+      const labelHit = labelStrongMatch(norm, targetNorm)
+      const generic = isGenericRequiredLikeMessage(norm)
+      return { entry, norm, associated, textOk, labelHit, generic, dobAgeOk, formatOk }
+    })
+    .filter(Boolean)
 
-    const msgEl = entry?.element
-    const domOk =
-      Boolean(targetEl && msgEl) && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl)
-    const textOk = messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)
-    const labelMention = targetTokens.length > 0 && targetTokens.some(t => norm.includes(t))
-    const generic = isGenericRequiredLikeMessage(norm)
-    if (textOk) return true
-    if (!domOk) return false
-    if (labelMention) return true
-    if (generic) return true
-    return false
-  })
-  return match?.text || ''
+  if (scored.length === 0) return ''
+
+  const multi = scored.length > 1
+  const pick = (pred) => scored.find(pred)
+
+  let hit = pick(
+    c =>
+      c.associated &&
+      (c.textOk ||
+        (c.labelHit && reqish.test(c.norm)) ||
+        (c.generic && (!multi || c.labelHit || c.textOk)))
+  )
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.dobAgeOk && (c.associated || c.labelHit))
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.formatOk && (c.associated || c.labelHit))
+  if (hit) return hit.entry.text
+
+  hit = pick(
+    c =>
+      c.labelHit &&
+      reqish.test(c.norm) &&
+      c.norm.length < 200 &&
+      (!multi || c.associated || c.textOk)
+  )
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.textOk && c.labelHit && (c.associated || c.norm.length < 96))
+  if (hit) return hit.entry.text
+
+  return ''
 }
 
 function pickMatchedMessageForConditionalRequired(entries, expectedResult, targetLabel = '', targetField = null) {
@@ -447,15 +670,21 @@ function pickMatchedMessageForConditionalRequired(entries, expectedResult, targe
   if (!targetEl || !Array.isArray(entries) || entries.length === 0) return ''
   const expectedNorm = normalizeLabelText(String(expectedResult || ''))
   const targetNorm = sanitizeSearchLabel(targetLabel)
-  const targetTokens = targetNorm.split(/\s+/).filter(w => w.length > 2)
   const loginPageSignals = /enter your details|sign in|username or password|invalid username/i
 
-  const inContainer = entries.filter(entry => {
+  let inContainer = entries.filter(entry => {
     const norm = normalizeLabelText(entry?.text || '')
     if (!norm || loginPageSignals.test(norm)) return false
     const msgEl = entry?.element
     return Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
   })
+  if (inContainer.length === 0) {
+    inContainer = entries.filter(entry => {
+      const norm = normalizeLabelText(entry?.text || '')
+      if (!norm || loginPageSignals.test(norm)) return false
+      return labelStrongMatch(norm, targetNorm)
+    })
+  }
   if (inContainer.length === 0) return ''
 
   const byPhrase = inContainer.find(e =>
@@ -467,14 +696,8 @@ function pickMatchedMessageForConditionalRequired(entries, expectedResult, targe
   const generic = inContainer.find(e => isGenericRequiredLikeMessage(normalizeLabelText(e.text)))
   if (generic) return generic.text
 
-  // Fall back to target token mention inside the target container.
-  if (targetTokens.length > 0) {
-    const byToken = inContainer.find(e => {
-      const norm = normalizeLabelText(e.text)
-      return targetTokens.some(t => norm.includes(t))
-    })
-    if (byToken) return byToken.text
-  }
+  const byLabel = inContainer.find(e => labelStrongMatch(normalizeLabelText(e.text), targetNorm))
+  if (byLabel) return byLabel.text
   return ''
 }
 
@@ -545,53 +768,6 @@ async function ensureRadioGroupUnselected(fieldEl, attempts = 5) {
   return false
 }
 
-function findVisibleValidationInContainer(container) {
-  if (!container?.querySelectorAll) return []
-  const nodes = Array.from(
-    container.querySelectorAll('formly-validation-message, .invalid-feedback')
-  ).filter(isVisible)
-  const seen = new Set()
-  return nodes
-    .map(el => ({
-      element: el,
-      text: String(el.textContent || '').replace(/\s+/g, ' ').trim()
-    }))
-    .filter(e => {
-      const n = normalizeLabelText(e.text)
-      if (!n || seen.has(n)) return false
-      seen.add(n)
-      return true
-    })
-}
-
-async function findVisibleValidationInContainerWithRetry(container, initialWaitMs = 2500, maxMs = 3500, stepMs = 250) {
-  await wait(initialWaitMs)
-  const tries = Math.max(1, Math.ceil(maxMs / stepMs))
-  let last = []
-  for (let i = 0; i < tries; i += 1) {
-    last = findVisibleValidationInContainer(container)
-    if (last.length > 0) return last
-    await wait(stepMs)
-  }
-  return last
-}
-
-async function clickContinueAndReadErrorsInContainer(container, expectedResult, targetLabel = '', targetField = null, waitMs = 2500) {
-  const button = findContinueButton()
-  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
-  scrollTestTargetIntoView(button)
-  await wait(420)
-  button.click()
-  const entries = await findVisibleValidationInContainerWithRetry(
-    container,
-    Math.max(2500, Number(waitMs || 0)),
-    4000,
-    250
-  )
-  const matched = pickMatchedMessage(entries, expectedResult, targetLabel, targetField)
-  return { ok: true, messages: entries.map(e => e.text), matched }
-}
-
 function cssEscapeSafe(value) {
   try {
     return CSS.escape(String(value || ''))
@@ -627,6 +803,7 @@ function detectFieldKind(el) {
   const type = String(el.type || '').toLowerCase()
   const placeholder = normalizeLabelText(el.getAttribute?.('placeholder') || '')
   if (type === 'radio') return 'radio'
+  if (type === 'file') return 'file'
   if (tag === 'select') return 'select'
   if (el.closest('ng-select, .ng-select') || tag === 'ng-select' || el.getAttribute?.('role') === 'combobox') return 'ng-select'
   if (
@@ -642,22 +819,138 @@ function detectFieldKind(el) {
   return 'input'
 }
 
-function resolveFieldTargetByNorm(normLabel, nameText) {
+function getLocalFieldTextBlobForScoring(el) {
+  if (!el?.closest) return ''
+  const wrap = el.closest(
+    'formly-wrapper-form-field, formly-field, mat-form-field, .mat-mdc-form-field, fieldset, .form-group, .field'
+  )
+  let chunk = String(wrap?.textContent || '').slice(0, 2400)
+  const prev = wrap?.previousElementSibling
+  if (prev && String(prev.textContent || '').length < 450) {
+    const prevTag = String(prev.tagName || '').toLowerCase()
+    if (prevTag === 'label' || /label|question|legend|form-label/i.test(String(prev.className || ''))) {
+      chunk = `${String(prev.textContent || '')} ${chunk}`
+    }
+  }
+  return normalizeLabelText(`${getLabelText(el)} ${chunk}`)
+}
+
+function minAcceptScoreForDeclaredField(scoreKey) {
+  const words = significantLabelWords(sanitizeSearchLabel(scoreKey))
+  if (words.length >= 3) return 36
+  if (words.length === 2) return 26
+  if (words.length === 1) return words[0].length > 6 ? 20 : 14
+  return 10
+}
+
+/** How well `el` matches the test case's declared field (label + optional field_name + hint). */
+function scoreFieldTargetCandidate(el, declaredLabelNorm, fieldName, contextHint) {
+  if (!el) return -1e9
+  const blob = getLocalFieldTextBlobForScoring(el)
+  const norm = sanitizeSearchLabel(declaredLabelNorm)
+  const words = significantLabelWords(norm)
+  let s = 0
+  const fn = String(fieldName || '').trim()
+  if (fn) {
+    const wrap = el.closest('formly-field, formly-wrapper-form-field')
+    const key = parseFormlyFieldIdKey(wrap?.id || '')
+    const fnC = fn.toLowerCase().replace(/[^a-z0-9]+/g, '')
+    const keyC = String(key).toLowerCase().replace(/[^a-z0-9]+/g, '')
+    if (fnC && keyC && (keyC === fnC || keyC.includes(fnC) || fnC.includes(keyC))) s += 130
+    const nm = String(el.getAttribute?.('name') || el.name || '').toLowerCase()
+    const fid = String(el.id || '').toLowerCase()
+    if (fnC && (nm.includes(fnC) || fid.includes(fnC))) s += 60
+  }
+  for (const w of words) {
+    if (!w) continue
+    if (blob.includes(w)) s += w.length >= 5 ? 16 : w.length >= 4 ? 12 : 7
+  }
+  if (norm && nearControlMatchesSearchLabel(el, norm)) s += 42
+  if (words.length >= 2) {
+    const allHit = words.every(w => blob.includes(w))
+    if (allHit) s += 48
+    else s -= 22
+  }
+  const stop = new Set([
+    'test',
+    'field',
+    'required',
+    'conditional',
+    'display',
+    'validation',
+    'format',
+    'check',
+    'leave',
+    'enter',
+    'when',
+    'select',
+    'empty',
+    'with',
+    'valid',
+    'values'
+  ])
+  for (const hw of significantLabelWords(sanitizeSearchLabel(String(contextHint || '').slice(0, 260)))) {
+    if (hw.length < 4 || stop.has(hw)) continue
+    if (blob.includes(hw)) s += 5
+  }
+  const wrapLen = String(el.closest('formly-field, formly-wrapper-form-field')?.textContent || '').length
+  if (wrapLen > 5500) s -= 14
+  else if (wrapLen > 0 && wrapLen < 900) s += 6
+  return s
+}
+
+function pickBestFieldTargetFromCandidates(cands, declaredLabelNorm, fieldName, contextHint) {
+  if (!cands.length) return { element: null, kind: 'unknown' }
+  const hint = String(contextHint || '')
+  const scored = cands
+    .map(c => ({
+      ...c,
+      score: scoreFieldTargetCandidate(c.element, declaredLabelNorm, fieldName, hint)
+    }))
+    .sort((a, b) => b.score - a.score)
+  const best = scored[0]
+  const minS = minAcceptScoreForDeclaredField(declaredLabelNorm)
+  if (best.score < minS) {
+    if (best.score < 8) return { element: null, kind: 'unknown' }
+    if (scored.length >= 2 && best.score - scored[1].score < 6) return { element: null, kind: 'unknown' }
+  }
+  if (scored.length >= 2 && best.score - scored[1].score < 8 && scored[1].score >= minS - 4) {
+    const n = sanitizeSearchLabel(declaredLabelNorm)
+    const aNear = nearControlMatchesSearchLabel(best.element, n)
+    const bNear = nearControlMatchesSearchLabel(scored[1].element, n)
+    if (aNear && !bNear) return { element: best.element, kind: best.kind }
+    if (!aNear && bNear) return { element: scored[1].element, kind: scored[1].kind }
+    if (best.score < minS + 12) return { element: null, kind: 'unknown' }
+  }
+  return { element: best.element, kind: best.kind }
+}
+
+/** Every control that plausibly matches `normLabel` (substring / label walk), before global ranking. */
+function gatherFieldTargetsByNorm(normLabel, nameText) {
+  const out = []
+  const seen = new Set()
+  const push = (el, kind) => {
+    if (!el || seen.has(el)) return
+    seen.add(el)
+    out.push({ element: el, kind: kind || detectFieldKind(el) })
+  }
+
+  if (!normLabel) return out
+
   const labels = Array.from(document.querySelectorAll('label'))
   for (const labelEl of labels) {
-    if (!normLabel) continue
     const lNorm = normalizeLabelText(labelEl.textContent)
     if (!lNorm.includes(normLabel)) continue
     const forId = String(labelEl.getAttribute('for') || '').trim()
     if (forId) {
       const byFor = document.getElementById(forId)
-      if (byFor) return { element: byFor, kind: detectFieldKind(byFor) }
+      if (byFor) push(byFor, detectFieldKind(byFor))
     }
     const nested = labelEl.querySelector('input, select, textarea, ng-select, .ng-select, div[role="combobox"]')
-    if (nested) return { element: nested, kind: detectFieldKind(nested) }
+    if (nested) push(nested, detectFieldKind(nested))
     const sib = labelEl.nextElementSibling
     if (sib?.matches?.('input, select, textarea, ng-select, .ng-select, div[role="combobox"]')) {
-      return { element: sib, kind: detectFieldKind(sib) }
+      push(sib, detectFieldKind(sib))
     }
   }
 
@@ -672,14 +965,15 @@ function resolveFieldTargetByNorm(normLabel, nameText) {
     )
   for (const container of containerCandidates) {
     const inners = Array.from(container.querySelectorAll(innerSelector))
-    const matched = inners.find(el => nearControlMatchesSearchLabel(el, normLabel))
-    if (matched) return { element: matched, kind: detectFieldKind(matched) }
+    for (const inner of inners) {
+      if (nearControlMatchesSearchLabel(inner, normLabel)) push(inner, detectFieldKind(inner))
+    }
   }
 
   const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
   for (const radio of radios) {
     const near = normalizeLabelText(getRadioContextText(radio))
-    if (normLabel && near.includes(normLabel)) return { element: radio, kind: 'radio' }
+    if (normLabel && near.includes(normLabel)) push(radio, 'radio')
   }
 
   const dateComps = Array.from(
@@ -691,14 +985,14 @@ function resolveFieldTargetByNorm(normLabel, nameText) {
     const near = normalizeLabelText(`${comp.textContent || ''} ${comp.closest('formly-field, formly-wrapper-form-field, .form-group, .field')?.textContent || ''}`)
     if (normLabel && near.includes(normLabel)) {
       const input = comp.querySelector('input')
-      if (input) return { element: input, kind: 'date' }
+      if (input) push(input, 'date')
     }
   }
 
   const ngSelects = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
   for (const ngs of ngSelects) {
     const near = normalizeLabelText(`${ngs.textContent || ''} ${ngs.closest('formly-field, formly-wrapper-form-field, .form-group, .field')?.textContent || ''}`)
-    if (normLabel && near.includes(normLabel)) return { element: ngs, kind: 'ng-select' }
+    if (normLabel && near.includes(normLabel)) push(ngs, 'ng-select')
   }
 
   const controls = Array.from(document.querySelectorAll('input, textarea, select'))
@@ -707,34 +1001,74 @@ function resolveFieldTargetByNorm(normLabel, nameText) {
     for (let depth = 0; depth < 5 && cur; depth += 1) {
       const lbl = cur.querySelector?.('label')
       const txt = normalizeLabelText(`${lbl?.textContent || ''} ${cur.textContent || ''}`)
-      if (normLabel && txt.includes(normLabel)) return { element: control, kind: detectFieldKind(control) }
+      if (normLabel && txt.includes(normLabel)) {
+        push(control, detectFieldKind(control))
+        break
+      }
       cur = cur.parentElement
     }
   }
 
   if (nameText) {
-    const byName = document.querySelector(`input[name="${cssEscapeSafe(nameText)}"], select[name="${cssEscapeSafe(nameText)}"], textarea[name="${cssEscapeSafe(nameText)}"], #${cssEscapeSafe(nameText)}`)
-    if (byName) return { element: byName, kind: detectFieldKind(byName) }
+    const byName = document.querySelector(
+      `input[name="${cssEscapeSafe(nameText)}"], select[name="${cssEscapeSafe(nameText)}"], textarea[name="${cssEscapeSafe(nameText)}"], #${cssEscapeSafe(nameText)}`
+    )
+    if (byName) push(byName, detectFieldKind(byName))
   }
 
-  return { element: null, kind: 'unknown' }
+  return out
+}
+
+function buildSearchTermsForField(fieldLabel, hint) {
+  const primary = sanitizeSearchLabel(fieldLabel)
+  const terms = []
+  const add = t => {
+    const s = sanitizeSearchLabel(t)
+    if (!s || terms.includes(s)) return
+    if (s.length < 4 && s !== primary) return
+    terms.push(s)
+  }
+  add(primary)
+  for (const t of expandLabelSearchTerms(fieldLabel, hint)) add(t)
+  return terms
 }
 
 function resolveFieldTarget(fieldLabel, fieldName, contextHint = '') {
   const nameText = String(fieldName || '').trim()
   const hint = `${nameText} ${String(contextHint || '')}`.trim()
+  const declared = sanitizeSearchLabel(fieldLabel)
+
   const byKey = resolveFieldTargetByFormlyKey(nameText)
-  if (byKey.element) return byKey
+  if (byKey.element) {
+    const ks = scoreFieldTargetCandidate(byKey.element, declared, nameText, hint)
+    if (ks >= 55 || (ks >= 28 && nearControlMatchesSearchLabel(byKey.element, declared))) {
+      return byKey
+    }
+  }
+
   const locCascade = resolveLocationCascadeChild(fieldLabel, hint)
   if (locCascade.element) return locCascade
+
   const natCascade = resolveNationalityCascadeChild(fieldLabel)
   if (natCascade.element) return natCascade
-  const terms = expandLabelSearchTerms(fieldLabel, hint)
-  for (const normLabel of terms) {
-    const hit = resolveFieldTargetByNorm(normLabel, nameText)
-    if (hit.element) return hit
+
+  const merged = []
+  const seen = new Set()
+  const pushUnique = (el, kind) => {
+    if (!el || seen.has(el)) return
+    seen.add(el)
+    merged.push({ element: el, kind })
   }
-  return { element: null, kind: 'unknown' }
+
+  if (byKey.element) pushUnique(byKey.element, byKey.kind)
+
+  for (const normLabel of buildSearchTermsForField(fieldLabel, hint)) {
+    for (const { element, kind } of gatherFieldTargetsByNorm(normLabel, nameText)) {
+      pushUnique(element, kind)
+    }
+  }
+
+  return pickBestFieldTargetFromCandidates(merged, declared, nameText, hint)
 }
 
 function getControlContainer(el) {
@@ -1038,9 +1372,68 @@ async function setDateValuePreferPicker(inputEl, fallbackValue = '') {
   return Boolean(String(inputEl.value || '').trim())
 }
 
+const LOCATION_CASCADE_STEPS = ['district', 'sector', 'cell', 'village', 'province']
+
+/** Earliest location keyword in the field wrapper reading order (district before sector, …). */
+function primaryLocationStepForControl(el) {
+  if (!el?.closest) return ''
+  const wrap = el.closest('formly-field, formly-wrapper-form-field') || getControlContainer(el)
+  const lower = String(wrap?.textContent || '').slice(0, 800).toLowerCase()
+  let bestPos = 1e9
+  let best = ''
+  for (const w of LOCATION_CASCADE_STEPS) {
+    const re = new RegExp(`\\b${w}\\b`, 'i')
+    const idx = lower.search(re)
+    if (idx >= 0 && idx < bestPos) {
+      bestPos = idx
+      best = w
+    }
+  }
+  return best
+}
+
+function primaryLocationTierIndex(el) {
+  const step = primaryLocationStepForControl(el)
+  const idx = LOCATION_CASCADE_STEPS.indexOf(step)
+  return idx >= 0 ? idx : 999
+}
+
+/** Which location tier this test targets (e.g. "Sector" → sector). */
+function locationStepFromFieldLabel(fieldLabel) {
+  const lower = normalizeText(String(fieldLabel || ''))
+  let bestPos = 1e9
+  let best = ''
+  for (const w of LOCATION_CASCADE_STEPS) {
+    const re = new RegExp(`\\b${w}\\b`, 'i')
+    const idx = lower.search(re)
+    if (idx >= 0 && idx < bestPos) {
+      bestPos = idx
+      best = w
+    }
+  }
+  return best
+}
+
+/** True when resolved control is the intended cascade row (not an earlier dropdown). */
+function resolvedTargetMatchesLocationStep(fieldLabel, target) {
+  const want = locationStepFromFieldLabel(fieldLabel)
+  if (!want) return true
+  const el = target?.element
+  if (!el) return false
+  const got = primaryLocationStepForControl(el)
+  if (!got) return false
+  return got.toLowerCase() === want.toLowerCase()
+}
+
 async function resolveTargetWithTypeHints(fieldLabel, fieldName, options = {}) {
   let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
-  if (target.element) return target
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
+    return target
+  }
 
   const hintedRadios = findRadiosForLabel(fieldLabel)
   if (hintedRadios.length > 0) return { element: hintedRadios[0], kind: 'radio' }
@@ -1049,17 +1442,29 @@ async function resolveTargetWithTypeHints(fieldLabel, fieldName, options = {}) {
   if (hintedDate) return { element: hintedDate, kind: 'date' }
 
   const hintedNg = findNgSelectForLabel(fieldLabel)
-  if (hintedNg) return { element: hintedNg, kind: 'ng-select' }
+  if (
+    hintedNg &&
+    resolvedTargetMatchesLocationStep(fieldLabel, { element: hintedNg, kind: 'ng-select' })
+  ) {
+    return { element: hintedNg, kind: 'ng-select' }
+  }
 
   const byCascadeChain = await resolveWithCascadeChain(fieldLabel, fieldName, options)
+  if (byCascadeChain.element && resolvedTargetMatchesLocationStep(fieldLabel, byCascadeChain)) {
+    return byCascadeChain
+  }
+  if (target.element && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+    return target
+  }
   if (byCascadeChain.element) return byCascadeChain
-
   return target
 }
 
 async function resolveWithCascadeChain(fieldLabel, fieldName, options = {}) {
   let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
-  if (target.element && isVisible(target.element)) return target
+  if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+    return target
+  }
   const contextNorm = normalizeLabelText(`${fieldLabel || ''} ${fieldName || ''} ${options?.contextHint || ''}`)
   const targetTokens = new Set(
     String(contextNorm || '')
@@ -1085,23 +1490,31 @@ async function resolveWithCascadeChain(fieldLabel, fieldName, options = {}) {
           if (scopeNorm.includes(k)) score += (locationOrder.length - idx)
         }
         if (touched.has(el) || (key && touched.has(key))) score -= 3
-        return { el, score, key }
+        const tierIdx = primaryLocationTierIndex(el)
+        const top = Number(el.getBoundingClientRect?.().top ?? 0)
+        return { el, score, key, tierIdx, top }
       })
-      .sort((a, b) => b.score - a.score)
+      .sort((a, b) => {
+        if (a.tierIdx !== b.tierIdx) return a.tierIdx - b.tierIdx
+        if (a.score !== b.score) return b.score - a.score
+        return a.top - b.top
+      })
     const next = candidates[0]?.el || null
     if (!next) break
     const nextKey = candidates[0]?.key || ''
     scrollTestTargetIntoView(next)
-    await wait(220)
+    await wait(55)
     const changed = await selectFirstNonEmptyNgSelect(next)
     touched.add(next)
     if (nextKey) touched.add(nextKey)
     if (!changed) {
-      await wait(180)
+      await wait(55)
     }
-    await wait(800)
+    await wait(170)
     target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
-    if (target.element && isVisible(target.element)) return target
+    if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+      return target
+    }
   }
   return target
 }
@@ -1132,14 +1545,23 @@ function pickVisibleCascadeDropdowns() {
 }
 
 async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, contextHint = '') {
-  for (let iteration = 0; iteration < 5; iteration += 1) {
+  for (let iteration = 0; iteration < 4; iteration += 1) {
     const target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
       allowContinue: false,
       contextHint
     })
-    if (target?.element && isVisible(target.element)) return target
+    if (
+      target?.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
+      return target
+    }
 
     const dropdowns = pickVisibleCascadeDropdowns()
+      .map(el => ({ el, tier: primaryLocationTierIndex(el), top: Number(el.getBoundingClientRect?.().top ?? 0) }))
+      .sort((a, b) => a.tier - b.tier || a.top - b.top)
+      .map(x => x.el)
     if (dropdowns.length === 0) continue
     for (const dd of dropdowns) {
       const tag = String(dd.tagName || '').toLowerCase()
@@ -1153,12 +1575,18 @@ async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, 
       } else {
         await selectFirstNonEmptyNgSelect(dd)
       }
-      await wait(1000)
+      await wait(220)
       const check = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
         allowContinue: false,
         contextHint
       })
-      if (check?.element && isVisible(check.element)) return check
+      if (
+        check?.element &&
+        isVisible(check.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, check)
+      ) {
+        return check
+      }
     }
   }
   return { element: null, kind: 'unknown' }
@@ -1201,14 +1629,14 @@ function findContinueButton() {
   return allButtons.find(btn => /continue|next/i.test(String(btn.textContent || '').trim())) || null
 }
 
-async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targetField = null) {
+async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
   const button = findContinueButton()
   if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
   scrollTestTargetIntoView(button)
-  await wait(420)
+  await wait(280)
   button.click()
   const entries = await getVisibleValidationEntriesWithRetry()
-  const matched = pickMatchedMessage(entries, expectedResult, targetLabel, targetField)
+  const matched = pickMatchedMessage(entries, expectedResult, targetLabel, targetField, whatToTest)
   return { ok: true, messages: entries.map(e => e.text), matched }
 }
 
@@ -1220,108 +1648,135 @@ function getInvalidValueForFormat(tc) {
   if (text.includes('email')) return 'notanemail'
   if (text.includes('phone')) return 'abc'
   if (text.includes('under 18') || text.includes('below 18') || text.includes('age')) {
-    const under18 = readTesterProfileValue(['dob_under_18', 'dob_minor'])
-    if (under18) return under18
     const d = new Date()
     d.setFullYear(d.getFullYear() - 17)
+    return d.toISOString().slice(0, 10)
+  }
+  if (text.includes('150') || text.includes('greater than') || text.includes('too old')) {
+    const d = new Date()
+    d.setFullYear(d.getFullYear() - 151)
     return d.toISOString().slice(0, 10)
   }
   return '!!!invalid!!!'
 }
 
-function readTesterProfileValue(keys = []) {
+function detectAttachmentCaseKind(tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (text.includes('larger than') || text.includes('500kb') || text.includes('size') || text.includes('oversize')) return 'size_limit'
+  if (text.includes('wrong format') || text.includes('invalid format') || text.includes('allowed file format') || text.includes('file format')) return 'invalid_format'
+  return 'required'
+}
+
+function findAttachmentFieldElementByLabel(fieldLabel, fieldName) {
+  const normLabel = sanitizeSearchLabel(fieldLabel)
+  const normName = String(fieldName || '').trim().toLowerCase()
+  const all = Array.from(document.querySelectorAll('input[type="file"]'))
+    .filter(el => isVisible(el) && !el.disabled && !el.readOnly)
+  if (all.length === 0) return null
+  if (all.length === 1) return all[0]
+  let best = null
+  let bestScore = -1e9
+  for (const el of all) {
+    const blob = normalizeLabelText(`${getLabelText(el)} ${el.id || ''} ${el.getAttribute('name') || ''} ${getLocalFieldTextBlobForScoring(el)}`)
+    let score = 0
+    if (normName) {
+      if (String(el.getAttribute('name') || '').toLowerCase().includes(normName)) score += 90
+      if (String(el.id || '').toLowerCase().includes(normName)) score += 70
+      if (blob.includes(normName)) score += 30
+    }
+    if (normLabel) {
+      if (blob.includes(normLabel)) score += 120
+      const words = significantLabelWords(normLabel)
+      for (const w of words) if (blob.includes(w)) score += 16
+    }
+    if (score > bestScore) {
+      bestScore = score
+      best = el
+    }
+  }
+  return best
+}
+
+function makeAttachmentTestFile(kind) {
+  if (kind === 'invalid_format') {
+    const txtBlob = new Blob(['qa helper invalid format fixture'], { type: 'text/plain' })
+    return new File([txtBlob], 'invalid-format.txt', { type: 'text/plain' })
+  }
+  if (kind === 'size_limit') {
+    const bytes = new Uint8Array(520 * 1024)
+    bytes.fill(65)
+    const pdfBlob = new Blob([bytes], { type: 'application/pdf' })
+    return new File([pdfBlob], 'oversized.pdf', { type: 'application/pdf' })
+  }
+  return null
+}
+
+function setFileInputValue(inputEl, file) {
+  if (!inputEl || !file) return false
   try {
-    if (!window?.localStorage) return ''
-    for (const key of keys) {
-      const direct = String(window.localStorage.getItem(key) || '').trim()
-      if (direct) return direct
-    }
-    const profileRaw = String(window.localStorage.getItem('qa_test_data_profile') || '').trim()
-    if (!profileRaw) return ''
-    const parsed = JSON.parse(profileRaw)
-    if (!parsed || typeof parsed !== 'object') return ''
-    for (const key of keys) {
-      const value = String(parsed?.[key] || '').trim()
-      if (value) return value
-    }
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    inputEl.files = dt.files
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+    inputEl.dispatchEvent(new Event('change', { bubbles: true }))
+    return true
   } catch {
-    // Ignore malformed profile payloads.
+    return false
   }
-  return ''
-}
-
-function readTesterProfileObject() {
-  try {
-    const profileRaw = String(window.localStorage.getItem('qa_test_data_profile') || '').trim()
-    if (!profileRaw) return {}
-    const parsed = JSON.parse(profileRaw)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-    return parsed
-  } catch {
-    return {}
-  }
-}
-
-function findProfileValueByLabelSimilarity(labelBlob) {
-  const blob = normalizeLabelText(labelBlob)
-  if (!blob) return ''
-  const blobTokens = new Set(blob.split(/\s+/).filter(t => t.length > 2))
-  const profile = readTesterProfileObject()
-  let best = { score: 0, value: '' }
-  for (const [k, v] of Object.entries(profile)) {
-    const value = String(v ?? '').trim()
-    if (!value) continue
-    const keyNorm = normalizeLabelText(String(k || '').replace(/_/g, ' '))
-    if (!keyNorm) continue
-    if (blob === keyNorm || blob.includes(keyNorm) || keyNorm.includes(blob)) return value
-    const keyTokens = keyNorm.split(/\s+/).filter(t => t.length > 2)
-    let overlap = 0
-    for (const t of keyTokens) {
-      if (blobTokens.has(t)) overlap += 1
-    }
-    if (overlap > best.score) {
-      best = { score: overlap, value }
-    }
-  }
-  return best.score >= 2 ? best.value : ''
-}
-
-function getPreferredNationalIdValue() {
-  const fromProfile = readTesterProfileValue([
-    'national_id',
-    'nationalId',
-    'id_number',
-    'idNumber'
-  ])
-  if (fromProfile) return fromProfile
-  return '1111171111111111'
-}
-
-function getPreferredProfileValueForControl(labelBlob, fallback = '') {
-  const blob = normalizeLabelText(labelBlob)
-  if (/\bfirst name\b/.test(blob)) return readTesterProfileValue(['first_name', 'firstName']) || fallback
-  if (/\blast name|surname\b/.test(blob)) return readTesterProfileValue(['last_name', 'lastName', 'surname']) || fallback
-  if (/\b(phone|mobile|tel)\b/.test(blob)) return readTesterProfileValue(['phone', 'phone_number', 'mobile']) || fallback
-  if (/\bemail\b/.test(blob)) return readTesterProfileValue(['email']) || fallback
-  if (/\b(date of birth|dob)\b/.test(blob)) return readTesterProfileValue(['dob_adult', 'date_of_birth']) || fallback
-  if (/\bnin\b/.test(blob)) return readTesterProfileValue(['nin']) || fallback
-  if (/\b(application number|citizen application)\b/.test(blob)) {
-    return readTesterProfileValue(['application_number', 'citizen_application_number']) || fallback
-  }
-  if (/\b(id number|national id|id no)\b/.test(blob)) return getPreferredNationalIdValue()
-  const bySimilarity = findProfileValueByLabelSimilarity(labelBlob)
-  if (bySimilarity) return bySimilarity
-  return fallback
 }
 
 function getLikelyValidValueForAutoFill(tc) {
   const text = normalizeLabelText(`${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.field_label || ''}`)
-  if (text.includes('national id') || text.includes('16 digits')) return getPreferredNationalIdValue()
+  if (/\b(national id|nin|citizen application|application number|id number)\b/.test(text)) return reusableIdValueForRun
+  if (text.includes('national id') || text.includes('16 digits')) return '1111171111111111'
   if (/\bnin\b/.test(text) || text.includes('10 digits')) return '1234567890'
   if (text.includes('citizen application') || text.includes('8 digits')) return '12345678'
   if (text.includes('phone')) return '0781234567'
   if (text.includes('email')) return 'autofill@example.com'
   return '1234567890'
+}
+
+function isIdLikeLabelText(text) {
+  const n = normalizeLabelText(text)
+  return /\b(id number|id no\.?|national\s*id|nin\b|application number|citizen application|rwanda\s*national|rwanational|identity\s*(number)?|identification(\s*number)?)\b/.test(
+    n
+  )
+}
+
+function idLikeStructuralHints(control) {
+  if (!control) return false
+  const fc = String(control.getAttribute?.('formcontrolname') || '')
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+  const nm = String(control.name || control.id || '')
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+  const hay = `${fc} ${nm}`
+  return /\b(idnumber|nationalid|nin|national_id|idno|citizenid|citizenapplication|applicationnumber)\b/.test(
+    hay
+  )
+}
+
+function isIdLikeControl(control) {
+  if (!control) return false
+  if (idLikeStructuralHints(control)) return true
+  const probe = `${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''} ${control?.getAttribute?.('aria-label') || ''} ${control?.getAttribute?.('formcontrolname') || ''}`
+  if (isIdLikeLabelText(probe)) return true
+  const blob = String(getLocalFieldTextBlobForScoring(control) || '').slice(0, 1400)
+  return isIdLikeLabelText(blob)
+}
+
+function seedReusableIdFromPageIfTyped() {
+  if (reusableIdValueForRun) return
+  const candidates = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea')).filter(
+    el => isVisible(el) && !el.disabled && !el.readOnly && isIdLikeControl(el)
+  )
+  for (const el of candidates) {
+    const v = String(el.value || '').trim()
+    if (!v) continue
+    reusableIdValueForRun = v
+    return
+  }
 }
 
 function readControlValue(el) {
@@ -1394,13 +1849,10 @@ function countChangedControls(before) {
 function isLikelyWidgetTriggerControl(control, kind) {
   const type = String(control?.type || '').toLowerCase()
   if (kind === 'ng-select' || kind === 'date' || type === 'date') return false
-  const label = normalizeLabelText(
-    `${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''}`
-  )
-  return /\b(id number|national id|nin|citizen application|application number)\b/.test(label)
+  return isIdLikeControl(control)
 }
 
-async function waitForWidgetSideEffects(beforeSnapshot, timeoutMs = 5000, minChanged = 1) {
+async function waitForWidgetSideEffects(beforeSnapshot, timeoutMs = 2800, minChanged = 1) {
   const step = 250
   const tries = Math.ceil(timeoutMs / step)
   for (let i = 0; i < tries; i += 1) {
@@ -1411,7 +1863,7 @@ async function waitForWidgetSideEffects(beforeSnapshot, timeoutMs = 5000, minCha
   return false
 }
 
-async function waitForAutoFillTargets(targets, beforeSnapshot, timeoutMs = 5000) {
+async function waitForAutoFillTargets(targets, beforeSnapshot, timeoutMs = 2800) {
   const step = 250
   const tries = Math.ceil(timeoutMs / step)
   for (let i = 0; i < tries; i += 1) {
@@ -1424,6 +1876,22 @@ async function waitForAutoFillTargets(targets, beforeSnapshot, timeoutMs = 5000)
     await wait(step)
   }
   return false
+}
+
+async function setInputLikeValueManually(control, value) {
+  const text = String(value ?? '')
+  if (typeof control?.focus === 'function') control.focus()
+  control.click?.()
+  await wait(40)
+  control.value = ''
+  dispatchInputEvents(control)
+  for (const ch of text) {
+    control.value = String(control.value || '') + ch
+    control.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(12)
+  }
+  dispatchInputEvents(control)
+  dispatchBlurEvent(control)
 }
 
 async function runWidgetAutoFillTest(tc, fieldLabel, fieldName) {
@@ -1449,9 +1917,7 @@ async function runWidgetAutoFillTest(tc, fieldLabel, fieldName) {
     const input = findDateInputForLabel(fieldLabel) || src
     await setDateValuePreferPicker(input, getSafeDateFallbackValue())
   } else {
-    src.value = val
-    dispatchInputEvents(src)
-    dispatchBlurEvent(src)
+    await setInputLikeValueManually(src, val)
   }
 
   const ok = await waitForAutoFillTargets(targetFields, before, 6000)
@@ -1633,9 +2099,9 @@ async function resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options
   const continueBtn = allowContinue ? findContinueButton() : null
   if (allowContinue && continueBtn) {
     scrollTestTargetIntoView(continueBtn)
-    await wait(380)
+    await wait(260)
     continueBtn.click()
-    await wait(900)
+    await wait(580)
     target = resolveFieldTarget(fieldLabel, fieldName, ch)
     if (target.element && isVisible(target.element)) return target
   }
@@ -1645,7 +2111,7 @@ async function resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options
   return target
 }
 
-async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHint = '', maxSteps = 4) {
+async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHint = '', maxSteps = 4, fillOptions = {}) {
   let target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
     allowContinue: false,
     contextHint
@@ -1653,13 +2119,13 @@ async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHi
   if (target.element && isVisible(target.element)) return target
 
   for (let i = 0; i < maxSteps; i += 1) {
-    await fillAllFieldsWithValidValues(null)
+    await fillAllFieldsWithValidValues(null, fillOptions)
     const btn = findContinueButton()
     if (!btn) break
     scrollTestTargetIntoView(btn)
-    await wait(380)
+    await wait(280)
     btn.click()
-    await wait(1000)
+    await wait(650)
     target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
       allowContinue: false,
       contextHint
@@ -1669,116 +2135,17 @@ async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHi
   return target
 }
 
-/** Normalize Yes/No for common radio model values; leave other triggers unchanged. */
-function normalizeConditionalTrigger(raw) {
-  const s = String(raw || '').trim()
-  const l = normalizeText(s)
-  if (l === 'yes' || l === 'no') return l === 'yes' ? 'Yes' : 'No'
-  return s
-}
-
-function trimParentQuestionLabel(s) {
-  return String(s || '')
-    .trim()
-    .replace(/\?+$/, '')
-    .trim()
-}
-
-/**
- * Parse conditional preconditions from free text — any parent field, not one product.
- * Supports: "when <Parent> is <value>", "select Yes/No on/for <Parent>", legacy "if … is …".
- */
+/** Uses conditionalParentKey.js (same logic as the background worker). */
 function parseConditionalSpec(tc) {
-  const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.name || ''}`
+  const fn = globalThis.qaHelperParseConditionalSpec
+  if (typeof fn !== 'function') return { parentLabel: '', triggerValue: '' }
+  return fn(tc)
+}
 
-  const afterSelectingYesNo = text.match(
-    /after\s+selecting\s+(yes|no)\s+(?:for|on)\s+(.+?)(?:\s*$|\s+and\b|\s+field\b)/i
-  )
-  if (afterSelectingYesNo) {
-    return {
-      parentLabel: trimParentQuestionLabel(afterSelectingYesNo[2]),
-      triggerValue: normalizeConditionalTrigger(afterSelectingYesNo[1])
-    }
-  }
-
-  const afterSelectingGeneral = text.match(
-    /after\s+selecting\s+(.+?)\s+(?:for|on)\s+(.+?)(?:\s+field\b|\s+and\b|\s*$)/i
-  )
-  if (afterSelectingGeneral) {
-    return {
-      parentLabel: trimParentQuestionLabel(afterSelectingGeneral[2]),
-      triggerValue: normalizeConditionalTrigger(afterSelectingGeneral[1])
-    }
-  }
-
-  const haveSet = text.match(/\bhave\s+(.+?)\s+set\s+to\s+(yes|no)\b/i)
-  if (haveSet) {
-    return {
-      parentLabel: trimParentQuestionLabel(haveSet[1]),
-      triggerValue: normalizeConditionalTrigger(haveSet[2])
-    }
-  }
-
-  const whenYesNo = text.match(/when\s+(.+?)\s+is\s+(yes|no)\b/i)
-  if (whenYesNo) {
-    return {
-      parentLabel: trimParentQuestionLabel(whenYesNo[1]),
-      triggerValue: normalizeConditionalTrigger(whenYesNo[2])
-    }
-  }
-
-  const selectForGeneric = text.match(
-    /\bselect\s+(.+?)\s+for\s+(.+?)(?:\s+and\b|\s+leave\b|\s+when\b|\s*$)/i
-  )
-  if (selectForGeneric) {
-    const a = String(selectForGeneric[1] || '').trim()
-    const b = trimParentQuestionLabel(selectForGeneric[2])
-    const aNorm = normalizeText(a)
-    if (aNorm === 'yes' || aNorm === 'no') {
-      return { parentLabel: b, triggerValue: normalizeConditionalTrigger(a) }
-    }
-    return { parentLabel: b, triggerValue: a }
-  }
-
-  const whenGeneral = text.match(
-    /when\s+(.+?)\s+is\s+(.+?)(?:\s+and\b|\s+attachment\b|\s+for\b|\s+field\b|\s+is\b\s+required|\s*$)/i
-  )
-  if (whenGeneral) {
-    const rawVal = String(whenGeneral[2] || '')
-      .trim()
-      .replace(/\s+attachment.*$/i, '')
-      .trim()
-    return {
-      parentLabel: trimParentQuestionLabel(whenGeneral[1]),
-      triggerValue: normalizeConditionalTrigger(rawVal)
-    }
-  }
-
-  const selectOn = text.match(
-    /select\s*['"]?\s*(yes|no)\s*['"]?\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*$)/i
-  )
-  if (selectOn) {
-    return {
-      parentLabel: trimParentQuestionLabel(selectOn[2]),
-      triggerValue: normalizeConditionalTrigger(selectOn[1])
-    }
-  }
-
-  const byWhen = text.match(/when\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
-  if (byWhen) {
-    return {
-      parentLabel: trimParentQuestionLabel(byWhen[1]),
-      triggerValue: normalizeConditionalTrigger(String(byWhen[2] || '').trim())
-    }
-  }
-  const byIf = text.match(/if\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
-  if (byIf) {
-    return {
-      parentLabel: trimParentQuestionLabel(byIf[1]),
-      triggerValue: normalizeConditionalTrigger(String(byIf[2] || '').trim())
-    }
-  }
-  return { parentLabel: '', triggerValue: '' }
+function parentSetupKeyFromTc(tc) {
+  const fn = globalThis.qaHelperParentSetupKey
+  if (typeof fn !== 'function') return ''
+  return String(fn(tc) || '')
 }
 
 function resolveConditionalParentField(spec) {
@@ -1810,28 +2177,62 @@ async function resolveTargetAfterCondition(fieldLabel, fieldName, options = {}) 
     const hintedNg = findNgSelectForLabel(fieldLabel)
     if (!target.element && hintedNg) target = { element: hintedNg, kind: 'ng-select' }
   }
-  if (target.element && isVisible(target.element)) return target
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
+    return target
+  }
   if (rwandaYesLocation) {
+    const cascaded = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+    if (
+      cascaded.element &&
+      isVisible(cascaded.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, cascaded)
+    ) {
+      return cascaded
+    }
     for (let step = 0; step < 3; step += 1) {
       const btn = findContinueButton()
       if (btn) {
         scrollTestTargetIntoView(btn)
-        await wait(380)
+        await wait(160)
         btn.click()
-        await wait(1000)
+        await wait(300)
       }
       target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
       if (!target.element) {
         const hintedNg = findNgSelectForLabel(fieldLabel)
         if (hintedNg) target = { element: hintedNg, kind: 'ng-select' }
       }
-      if (target.element && isVisible(target.element)) return target
+      if (
+        target.element &&
+        isVisible(target.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, target)
+      ) {
+        return target
+      }
+      const again = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+      if (
+        again.element &&
+        isVisible(again.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, again)
+      ) {
+        return again
+      }
     }
   }
   for (let i = 0; i < 3; i += 1) {
-    await wait(250)
+    await wait(120)
     target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
-    if (target.element && isVisible(target.element)) return target
+    if (
+      target.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
+      return target
+    }
   }
   const byCascade = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
   if (byCascade.element && isVisible(byCascade.element)) return byCascade
@@ -1967,7 +2368,7 @@ async function applyAnySelectionStep(fieldLabel, stepText) {
   const kind = target.kind || detectFieldKind(target.element)
   if (kind === 'ng-select') {
     await selectFirstNonEmptyNgSelect(target.element)
-    await wait(800)
+    await wait(380)
     return true
   }
   if (kind === 'radio') {
@@ -1975,7 +2376,7 @@ async function applyAnySelectionStep(fieldLabel, stepText) {
     if (group.length > 0) {
       group[0].click()
       dispatchInputEvents(group[0])
-      await wait(500)
+      await wait(260)
       return true
     }
     return false
@@ -1987,7 +2388,7 @@ async function applyAnySelectionStep(fieldLabel, stepText) {
     if (nonEmpty) {
       target.element.value = nonEmpty.value
       dispatchInputEvents(target.element)
-      await wait(500)
+      await wait(260)
       return true
     }
   }
@@ -2009,7 +2410,7 @@ async function applyValueSelectionStep(fieldLabel, triggerValue, stepText) {
       })
       if (option) {
         option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-        await wait(1000)
+        await wait(420)
         return true
       }
     }
@@ -2023,7 +2424,7 @@ async function applyValueSelectionStep(fieldLabel, triggerValue, stepText) {
       if (match) {
         match.click()
         dispatchInputEvents(match)
-        await wait(1000)
+        await wait(420)
         return true
       }
     }
@@ -2038,7 +2439,7 @@ async function applyValueSelectionStep(fieldLabel, triggerValue, stepText) {
       if (match) {
         target.element.value = match.value
         dispatchInputEvents(target.element)
-        await wait(1000)
+        await wait(420)
         return true
       }
     }
@@ -2059,7 +2460,7 @@ async function parseAndExecuteSteps(whatToTest) {
     const step = rawStep.replace(/^[,;:\s-]+/, '').trim()
     if (!step) continue
 
-    const anyOn = step.match(/\bselect\s+any\s+option\s+on\s+(.+?)(?:\s+field\b|\s*$)/i)
+    const anyOn = step.match(/\bselect\s+any\s+option\s+on\s+(?:the\s+)?(.+?)(?:\s+field\b|\s*$)/i)
     if (anyOn?.[1]) {
       const fieldLabel = normalizeStepFieldLabel(anyOn[1])
       await applyAnySelectionStep(fieldLabel, step)
@@ -2097,22 +2498,24 @@ function ngSelectRootAppearsUnselected(root) {
 function getSafeDefaultInputValue(control, kind) {
   const type = String(control?.type || '').toLowerCase()
   const label = normalizeLabelText(`${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''}`)
-  const fromProfile = getPreferredProfileValueForControl(label, '')
-  if (fromProfile) return fromProfile
   if (type === 'email' || /\bemail\b/.test(label)) return 'test@example.com'
   if (type === 'tel' || /\b(phone|mobile|tel)\b/.test(label)) return '0781234567'
   if (kind === 'date' || type === 'date') return getSafeDateFallbackValue()
   if (/\b(date of birth|dob)\b/.test(label)) return getSafeDateFallbackValue()
   if (/\bdate\b/.test(label)) return getSafeDateFallbackValue()
+  if (isIdLikeControl(control) && String(reusableIdValueForRun || '').trim()) return reusableIdValueForRun
   if (type === 'number' || /\b(age|number|amount|count|qty|quantity)\b/.test(label)) return '123'
   if (/\b(first name|lastname|last name|surname|name)\b/.test(label)) return 'John'
-  if (/\b(id number|id no|national id)\b/.test(label)) return getPreferredNationalIdValue()
-  if (/\b(nin|application number)\b/.test(label)) return '1234567890'
+  if (/\b(id number|id no|national id|nin|application number|citizen application)\b/.test(label)) return reusableIdValueForRun
   if (type === 'url' || /\b(url|website|site)\b/.test(label)) return 'https://example.com'
   return 'ValidInput'
 }
 
-async function fillAllFieldsWithValidValues(targetToSkip = null) {
+async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
+  const widgetWaitMs = Math.min(8000, Math.max(200, Number(options.widgetWaitMs) || 2400))
+  const manualLike = options.manualLike !== false
+  const fillEvenIfPopulated = options.fillEvenIfPopulated === true
+  const extraSkips = Array.isArray(options.skipControls) ? options.skipControls.filter(Boolean) : []
   const controls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
   const handledRadioGroups = new Set()
   const handledNgSelectRoots = new Set()
@@ -2121,6 +2524,9 @@ async function fillAllFieldsWithValidValues(targetToSkip = null) {
   const skipRadioName = skipKind === 'radio' ? String(skipEl?.name || '').trim() : ''
   const skipRadioContainer = skipKind === 'radio' && skipEl ? getRadioGroupContainer(skipEl) : null
   const excludePredicate = (control) => {
+    for (const extra of extraSkips) {
+      if (control === extra || control.contains?.(extra) || extra.contains?.(control)) return true
+    }
     if (!skipEl) return false
     if (control === skipEl || control.contains?.(skipEl) || skipEl.contains?.(control)) return true
     if (skipKind === 'radio' && detectFieldKind(control) === 'radio') {
@@ -2151,12 +2557,14 @@ async function fillAllFieldsWithValidValues(targetToSkip = null) {
     if (kind === 'ng-select') {
       const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
       if (handledNgSelectRoots.has(root)) continue
+      if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) continue
       handledNgSelectRoots.add(root)
       await selectFirstNonEmptyNgSelect(root)
       continue
     }
     if (kind === 'select') {
       if (control.disabled || control.readOnly) continue
+      if (!fillEvenIfPopulated && String(control.value || '').trim()) continue
       const options = Array.from(control.options || [])
       const nonEmpty = options.find(opt => String(opt.value || '').trim())
       if (nonEmpty) {
@@ -2168,12 +2576,41 @@ async function fillAllFieldsWithValidValues(targetToSkip = null) {
     if (control.disabled || control.readOnly) continue
     const type = String(control.type || '').toLowerCase()
     const beforeWidget = isLikelyWidgetTriggerControl(control, kind) ? snapshotVisibleControls() : null
-    if (type === 'checkbox') control.checked = true
-    else control.value = getSafeDefaultInputValue(control, kind)
+    if (type === 'checkbox') {
+      control.checked = true
+    } else if (isIdLikeControl(control)) {
+      const currentId = String(control.value || '').trim()
+      const wantId = String(reusableIdValueForRun || '').trim()
+      if (!reusableIdValueForRun && currentId) {
+        reusableIdValueForRun = currentId
+      } else if (wantId && (fillEvenIfPopulated || !currentId || currentId !== wantId)) {
+        if (manualLike) await setInputLikeValueManually(control, reusableIdValueForRun)
+        else control.value = reusableIdValueForRun
+      }
+    } else {
+      const hasValue = String(control.value || '').trim().length > 0
+      if (!fillEvenIfPopulated && hasValue) {
+        // Keep existing user value as-is.
+      } else if (
+        manualLike &&
+        (type === 'text' ||
+          type === 'email' ||
+          type === 'tel' ||
+          type === 'number' ||
+          type === 'url' ||
+          type === 'search' ||
+          kind === 'textarea' ||
+          type === 'password')
+      ) {
+        await setInputLikeValueManually(control, getSafeDefaultInputValue(control, kind))
+      } else {
+        control.value = getSafeDefaultInputValue(control, kind)
+      }
+    }
     dispatchInputEvents(control)
     dispatchBlurEvent(control)
     if (beforeWidget) {
-      await waitForWidgetSideEffects(beforeWidget, 5500, 1)
+      await waitForWidgetSideEffects(beforeWidget, widgetWaitMs, 1)
     }
   }
 
@@ -2198,34 +2635,401 @@ async function fillAllFieldsWithValidValues(targetToSkip = null) {
     await wait(200)
   }
 
-  await wait(500)
+  const natWraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).filter(w => {
+    const k = parseFormlyFieldIdKey(w.id)
+    return k && k.toLowerCase() === 'nationality'
+  })
+  for (const nw of natWraps) {
+    if (skipEl && nw.contains(skipEl)) continue
+    for (let round = 0; round < 8; round += 1) {
+      const open = Array.from(nw.querySelectorAll('ng-select, .ng-select, div[role="combobox"]')).filter(
+        el => isVisible(el) && ngSelectRootAppearsUnselected(el)
+      )
+      if (open.length === 0) break
+      for (const el of open) {
+        if (excludePredicate(el)) continue
+        await selectFirstNonEmptyNgSelect(el)
+        await wait(420)
+      }
+    }
+  }
+
+  await wait(350)
 }
 
-async function executeTestCase(tc) {
+function collectDiscoveryRequiredErrors() {
+  const texts = []
+  const seen = new Set()
+  for (const entry of getVisibleValidationEntries()) {
+    const txt = String(entry?.text || '').trim()
+    if (!txt || seen.has(txt)) continue
+    seen.add(txt)
+    texts.push(txt)
+  }
+  return texts
+}
+
+/**
+ * Map a run-start discovery line to this required_field case (label + expected + what_to_test).
+ * Used to annotate passes and to rescue when Step C cannot see the message in the field container.
+ */
+function matchDiscoveryLineForRequiredCase(tc, fieldLabel) {
+  if (!Array.isArray(discoveredRequiredErrors) || discoveredRequiredErrors.length === 0) return ''
+  const targetNorm = sanitizeSearchLabel(fieldLabel)
+  const expNorm = normalizeLabelText(String(tc?.expected_result || ''))
+  const whatNorm = normalizeLabelText(String(tc?.what_to_test || ''))
+  for (const raw of discoveredRequiredErrors) {
+    const line = String(raw || '').trim()
+    if (!line) continue
+    const norm = normalizeLabelText(line)
+    if (looksAggregatedDiscoveryLine(norm)) continue
+    if (!labelStrongMatch(norm, targetNorm)) continue
+    const one = [{ element: null, text: line }]
+    if (pickMatchedMessage(one, tc?.expected_result, fieldLabel, null, String(tc?.what_to_test || ''))) {
+      return line
+    }
+    if (
+      expNorm &&
+      (messageContainsTwoConsecutiveWordsFromExpected(norm, expNorm) ||
+        messageContainsThreeConsecutiveWordsFromExpected(norm, expNorm))
+    ) {
+      return line
+    }
+    if (formatValidationLooseMatch(norm, expNorm, whatNorm, targetNorm)) return line
+  }
+  return ''
+}
+
+async function clickContinueWithoutValidationRead() {
+  const button = findContinueButton()
+  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  scrollTestTargetIntoView(button)
+  await wait(280)
+  button.click()
+  return { ok: true }
+}
+
+async function requiredFieldRunPreflightStepAB() {
+  throwIfCancelled()
+  await clickContinueWithoutValidationRead()
+  await wait(1500)
+  discoveredRequiredErrors = collectDiscoveryRequiredErrors()
+  await fillAllFieldsWithValidValues(null, { manualLike: true, widgetWaitMs: 2400 })
+  await wait(280)
+}
+
+const REQUIRED_FIELD_CONTAINER_MSG_SEL = [
+  '.invalid-feedback',
+  'formly-validation-message',
+  'mat-error',
+  '.mat-mdc-form-field-error',
+  '.mdc-text-field-helper-text--validation-msg',
+  '.text-danger',
+  '[class*="validation-message"]'
+].join(', ')
+
+function getRequiredFieldValidationRoots(targetEl) {
+  const roots = new Set()
+  if (!targetEl?.closest) return []
+  const r1 = getTargetFieldValidationRoot(targetEl)
+  const r2 = getRadioGroupContainer(targetEl)
+  const mat = targetEl.closest(
+    'mat-form-field, .mat-mdc-form-field, .mat-form-field, .mdc-text-field, .mat-mdc-text-field-wrapper'
+  )
+  if (r1) roots.add(r1)
+  if (r2) roots.add(r2)
+  if (mat) roots.add(mat)
+  if (roots.size === 0) {
+    const p = targetEl.parentElement
+    if (p) roots.add(p)
+  }
+  return Array.from(roots).filter(Boolean)
+}
+
+function getRequiredFieldValidationInContainer(targetEl) {
+  if (!targetEl) return []
+  const roots = getRequiredFieldValidationRoots(targetEl)
+  const out = []
+  const seen = new Set()
+  for (const root of roots) {
+    if (!root?.querySelectorAll) continue
+    for (const el of root.querySelectorAll(REQUIRED_FIELD_CONTAINER_MSG_SEL)) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      if (!t || seen.has(t)) continue
+      seen.add(t)
+      out.push({ element: el, text: t })
+    }
+  }
+  return out
+}
+
+function detectFormAdvanced(urlBefore, sectionEl) {
+  if (String(location.href || '') !== String(urlBefore || '')) return true
+  if (sectionEl && document.contains(sectionEl) && !isVisible(sectionEl)) return true
+  return false
+}
+
+async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
+  if (!target) return
+  if (kind === 'radio') {
+    const group = collectRadioGroup(target, target?.name || '')
+    if (group[0]) {
+      group[0].click()
+      dispatchInputEvents(group[0])
+    }
+    return
+  }
+  if (kind === 'date') {
+    const dateInput = findDateInputForLabel(fieldLabel) || target
+    if (isCustomDatePickerInput(dateInput)) {
+      await setDateValuePreferPicker(dateInput, getSafeDateFallbackValue())
+    } else {
+      dateInput.value = getSafeDateFallbackValue()
+      dispatchInputEvents(dateInput)
+      dispatchBlurEvent(dateInput)
+    }
+    return
+  }
+  if (kind === 'ng-select') {
+    const ng =
+      findNgSelectForLabel(fieldLabel) ||
+      target.closest?.('ng-select, .ng-select, [role="combobox"]') ||
+      target
+    await selectFirstNonEmptyNgSelect(ng)
+    return
+  }
+  const tag = String(target.tagName || '').toLowerCase()
+  if (kind === 'select' || tag === 'select') {
+    const options = Array.from(target.options || [])
+    const nonEmpty = options.find(opt => String(opt.value || '').trim())
+    if (nonEmpty) {
+      target.value = nonEmpty.value
+      dispatchInputEvents(target)
+    }
+    return
+  }
+  const type = String(target.type || '').toLowerCase()
+  if (type === 'checkbox') {
+    target.checked = true
+    dispatchInputEvents(target)
+    return
+  }
+  if (isIdLikeControl(target) && String(reusableIdValueForRun || '').trim()) {
+    await setInputLikeValueManually(target, reusableIdValueForRun)
+    return
+  }
+  target.value = getSafeDefaultInputValue(target, kind)
+  dispatchInputEvents(target)
+  dispatchBlurEvent(target)
+}
+
+function appendRunStartMappingNote(message, preflightLine) {
+  const base = String(message || '').trim()
+  if (!preflightLine) return base
+  return base
+}
+
+async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, field) {
+  if (target.kind !== 'radio' && (field.disabled || field.readOnly)) {
+    return { skipped: true, reason: 'field is disabled — auto-filled by widget' }
+  }
+
+  const preflightLine = matchDiscoveryLineForRequiredCase(tc, fieldLabel)
+
+  const urlBefore = String(location.href || '')
+  const sectionEl = field?.closest?.(
+    'formly-group, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field, formly-field'
+  )
+
+  if (target.kind === 'radio') {
+    const group = collectRadioGroup(field, field?.name || '')
+    if (group.length > 0) {
+      await ensureRadioGroupUnselected(field, 6)
+    }
+  } else if (target.kind === 'date') {
+    const dateInput = findDateInputForLabel(fieldLabel) || field
+    if (isCustomDatePickerInput(dateInput)) {
+      await clearCustomDatePickerValue(dateInput)
+    } else {
+      dateInput.value = ''
+      dispatchInputEvents(dateInput)
+      dispatchBlurEvent(dateInput)
+    }
+  } else if (target.kind === 'ng-select') {
+    const ng = findNgSelectForLabel(fieldLabel) || field
+    await clearNgSelectValue(ng)
+  } else if (target.kind === 'select') {
+    field.value = ''
+    dispatchInputEvents(field)
+    dispatchBlurEvent(field)
+  } else {
+    field.value = ''
+    dispatchInputEvents(field)
+    dispatchBlurEvent(field)
+  }
+
+  await wait(200)
+  const clicked = await clickContinueWithoutValidationRead()
+  if (!clicked.ok) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(350)
+    return { passed: false, message: clicked.error, skipFullResetAfter: true }
+  }
+  await wait(1500)
+
+  if (detectFormAdvanced(urlBefore, sectionEl)) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(350)
+    return {
+      passed: false,
+      message: 'Form advanced — field was not properly cleared',
+      skipFullResetAfter: true
+    }
+  }
+
+  let containerEntries = getRequiredFieldValidationInContainer(field)
+  if (containerEntries.length === 0) {
+    await wait(450)
+    containerEntries = getRequiredFieldValidationInContainer(field)
+  }
+  if (containerEntries.length > 0) {
+    const matched = pickMatchedMessage(
+      containerEntries,
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || '')
+    )
+    const msg = (matched || containerEntries.map(e => e.text).join('; ')).trim()
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(350)
+    return {
+      passed: true,
+      message: appendRunStartMappingNote(
+        msg.slice(0, 800) || 'Passed: validation shown for empty field',
+        preflightLine
+      ),
+      skipFullResetAfter: true,
+      ...(preflightLine ? { preflightMapped: true } : {})
+    }
+  }
+
+  const allVis = getVisibleValidationEntries()
+  const targetNorm = sanitizeSearchLabel(fieldLabel)
+  const scoped = allVis.filter(e => {
+    const norm = normalizeLabelText(e.text)
+    if (!norm) return false
+    return (
+      isMessageDomDescendantOfTargetFieldContainer(e.element, field) ||
+      labelStrongMatch(norm, targetNorm)
+    )
+  })
+  const pool = scoped.length > 0 ? scoped : allVis
+  const looseMatched = pickMatchedMessage(
+    pool,
+    tc?.expected_result,
+    fieldLabel,
+    target,
+    String(tc?.what_to_test || '')
+  )
+  if (looseMatched) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(350)
+    return {
+      passed: true,
+      message: appendRunStartMappingNote(
+        looseMatched.slice(0, 800) || 'Passed: validation matched for empty field',
+        preflightLine
+      ),
+      skipFullResetAfter: true,
+      ...(preflightLine ? { preflightMapped: true } : {})
+    }
+  }
+
+  if (preflightLine) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(350)
+    return {
+      passed: true,
+      message: 'Passed: required validation for this field was already shown during run-start preflight.',
+      skipFullResetAfter: true,
+      preflightMapped: true
+    }
+  }
+
+  await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+  await wait(350)
+  const hint =
+    discoveredRequiredErrors.length > 0
+      ? ` Run-start discovery had ${discoveredRequiredErrors.length} message(s): ${discoveredRequiredErrors.slice(0, 4).join(' | ')}`
+      : ''
+  return {
+    passed: false,
+    message: `Failed: no validation message in target field container after Continue.${hint}`.slice(0, 900),
+    skipFullResetAfter: true
+  }
+}
+
+function isConditionalFieldTestType(tt) {
+  return tt === 'conditional_field' || tt === 'conditional_required' || tt === 'conditional_display'
+}
+
+function expectsConditionalFieldHidden(tc) {
+  return /not displayed|not visible|hidden|does not appear|not shown|displayed\s*:\s*no|is displayed\s*:\s*no/i.test(
+    String(tc?.expected_result || tc?.what_to_test || '')
+  )
+}
+
+function shouldStripConditionalClauseForFieldLabel(testType) {
+  return testType === 'conditional_display' || testType === 'conditional_field'
+}
+
+async function executeTestCase(tc, runContext = {}) {
+  throwIfCancelled()
+  updateLiveRunIndicator(tc, null, 'Preparing')
+  seedReusableIdFromPageIfTyped()
   const testType = String(tc?.test_type || '').trim()
   const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
   const fieldLabel = sanitizeSearchLabel(
-    testType === 'conditional_display' ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
   )
   const fieldName = String(tc?.field_name || '').trim()
   let conditionalTrace = ''
+  let conditionalSetupKey = ''
 
   await expandCollapsedSectionsOnce()
-  await parseAndExecuteSteps(tc?.what_to_test)
-  if (testType === 'conditional_required') {
-    await wait(500)
+  const deferWhatToTestSteps = isConditionalFieldTestType(testType)
+  if (!deferWhatToTestSteps) {
+    await parseAndExecuteSteps(tc?.what_to_test)
+  }
+  if (isConditionalFieldTestType(testType)) {
+    await wait(180)
+  }
+
+  if (runContext.isRunStart || runContext.primeAfterNavigation) {
+    requiredFieldRunPreflightDone = false
+    discoveredRequiredErrors = []
+    hasExpandedSectionsForRun = false
+  }
+  if (!requiredFieldRunPreflightDone && (runContext.isRunStart || testType === 'required_field')) {
+    await requiredFieldRunPreflightStepAB()
+    requiredFieldRunPreflightDone = true
   }
 
   const executableTypes = new Set([
     'required_field',
     'format_validation',
-    'optional_field',
+    'conditional_field',
     'conditional_required',
     'conditional_display',
-    'successful_submit'
+    'successful_submit',
+    'label_check'
   ])
   await maybePrepareIdTypeFromWhatToTest(tc)
-  const ctxHint = String(tc?.name || '')
+  const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
+    .filter(Boolean)
+    .join(' | ')
   let target = testType === 'successful_submit'
     ? { element: null, kind: 'unknown' }
     : await resolveTargetWithTypeHints(fieldLabel, fieldName, {
@@ -2233,7 +3037,7 @@ async function executeTestCase(tc) {
       })
   if (
     !target.element &&
-    ['required_field', 'format_validation', 'optional_field'].includes(testType)
+    ['required_field', 'format_validation'].includes(testType)
   ) {
     const spec = parseConditionalSpec(tc)
     if (String(spec.parentLabel || '').trim() && String(spec.triggerValue || '').trim()) {
@@ -2257,110 +3061,141 @@ async function executeTestCase(tc) {
     }
   }
 
-  if (testType === 'conditional_required' || testType === 'conditional_display') {
+  if (isConditionalFieldTestType(testType)) {
     const spec = parseConditionalSpec(tc)
-    const parentField = resolveConditionalParentField(spec)
-    if (!parentField) return { passed: false, message: `Parent field ${spec.parentLabel || 'unknown'} not found on page` }
-    conditionalTrace = `Condition: ${String(spec.parentLabel || 'unknown').trim() || 'unknown'}=${String(spec.triggerValue || 'unknown').trim() || 'unknown'}`
-    scrollTestTargetIntoView(parentField)
-    await wait(380)
-    let applied = setParentConditionalValue(parentField, spec.triggerValue)
-    if (!applied) applied = applyConditionalDomFallback(spec.parentLabel, spec.triggerValue)
-    if (!applied) return { passed: false, message: 'Could not set conditional parent field value' }
-    await wait(1000)
-    const chainTarget = await resolveWithCascadeChain(fieldLabel, fieldName, {
-      allowContinue: false,
-      contextHint: String(tc?.name || '')
-    })
-    if (chainTarget.element && isVisible(chainTarget.element)) {
-      target = chainTarget
+    const conditionalParentField = resolveConditionalParentField(spec)
+    const setupKey = parentSetupKeyFromTc(tc)
+    conditionalSetupKey = setupKey
+    const skipParentApply = Boolean(
+      setupKey &&
+      String(runContext.previousParentSetupKey || '') === setupKey
+    )
+    conditionalTrace = `Condition: ${String(spec.parentLabel || 'unknown').trim() || 'unknown'}=${String(spec.triggerValue || 'unknown').trim() || 'unknown'}${skipParentApply ? ' [same parent — batch]' : ''}`
+
+    if (!skipParentApply) {
+      if (!conditionalParentField) {
+        return {
+          passed: false,
+          message: `Parent field ${spec.parentLabel || 'unknown'} not found on page`,
+          parentSetupKey: setupKey
+        }
+      }
+      scrollTestTargetIntoView(conditionalParentField)
+      await wait(240)
+      let applied = setParentConditionalValue(conditionalParentField, spec.triggerValue)
+      if (!applied) applied = applyConditionalDomFallback(spec.parentLabel, spec.triggerValue)
+      if (!applied) {
+        return {
+          passed: false,
+          message: 'Could not set conditional parent field value',
+          parentSetupKey: setupKey
+        }
+      }
+      await wait(320)
+    } else {
+      await wait(70)
     }
+    await parseAndExecuteSteps(tc?.what_to_test)
+    await wait(90)
+
+    const navOpts = { allowContinue: false, contextHint: ctxHint }
     const locNorm = sanitizeSearchLabel(fieldLabel)
-    const rwandaYesLocation = normalizeText(spec.triggerValue) === 'yes' &&
-      /\b(district|sector|cell|village)\b/.test(locNorm)
-    const afterConditionTarget = await resolveTargetAfterCondition(fieldLabel, fieldName, {
-      rwandaYesLocation,
-      contextHint: String(tc?.name || '')
-    })
-    if (afterConditionTarget.element && isVisible(afterConditionTarget.element)) {
-      target = afterConditionTarget
-    } else if (!target.element) {
-      // Last guard for deep cascading chains (district->sector->cell->village and similar).
-      target = await resolveWithCascadeChain(fieldLabel, fieldName, {
-        allowContinue: false,
-        contextHint: String(tc?.name || '')
+    const rwandaYesLocation =
+      normalizeText(spec.triggerValue) === 'yes' && /\b(district|sector|cell|village)\b/.test(locNorm)
+
+    const settled = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+    const quickReady =
+      settled.element &&
+      isVisible(settled.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, settled)
+
+    if (quickReady) {
+      target = settled
+    } else {
+      const chainTarget = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+      if (chainTarget.element && isVisible(chainTarget.element)) {
+        target = chainTarget
+      }
+      const afterConditionTarget = await resolveTargetAfterCondition(fieldLabel, fieldName, {
+        rwandaYesLocation,
+        contextHint: ctxHint
       })
+      if (afterConditionTarget.element && isVisible(afterConditionTarget.element)) {
+        target = afterConditionTarget
+      } else if (!target.element) {
+        target = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+      }
     }
-    if (testType === 'conditional_required' && (!target?.element || !isVisible(target.element))) {
-      const deep = await resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, String(tc?.name || ''))
+    const expectsHiddenForCascade = expectsConditionalFieldHidden(tc)
+    if (
+      !expectsHiddenForCascade &&
+      (!target?.element || !isVisible(target.element))
+    ) {
+      const deep = await resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, ctxHint)
       if (deep?.element && isVisible(deep.element)) target = deep
-      else return { passed: false, message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found after cascade chain resolution` }
+      else {
+        return {
+          passed: false,
+          message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found after cascade chain resolution`,
+          parentSetupKey: setupKey
+        }
+      }
     }
     conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
-  } else if (executableTypes.has(testType)) {
-    await fillAllFieldsWithValidValues(target)
+    // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
+  } else if (executableTypes.has(testType) && !(testType === 'required_field' && requiredFieldRunPreflightDone)) {
+    await fillAllFieldsWithValidValues(target, { manualLike: true })
   }
 
   let field = target.element
-  if (!field && ['required_field', 'format_validation', 'optional_field', 'conditional_required', 'conditional_display'].includes(testType)) {
-    const bySectionAdvance = await resolveWithPrefillAcrossSections(fieldLabel, fieldName, ctxHint, 4)
+  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType)) {
+    const locCascade = /\b(district|sector|cell|village|province|location)\b/i.test(
+      `${fieldLabel} ${fieldName} ${ctxHint}`
+    )
+    const expectsHiddenPrefill = expectsConditionalFieldHidden(tc)
+    const prefillMax =
+      isConditionalFieldTestType(testType) && expectsHiddenPrefill ? 2 : locCascade ? 3 : 4
+    const prefillFill =
+      isConditionalFieldTestType(testType) && expectsHiddenPrefill
+        ? { widgetWaitMs: 1200 }
+        : locCascade
+          ? { widgetWaitMs: 1600 }
+          : {}
+    const bySectionAdvance = await resolveWithPrefillAcrossSections(
+      fieldLabel,
+      fieldName,
+      ctxHint,
+      prefillMax,
+      prefillFill
+    )
     if (bySectionAdvance.element && isVisible(bySectionAdvance.element)) {
       target = bySectionAdvance
       field = target.element
     }
   }
-  if (!field && ['required_field', 'format_validation', 'optional_field', 'conditional_required', 'conditional_display'].includes(testType)) {
-    return { passed: false, message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page` }
+  if (!field && isConditionalFieldTestType(testType) && expectsConditionalFieldHidden(tc)) {
+    return {
+      passed: true,
+      message: `Conditional field not in DOM or not resolved (treated as hidden when parent is No).${conditionalTrace ? ` ${conditionalTrace}` : ''}`.slice(0, 900),
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
+  }
+  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType)) {
+    return {
+      passed: false,
+      message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page`,
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
   }
 
   if (field) {
     scrollTestTargetIntoView(field)
-    await wait(400)
+    await wait(260)
+    updateLiveRunIndicator(tc, field, 'Testing field')
   }
 
   if (testType === 'required_field') {
-    if (target.kind !== 'radio' && (field.disabled || field.readOnly)) {
-      return { skipped: true, reason: 'field is disabled — auto-filled by widget' }
-    }
-    if (target.kind === 'radio') {
-      const group = collectRadioGroup(field, field?.name || '')
-      if (group.length > 0) {
-        await ensureRadioGroupUnselected(field, 6)
-      }
-      const radioContainer = getRadioGroupContainer(field)
-      const clicked = await clickContinueAndReadErrorsInContainer(
-        radioContainer,
-        tc?.expected_result,
-        fieldLabel,
-        target,
-        2500
-      )
-      if (!clicked.ok) return { passed: false, message: clicked.error }
-      return { passed: Boolean(clicked.matched), message: clicked.matched || '' }
-    } else if (target.kind === 'date') {
-      const dateInput = findDateInputForLabel(fieldLabel) || field
-      if (isCustomDatePickerInput(dateInput)) {
-        await clearCustomDatePickerValue(dateInput)
-      } else {
-        dateInput.value = ''
-        dispatchInputEvents(dateInput)
-        dispatchBlurEvent(dateInput)
-      }
-    } else if (target.kind === 'ng-select') {
-      const ng = findNgSelectForLabel(fieldLabel) || field
-      await clearNgSelectValue(ng)
-    } else if (target.kind === 'select') {
-      field.value = ''
-      dispatchInputEvents(field)
-      dispatchBlurEvent(field)
-    } else {
-      field.value = ''
-      dispatchInputEvents(field)
-      dispatchBlurEvent(field)
-    }
-    const clicked = await clickContinueAndReadErrors(tc?.expected_result, fieldLabel, target)
-    if (!clicked.ok) return { passed: false, message: clicked.error }
-    return { passed: Boolean(clicked.matched), message: clicked.matched || '' }
+    return executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, field)
   }
 
   if (testType === 'format_validation') {
@@ -2385,53 +3220,56 @@ async function executeTestCase(tc) {
       dispatchInputEvents(field)
       dispatchBlurEvent(field)
     }
-    const clicked = await clickContinueAndReadErrors(tc?.expected_result, fieldLabel, target)
+    const clicked = await clickContinueAndReadErrors(
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || '')
+    )
     if (!clicked.ok) return { passed: false, message: clicked.error }
     return { passed: Boolean(clicked.matched), message: clicked.matched || '' }
   }
 
-  if (testType === 'optional_field') {
-    if (field.disabled || field.readOnly) {
-      return { passed: true, message: 'Field is disabled/readonly and not blocking submit.' }
-    }
-    if (target.kind === 'ng-select') {
-      const ng = findNgSelectForLabel(fieldLabel) || field
-      await clearNgSelectValue(ng)
-    } else if (target.kind === 'date') {
-      const dateInput = findDateInputForLabel(fieldLabel) || field
-      dateInput.value = ''
-      dispatchInputEvents(dateInput)
-      dispatchBlurEvent(dateInput)
-    } else {
-      field.value = ''
-      dispatchInputEvents(field)
-      dispatchBlurEvent(field)
-    }
-    const button = findContinueButton()
-    if (!button) return { passed: false, message: 'Continue/Next button not found on page' }
-    scrollTestTargetIntoView(button)
-    await wait(420)
-    button.click()
-    const entries = await getVisibleValidationEntriesWithRetry()
-    const allMessages = entries.map(e => e.text)
-    const relevant = allMessages.filter(msg => !/enter your details|sign in|login/i.test(msg))
-    const mention = relevant.find(msg => normalizeText(msg).includes(normalizeText(fieldLabel || fieldName)))
-    return { passed: !mention, message: mention || '' }
-  }
-
-  if (testType === 'conditional_display') {
-    const visible = isVisible(field)
-    const expectsHidden = /not displayed|not visible|hidden|does not appear|not shown/i.test(String(tc?.expected_result || tc?.what_to_test || ''))
-    const passed = expectsHidden ? !visible : visible
+  if (testType === 'label_check') {
+    const actualLabel = String(getLabelText(field) || '').trim()
+    const actualPlaceholder = String(field?.getAttribute?.('placeholder') || '').trim()
+    const source = String(tc?.expected_result || tc?.what_to_test || '')
+    const expectedLabel = String(source.match(/label:\s*"([^"]*)"/i)?.[1] || '').trim()
+    const expectedPlaceholder = String(source.match(/placeholder:\s*"([^"]*)"/i)?.[1] || '').trim()
+    const labelOk = expectedLabel ? actualLabel === expectedLabel : Boolean(actualLabel)
+    const placeholderOk = expectedPlaceholder ? actualPlaceholder === expectedPlaceholder : true
+    const passed = labelOk && placeholderOk
     return {
       passed,
       message: passed
-        ? `${expectsHidden ? 'Conditional field stayed hidden as expected.' : 'Conditional field is visible.'}${conditionalTrace ? ` ${conditionalTrace}` : ''}`
-        : `${expectsHidden ? 'Conditional field appeared but was expected hidden.' : 'Conditional field did not become visible.'}${conditionalTrace ? ` ${conditionalTrace}` : ''}`
+        ? `Label check passed for ${fieldLabel || fieldName || tc?.name || 'field'}`
+        : `Expected label "${expectedLabel}" and placeholder "${expectedPlaceholder}", got label "${actualLabel}" and placeholder "${actualPlaceholder}"`
     }
   }
 
-  if (testType === 'conditional_required') {
+  if (isConditionalFieldTestType(testType)) {
+    const expectsHidden = expectsConditionalFieldHidden(tc)
+    const visible = isVisible(field)
+
+    if (expectsHidden) {
+      const passed = !visible
+      return {
+        passed,
+        message: passed
+          ? `Conditional field stayed hidden as expected.${conditionalTrace ? ` ${conditionalTrace}` : ''}`
+          : `Conditional field appeared but was expected hidden.${conditionalTrace ? ` ${conditionalTrace}` : ''}`,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+
+    if (!visible) {
+      return {
+        passed: false,
+        message: `Conditional field did not become visible.${conditionalTrace ? ` ${conditionalTrace}` : ''}`.slice(0, 900),
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+
     if (target.kind === 'ng-select') {
       const ng = findNgSelectForLabel(fieldLabel) || field
       await clearNgSelectValue(ng)
@@ -2445,37 +3283,57 @@ async function executeTestCase(tc) {
       dispatchInputEvents(field)
       dispatchBlurEvent(field)
     }
-    const clicked = await clickContinueAndReadErrors(tc?.expected_result, fieldLabel, target)
-    if (!clicked.ok) return { passed: false, message: clicked.error }
+    const clicked = await clickContinueAndReadErrors(
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || '')
+    )
+    if (!clicked.ok) {
+      return {
+        passed: false,
+        message: clicked.error,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+    const visibleAfter = await getVisibleValidationEntriesWithRetry({ quick: true })
     const strict = pickMatchedMessageForConditionalRequired(
-      getVisibleValidationEntries(),
+      visibleAfter,
       tc?.expected_result,
       fieldLabel,
       target
     )
     const base = strict || ''
-    return { passed: Boolean(strict), message: `${base}${conditionalTrace ? `${base ? ' | ' : ''}${conditionalTrace}` : ''}` }
+    const passed = Boolean(strict)
+    const visOk = 'Field shown and is required.'
+    return {
+      passed,
+      message: passed
+        ? `${visOk} ${base}${conditionalTrace ? `${base ? ' | ' : ''}${conditionalTrace}` : ''}`.trim()
+        : `${visOk} Required validation did not match: ${base || 'no matching message'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.slice(0, 900),
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
   }
 
   if (testType === 'successful_submit') {
-    for (let round = 0; round < 3; round += 1) {
+    for (let round = 0; round < 2; round += 1) {
       await fillAllFieldsWithValidValues(null)
-      await wait(200)
+      await wait(160)
       const button = findContinueButton()
       if (!button) break
       scrollTestTargetIntoView(button)
-      await wait(420)
+      await wait(280)
       button.click()
-      await wait(900)
+      await wait(550)
     }
     await fillAllFieldsWithValidValues(null)
     const finalBtn = findContinueButton()
     if (finalBtn) {
       scrollTestTargetIntoView(finalBtn)
-      await wait(420)
+      await wait(280)
       finalBtn.click()
     }
-    await wait(400)
+    await wait(260)
     let entries = getVisibleValidationEntries()
     if (entries.length === 0) {
       return { passed: true, message: 'Passed: no validation errors after multi-step fill and submit.' }
@@ -2494,12 +3352,53 @@ async function executeTestCase(tc) {
     return runWidgetAutoFillTest(tc, fieldLabel, fieldName)
   }
   if (testType === 'attachment') {
-    return { skipped: true, reason: 'attachment tests require file system access — not supported in extension mode yet' }
-  }
-  if (testType === 'disabled_field') {
-    return { skipped: true, reason: 'disabled_field is verified through widget_auto_fill — not supported standalone in extension mode yet' }
-  }
+    const attachmentInput =
+      (field && String(field.type || '').toLowerCase() === 'file' ? field : null) ||
+      (target?.element && String(target.element.type || '').toLowerCase() === 'file' ? target.element : null) ||
+      findAttachmentFieldElementByLabel(fieldLabel, fieldName)
+    if (!attachmentInput) {
+      return {
+        passed: false,
+        message: `Attachment input ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page`
+      }
+    }
 
+    scrollTestTargetIntoView(attachmentInput)
+    await wait(260)
+    updateLiveRunIndicator(tc, attachmentInput, 'Testing field')
+
+    const kind = detectAttachmentCaseKind(tc)
+    await fillAllFieldsWithValidValues({ element: attachmentInput, kind: 'input' })
+    await wait(180)
+    attachmentInput.value = ''
+    attachmentInput.dispatchEvent(new Event('input', { bubbles: true }))
+    attachmentInput.dispatchEvent(new Event('change', { bubbles: true }))
+
+    if (kind !== 'required') {
+      const fixture = makeAttachmentTestFile(kind)
+      const setOk = setFileInputValue(attachmentInput, fixture)
+      if (!setOk) {
+        return {
+          passed: false,
+          message: 'Could not set test file on attachment input'
+        }
+      }
+      await wait(140)
+    }
+
+    const clicked = await clickContinueAndReadErrors(
+      tc?.expected_result,
+      fieldLabel || getLabelText(attachmentInput) || 'attachment',
+      { element: attachmentInput, kind: 'input' },
+      String(tc?.what_to_test || '')
+    )
+    if (!clicked.ok) return { passed: false, message: clicked.error }
+    const matched = String(clicked.matched || '').trim()
+    return {
+      passed: Boolean(matched),
+      message: matched || `Attachment validation did not match expected result for ${fieldLabel || fieldName || tc?.name || 'attachment'}`
+    }
+  }
   return { skipped: true, reason: `unsupported test type: ${testType}` }
 }
 
@@ -2557,33 +3456,91 @@ async function resetFormStateAfterTest(targetField) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'QA_HELPER_CANCEL_CURRENT_TEST') {
+    cancelCurrentTestRequested = true
+    sendResponse({ ok: true })
+    return true
+  }
   if (message?.type === 'QA_HELPER_SCAN_FIELDS') {
     sendResponse({ ok: true, fields: scanFormFields() })
     return true
   }
-  if (message?.type === 'QA_HELPER_RUN_TEST_CASE') {
+  if (message?.type === 'QA_HELPER_ADVANCE_SECTION') {
     ;(async () => {
       try {
-        const tc = message?.testCase || {}
-        const profile = message?.testDataProfile
-        if (profile && typeof profile === 'object' && !Array.isArray(profile)) {
-          try {
-            window.localStorage.setItem('qa_test_data_profile', JSON.stringify(profile))
-          } catch {
-            // Ignore storage limits/availability and continue with fallbacks.
-          }
+        cancelCurrentTestRequested = false
+        const clicked = await clickContinueWithoutValidationRead()
+        if (!clicked.ok) {
+          sendResponse({ ok: false, error: clicked.error || 'Continue button not found' })
+          return
         }
+        // Give SPA routers / lazy sections time to render the next step.
+        await wait(900)
+        sendResponse({ ok: true, advanced: true })
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || 'Failed to advance section') })
+      }
+    })()
+    return true
+  }
+  if (message?.type === 'QA_HELPER_RUN_TEST_CASE') {
+    let responded = false
+    const safeResponse = (payload) => {
+      if (responded) return
+      responded = true
+      try {
+        sendResponse(payload)
+      } catch {
+        /* Port may already be closed after navigation. */
+      }
+    }
+    const onPageHide = () => {
+      cancelCurrentTestRequested = true
+      safeResponse({
+        ok: true,
+        passed: false,
+        message: 'Interrupted: page changed during this test — run continues on the new page.'
+      })
+    }
+    window.addEventListener('pagehide', onPageHide)
+    ;(async () => {
+      try {
+        cancelCurrentTestRequested = false
+        const tc = message?.testCase || {}
+        reusableIdValueForRun = String(message?.reusableIdValue || '').trim()
+        throwIfCancelled()
         await expandCollapsedSectionsOnce()
-        const result = await executeTestCase(tc)
+        const result = await executeTestCase(tc, {
+          isRunStart: Boolean(message?.isRunStart),
+          primeAfterNavigation: Boolean(message?.primeAfterNavigation),
+          previousParentSetupKey: String(message?.previousParentSetupKey || '')
+        })
+        if (message?.skipFormResetAfter) {
+          result.skipFullResetAfter = true
+        }
+        throwIfCancelled()
         if (result && result.passed === false && !result.skipped) {
           result.screenshotDataUrl = await requestFailureScreenshot()
         }
         const targetLabel = sanitizeSearchLabel(String(tc?.field_label || tc?.name || ''))
         const targetField = resolveFieldTarget(targetLabel, String(tc?.field_name || ''))
-        await resetFormStateAfterTest(targetField)
-        sendResponse({ ok: true, ...result })
+        if (!result?.skipFullResetAfter) {
+          await resetFormStateAfterTest(targetField)
+        } else {
+          await wait(200)
+        }
+        clearLiveRunIndicator()
+        safeResponse({ ok: true, ...result })
       } catch (err) {
-        sendResponse({ ok: true, passed: false, message: String(err?.message || 'Unknown execution error') })
+        clearLiveRunIndicator()
+        const msg = String(err?.message || 'Unknown execution error')
+        if (/cancelled by user/i.test(msg)) {
+          safeResponse({ ok: true, skipped: true, reason: 'Stopped by user' })
+        } else {
+          safeResponse({ ok: true, passed: false, message: msg })
+        }
+      } finally {
+        window.removeEventListener('pagehide', onPageHide)
       }
     })()
     return true

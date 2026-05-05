@@ -47,21 +47,17 @@
             — This test is strict: if label or placeholder differs from the expected strings by even one character it fails.
             — If the SRD provides example valid values or test data for a field include them in what_to_test as: "Use test value: [value]"
 
-            For conditional_required:
-            — what_to_test must describe setting the parent field to the triggering value first then leaving the conditional field empty
-            — Use this exact sentence pattern: "Select [triggerValue] on [parentFieldLabel] field, then leave [targetFieldLabel] field empty"
-            — expected_result must contain the exact error message
-
-            For conditional_display:
-            — Only generate for fields that the SRD explicitly states have a display rule controlled by another field
-            — The parent field must be the field that controls the display not the target field itself
-            — Never generate a conditional_display test where the parent field and target field are from the same cascading group
-            — Use this exact pattern: "Select [triggerValue] on [parentField] field and check if [targetField] field is displayed"
+            For conditional_field (visibility + required when shown — one test_type):
+            — After the parent condition (and any cascade steps), automation checks that the target is shown or hidden as the SRD states; when it must be visible, the same test leaves it empty and expects the exact required validation message in expected_result.
+            — The parent in what_to_test must be the controller, not the target. Never use parent and target from the same cascading group as each other in one case.
+            — expected_result format is mandatory:
+              • If field should show and be required: Displayed: Yes; Required: Yes; Validation: "<exact SRD error message>"
+              • If field should stay hidden: Displayed: No; Required: N/A (hidden by condition)
+            — When the field must be visible and required, use: "Select [triggerValue] on [parentFieldLabel] field, then leave [targetFieldLabel] field empty" (extend with cascade levels when needed).
 
             For fields in a cascading dropdown chain (each level appears only after selecting a parent level):
             — Always describe the full chain of prerequisite selections in what_to_test.
-            — Use this pattern for display checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then check if [targetField] field is displayed"
-            — Use this pattern for required checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then leave [targetField] field empty"
+            — Example with cascade and required: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then leave [targetField] field empty"
             — Identify cascading fields from SRD parent-child display dependencies and wording like selecting one level within a previously selected parent level.
 
             For widget_auto_fill:
@@ -85,7 +81,7 @@
             — Do not generate optional_field test cases.
             — Never generate a widget_auto_fill test for a plain input field unless the SRD explicitly describes widget/auto-fill behavior for it.
             — Never generate an attachment test for any field that is not a file upload/attachment field in the SRD.
-            — Never generate a disabled_field test as conditional_required. Disabled fields may only use widget_auto_fill or disabled_field types.
+            — Never generate a disabled_field test as conditional_field. Disabled fields may only use widget_auto_fill or disabled_field types.
 
             STEP 1 — BEFORE generating any test cases, carefully read the entire SRD and identify:
             — Which fields use widgets — these are fields where the Type column says Widget or has multiple types listed
@@ -115,17 +111,15 @@
 
             2. FORMAT VALIDATION TESTS — if the field has a format rule such as minimum digits, maximum digits, email format, phone format, age restriction, or date range, generate a SEPARATE test case for each individual format rule
 
-            3. CONDITIONAL REQUIRED TESTS — if a field is only required when another field has a specific value, generate a test that first sets that condition and then leaves the conditional field empty. Always describe in what_to_test which field needs to be set first and to what value
+            3. CONDITIONAL FIELD TESTS — if a field only appears or only becomes required when another field has a specific value, generate one conditional_field test per SRD rule: set the parent (and cascade steps), assert visibility per the SRD, and when the field must be visible leave it empty and expect the exact validation message. Always describe in what_to_test which field is set first and to what value.
 
-            4. CONDITIONAL DISPLAY TESTS — if a field only appears when another field has a specific value, always describe in what_to_test that the condition must be set first before interacting with that field
+            4. WIDGET AUTO-FILL TESTS — if the SRD describes that entering a value in one field automatically populates other fields, generate a test that enters a valid value in the trigger field and checks that all the described fields get automatically filled
 
-            5. WIDGET AUTO-FILL TESTS — if the SRD describes that entering a value in one field automatically populates other fields, generate a test that enters a valid value in the trigger field and checks that all the described fields get automatically filled
+            5. ATTACHMENT TESTS — for every file upload or attachment field in the form, generate three separate test cases: one for when the attachment is required and left empty, one for uploading a file with a wrong format, and one for uploading a file that exceeds the maximum allowed size
 
-            6. ATTACHMENT TESTS — for every file upload or attachment field in the form, generate three separate test cases: one for when the attachment is required and left empty, one for uploading a file with a wrong format, and one for uploading a file that exceeds the maximum allowed size
+            6. DISABLED FIELD TESTS — if a field is described as disabled or read-only and gets its value from another field, generate a test confirming it is auto-filled correctly when the source field is filled
 
-            7. DISABLED FIELD TESTS — if a field is described as disabled or read-only and gets its value from another field, generate a test confirming it is auto-filled correctly when the source field is filled
-
-            8. LABEL_CHECK TESTS — generate a separate label_check for every form field (except submit/button/hidden): visible label and placeholder (empty placeholder allowed). Do not fold that work into a required_field test, and do not use the same naming pattern as required_field cases.
+            7. LABEL_CHECK TESTS — generate a separate label_check for every form field (except submit/button/hidden): visible label and placeholder (empty placeholder allowed). Do not fold that work into a required_field test, and do not use the same naming pattern as required_field cases.
 
             Important rules:
             - Read every single validation rule, display rule, conditional rule, and widget behavior described in the SRD

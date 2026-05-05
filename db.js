@@ -196,7 +196,6 @@ async function initTurso(url, authToken) {
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_url TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_username TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
-  await tryExecTurso(`ALTER TABLE projects ADD COLUMN test_data_profile TEXT`)
   await tryExecTurso(
     `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
   )
@@ -293,12 +292,6 @@ async function initSqlite() {
   }
 
   try {
-    _sqlite.exec(`ALTER TABLE projects ADD COLUMN test_data_profile TEXT`)
-  } catch {
-    // Column already exists.
-  }
-
-  try {
     _sqlite.exec(
       `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
     )
@@ -334,6 +327,11 @@ async function initSqlite() {
   console.log('[qa-helper] Database ready at', dbPath)
 }
 
+function isLikelyTursoNetworkFailure(err) {
+  const msg = String(err?.message || err?.cause?.message || err || '')
+  return /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|fetch failed|getaddrinfo|ENOTFOUND/i.test(msg)
+}
+
 export const dbReady = (async () => {
   const { url, authToken } = libsqlEnv()
   if (url) {
@@ -343,8 +341,24 @@ export const dbReady = (async () => {
       )
       throw new Error('LIBSQL_AUTH_TOKEN (or TURSO_AUTH_TOKEN) is required when using a LibSQL URL')
     }
-    await initTurso(url, authToken)
-    return
+    try {
+      await initTurso(url, authToken)
+      return
+    } catch (err) {
+      if (process.env.NODE_ENV === 'production') {
+        console.error('[qa-helper] Turso connection failed in production — fix LIBSQL_URL / token or network.', err)
+        throw err
+      }
+      if (!isLikelyTursoNetworkFailure(err)) throw err
+      console.warn(
+        '[qa-helper] Turso host unreachable (e.g. ENOTFOUND). Using local SQLite instead. ' +
+          'Update or remove LIBSQL_URL / TURSO_DATABASE_URL in .env, or create a new DB at https://turso.tech.',
+        String(err?.message || err).slice(0, 280)
+      )
+      _turso = null
+      await initSqlite()
+      return
+    }
   }
   await initSqlite()
 })()

@@ -3,6 +3,7 @@ let API_BASE = CONFIG.API_URL
 let APP_BASE = CONFIG.API_URL
 const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com', CONFIG.LOCAL_URL, CONFIG.PRODUCTION_URL]
 const ACTIVE_JOB_KEY = 'qa_ext_active_job'
+const REUSABLE_ID_KEY = 'qa_ext_reusable_id_value'
 let lastEventSeq = 0
 
 function deriveAppBase(apiBase) {
@@ -17,12 +18,125 @@ const els = {
   password: document.getElementById('password'),
   loginBtn: document.getElementById('loginBtn'),
   runBtn: document.getElementById('runTest'),
+  stopBtn: document.getElementById('stopTest'),
   projectSelect: document.getElementById('projectSelect'),
+  reusableIdValue: document.getElementById('reusableIdValue'),
   status: document.getElementById('status'),
   statusWrap: document.getElementById('statusWrap'),
   results: document.getElementById('results'),
   viewBtn: document.getElementById('viewResultsBtn'),
   openAppBtn: document.getElementById('openAppBtn')
+}
+
+function setRunControls(running) {
+  if (els.runBtn) {
+    els.runBtn.style.display = 'block'
+    els.runBtn.disabled = Boolean(running)
+  }
+  if (els.stopBtn) {
+    els.stopBtn.style.display = 'block'
+    els.stopBtn.disabled = !running
+  }
+}
+
+async function syncRunControlsWithBackgroundState() {
+  try {
+    const statusResp = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'QA_HELPER_GET_EXTENSION_RUN_STATE' }, (resp) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+        resolve(resp || {})
+      })
+    })
+    const st = statusResp?.state || {}
+    const isRunning = st.status === 'running'
+    setRunControls(isRunning)
+    if (isRunning) {
+      const msg = String(st.message || '').trim() || 'Test run is still active...'
+      setStatus(msg, true)
+      const total = Number(st.total || 0)
+      const current = Number(st.current || 0)
+      renderProgress(Math.min(current, total), Math.max(total, 1), msg)
+    }
+  } catch {
+    // Ignore state sync failures and keep default controls.
+  }
+}
+
+async function resumeBackgroundRunIfAny() {
+  try {
+    const statusResp = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'QA_HELPER_GET_EXTENSION_RUN_STATE' }, (resp) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+        resolve(resp || {})
+      })
+    })
+    const st = statusResp?.state || {}
+    if (st.status !== 'running') return
+
+    setRunControls(true)
+    const projectId = Number(st.projectId || Number(els.projectSelect?.value || 0))
+    const pollStarted = Date.now()
+    const pollTimeoutMs = 45 * 60 * 1000
+
+    while (Date.now() - pollStarted < pollTimeoutMs) {
+      const next = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({ type: 'QA_HELPER_GET_EXTENSION_RUN_STATE' }, (resp) => {
+          if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+          resolve(resp || {})
+        })
+      })
+      const rs = next?.state || {}
+      const total = Number(rs.total || 0)
+      const current = Number(rs.current || 0)
+      const msg = String(rs.message || 'Running tests...')
+      setStatus(msg, rs.status === 'running')
+      renderProgress(Math.min(current, total), Math.max(total, 1), msg)
+
+      if (rs.status === 'done') {
+        const summary = String(rs.summary || 'Done')
+        setStatus(summary, false)
+        els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        if (rs.runId && projectId) {
+          els.viewBtn.style.display = 'block'
+          els.viewBtn.onclick = () => {
+            chrome.tabs.create({ url: `${APP_BASE}/?project=${projectId}&run=${rs.runId}` })
+          }
+        }
+        setRunControls(false)
+        return
+      }
+      if (rs.status === 'stopped') {
+        const summary = String(rs.summary || rs.message || 'Stopped')
+        setStatus(summary, false)
+        els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        setRunControls(false)
+        return
+      }
+      if (rs.status === 'error') {
+        throw new Error(String(rs.message || 'Background run failed'))
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 260))
+    }
+  } catch (err) {
+    setStatus(err.message || 'Failed to resume running test', false)
+    setRunControls(false)
+  }
+}
+
+async function stopExtensionTests() {
+  try {
+    const stopped = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'QA_HELPER_STOP_EXTENSION_RUN' }, (resp) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
+        resolve(resp || {})
+      })
+    })
+    if (!stopped?.ok) throw new Error(stopped?.error || 'Failed to stop test run')
+    setStatus('Stopping test run after current step...', true)
+  } catch (err) {
+    setStatus(err.message || 'Failed to stop test run', false)
+  }
 }
 
 function getStoredToken() {
@@ -51,6 +165,16 @@ function getActiveJob() {
   } catch {
     return null
   }
+}
+
+function getReusableIdValue() {
+  return String(localStorage.getItem(REUSABLE_ID_KEY) || '').trim()
+}
+
+function setReusableIdValue(value) {
+  const v = String(value || '').trim()
+  if (v) localStorage.setItem(REUSABLE_ID_KEY, v)
+  else localStorage.removeItem(REUSABLE_ID_KEY)
 }
 
 function authHeaders() {
@@ -145,7 +269,7 @@ function renderProgress(current, total, label = '') {
     </div>`
 }
 
-function _sendTabMessageWithTimeout(tabId, payload, timeoutMs = 45000) {
+function _sendTabMessageWithTimeout(tabId, payload, timeoutMs = 3 * 60 * 1000) {
   return new Promise((resolve, reject) => {
     let done = false
     const timer = setTimeout(() => {
@@ -365,18 +489,29 @@ async function runFromExtension() {
 async function runExtensionTests() {
   els.results.innerHTML = ''
   els.viewBtn.style.display = 'none'
+  setRunControls(true)
 
   const token = await ensureExtensionToken()
   if (!token) {
     showOpenApp('Please log in to QA Helper first')
+    setRunControls(false)
     return
   }
 
   const projectId = Number(els.projectSelect.value || 0)
+  const reusableIdValue = String(els.reusableIdValue?.value || '').trim()
   if (!projectId) {
     setStatus('Select a project first')
+    setRunControls(false)
     return
   }
+  if (!reusableIdValue) {
+    setStatus('Enter Reusable ID value before running tests')
+    if (els.reusableIdValue) els.reusableIdValue.focus()
+    setRunControls(false)
+    return
+  }
+  setReusableIdValue(reusableIdValue)
 
   try {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true })
@@ -393,7 +528,8 @@ async function runExtensionTests() {
           projectId,
           apiBase: API_BASE,
           token: getStoredToken(),
-          tabId: activeTab.id
+          tabId: activeTab.id,
+          reusableIdValue
         },
         (resp) => {
           if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
@@ -429,17 +565,27 @@ async function runExtensionTests() {
             chrome.tabs.create({ url: `${APP_BASE}/?project=${projectId}&run=${st.runId}` })
           }
         }
+        setRunControls(false)
+        return
+      }
+      if (st.status === 'stopped') {
+        const summary = String(st.summary || st.message || 'Stopped')
+        setStatus(summary, false)
+        els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        setRunControls(false)
         return
       }
       if (st.status === 'error') {
         throw new Error(String(st.message || 'Background run failed'))
       }
-      await new Promise(resolve => setTimeout(resolve, 350))
+      await new Promise(resolve => setTimeout(resolve, 260))
     }
     throw new Error('Background run timed out')
   } catch (err) {
     setStatus(err.message || 'Failed to run extension tests', false)
     els.results.innerHTML = `<div class="check fail">${err.message || 'Unknown extension error'}</div>`
+  } finally {
+    setRunControls(false)
   }
 }
 
@@ -501,6 +647,7 @@ async function pollJobUntilDone(jobId, pendingScreenshots = []) {
     const progress = statusData.progress || {}
     const total = Number(progress.total || 0)
     const completed = Number(progress.completed || 0)
+    renderProgress(Math.min(completed, total), Math.max(total, 1), message || 'Running tests...')
 
     if (phase === 'checking_field' && message) {
       setStatus(message, true)
@@ -537,6 +684,11 @@ async function pollJobUntilDone(jobId, pendingScreenshots = []) {
       throw new Error(statusData.error || statusData.message || 'Extension scan failed')
     }
     if (statusData.status === 'done') {
+      finalResult = statusData.result || null
+      setActiveJob(null)
+      break
+    }
+    if (statusData.result && String(statusData.phase || '').toLowerCase() === 'done') {
       finalResult = statusData.result
       setActiveJob(null)
       break
@@ -578,6 +730,9 @@ async function resumeActiveJobIfAny() {
 
 els.loginBtn.addEventListener('click', login)
 els.runBtn.addEventListener('click', runExtensionTests)
+if (els.stopBtn) {
+  els.stopBtn.addEventListener('click', stopExtensionTests)
+}
 if (els.openAppBtn) {
   els.openAppBtn.addEventListener('click', openApp)
 }
@@ -591,6 +746,14 @@ async function initExtension() {
     // Fallback to whatever CONFIG.API_URL already points at.
   }
   loadProjects()
+  if (els.reusableIdValue) {
+    els.reusableIdValue.value = getReusableIdValue()
+    els.reusableIdValue.addEventListener('change', () => {
+      setReusableIdValue(els.reusableIdValue.value)
+    })
+  }
+  await syncRunControlsWithBackgroundState()
+  resumeBackgroundRunIfAny()
   resumeActiveJobIfAny()
 }
 

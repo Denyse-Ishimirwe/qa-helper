@@ -218,18 +218,24 @@
   margin-bottom: 10px;
 }
 
-.card-num {
-  background: #00448e;
-  color: white;
-  border-radius: 50%;
-  width: 22px;
-  height: 22px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 11px;
-  font-weight: bold;
+.card-drag-handle {
+  cursor: grab;
+  user-select: none;
+  color: #94a3b8;
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: -2px;
+  padding: 2px 4px;
   flex-shrink: 0;
+  touch-action: none;
+}
+
+.card-drag-handle:active {
+  cursor: grabbing;
+}
+
+.panel-card-dragging {
+  opacity: 0.55;
 }
 
 .card-name {
@@ -249,7 +255,7 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  padding-left: 32px;
+  padding-left: 0;
 }
 
 .card-field {

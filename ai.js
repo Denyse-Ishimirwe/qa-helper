@@ -11,6 +11,129 @@ const GROQ_PRIMARY_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile')
  */
 const GROQ_FALLBACK_MODEL = String(process.env.GROQ_FALLBACK_MODEL ?? 'llama-3.1-8b-instant').trim()
 
+/** Generic head+tail truncation (form JSON, etc.). */
+function trimWithHeadTail(text, maxChars) {
+  const raw = String(text || '')
+  if (raw.length <= maxChars) return raw
+  const head = Math.max(1000, Math.floor(maxChars * 0.66))
+  const tail = Math.max(700, maxChars - head)
+  return `${raw.slice(0, head)}\n\n[... truncated ...]\n\n${raw.slice(-tail)}`
+}
+
+/**
+ * SRD validation tables often sit in the middle of the document. Plain head+tail drops them.
+ * This keeps start + end + rule-heavy paragraphs in the middle up to midBudget.
+ */
+function trimSrdForPrompt(text, maxChars) {
+  const raw = String(text || '')
+  if (raw.length <= maxChars) return raw
+
+  const reserve = 280
+  const headN = Math.min(Math.floor(maxChars * 0.34), 24000)
+  const tailN = Math.min(Math.floor(maxChars * 0.3), 24000)
+  let midBudget = maxChars - headN - tailN - reserve
+  if (midBudget < 2000) {
+    return trimWithHeadTail(text, maxChars)
+  }
+
+  const head = raw.slice(0, headN)
+  const tail = raw.slice(-tailN)
+  const ruleHint =
+    /\b(validation|verif|incorrect|error|message|required|mandatory|format|invalid|min\.|max\.|length|pattern|regex|attachment|upload|file|size|mb|kb|conditional|when\b|if\b|visible|hidden|displayed|success|confirm|widget|auto[\s-]?fill|national\s*id|\bnin\b|annex|appendix|table|rule|criteria)\b/i
+
+  const chunks = raw.split(/\n{2,}/)
+  const ranked = chunks
+    .map((c) => c.trim())
+    .filter((c) => c.length > 30 && ruleHint.test(c.slice(0, 4000)))
+    .sort((a, b) => b.length - a.length)
+
+  const seen = new Set()
+  const parts = []
+  let used = 0
+  for (const c of ranked) {
+    const snippet = c.length > 4000 ? `${c.slice(0, 4000)}\n[…]` : c
+    const key = snippet.slice(0, 160)
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (used + snippet.length + 2 > midBudget) break
+    parts.push(snippet)
+    used += snippet.length + 2
+  }
+
+  let mid = parts.join('\n\n')
+  if (mid.length < 500) {
+    const startMid = Math.max(headN, Math.floor(raw.length / 2) - Math.floor(midBudget / 2))
+    mid = raw.slice(startMid, startMid + midBudget)
+  }
+
+  return `${head}\n\n[--- SRD excerpts: validation, errors, rules, tables ---]\n\n${mid}\n\n[--- end excerpts ---]\n\n${tail}`
+}
+
+/**
+ * System message: rules stay separate from the SRD so the model does not ignore them.
+ * User message is almost entirely the document + form JSON.
+ */
+const GENERATE_TEST_CASES_SYSTEM = `You output ONLY a JSON array of test case objects. No markdown fences, no commentary before or after.
+
+You must base every test case ONLY on the Requirements document (SRD) in the user message and optional form-structure JSON there.
+
+ANTI-HALLUCINATION (highest priority):
+— Do NOT invent validation rules, error messages, field labels, conditional behaviour, or success text. Every test must trace to something explicitly stated in the SRD (tables, annexes, bullets, quoted strings).
+— If the SRD does not mention an attachment field, widget auto-fill, or conditional rule, do NOT generate that test_type for it.
+— For expected_result: paste the exact user-visible message from the SRD when the document provides it. If the SRD only describes the rule in prose, quote that prose and add "(SRD section/table reference)" — never fabricate UI copy.
+— Prefer fewer faithful tests over many vague ones. Never pad the array.
+
+HOW TO READ THE SRD:
+PASS A — Inventory: fields, validation rules, conditionals, attachments, widgets, submit/success.
+PASS B — Messages verbatim into expected_result when the SRD gives exact wording.
+PASS C — One distinct rule → one test case.
+PASS D — If form JSON exists, align field names; still only test what the SRD authorizes.
+PASS E — Add a test only for an explicitly documented rule; no filler.
+
+REQUIRED PRODUCT STYLE (follow this layout so tests match the QA template — SRD text always wins when it differs):
+Use concise English. Field labels in names and sentences must match the SRD / form (same spelling and capitalization as the form).
+
+name (title pattern):
+— Mandatory field empty test: "{FieldLabel} Required Field Test"  (e.g. First Name Required Field Test)
+— SRD-optional field empty test: "{FieldLabel} Optional Field Test"
+— Single format rule: "{FieldLabel} {RuleShortName} Test"  (e.g. Date of Birth Age Restriction Test)
+— Visibility-only check: "{FieldLabel} Conditional Display Test"
+— Submit: "Successful Submit Test"
+
+what_to_test (one clear sentence; short — NOT long numbered steps unless the SRD requires a cascade chain):
+— Required empty: "Leaving {FieldLabel} field empty"
+— Optional empty (expect no error): same leaving-empty wording; pair with name "... Optional Field Test" and expected_result "No error message"
+— Parent + required empty: "Selecting '{Value}' on {ParentFieldLabel} field and leaving {TargetFieldLabel} field empty"
+— Parent + visibility check: "Selecting '{Value}' on {ParentFieldLabel} field and checking if {TargetFieldLabel} field appears"
+— Format / rule: "Entering …" describing the invalid input in plain English (e.g. date below minimum age)
+— Successful submit: "Filling out all required fields and submitting the form"
+
+expected_result:
+— Prefer exact user-visible strings from the SRD; if the exemplar uses short canonical phrases ("First name is required", "District is required") and the SRD matches that meaning, you may use that style.
+— Optional-field negative test: "No error message"
+— Visibility: "{FieldLabel} field appears" (or exact SRD wording)
+— Submit: "Form is submitted successfully" or exact success message from SRD
+
+conditional_field / widget_auto_fill / attachment / label_check: still use this short name + what_to_test style where possible; for strict automation, conditional_field may use expected_result format Displayed: Yes; Required: Yes; Validation: "…" when the SRD requires combined visibility + required checks.
+
+General:
+— Never placeholders only ("Required error", "See SRD").
+— Never disabled_field type.
+— Widget flows (e.g. ID type before ID number): reflect SRD order inside what_to_test in the same short sentence style.
+
+Output schema per element:
+{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check" }
+
+STYLE EXEMPLAR (structure only — replace with real SRD fields and messages):
+[
+  {"name":"First Name Required Field Test","what_to_test":"Leaving First Name field empty","expected_result":"First name is required","test_type":"required_field"},
+  {"name":"Last Name Optional Field Test","what_to_test":"Leaving Last Name field empty","expected_result":"No error message","test_type":"required_field"},
+  {"name":"Date of Birth Age Restriction Test","what_to_test":"Entering a date of birth that is below 18 years old","expected_result":"Must be above 18 years old","test_type":"format_validation"},
+  {"name":"District Required Field Test","what_to_test":"Selecting 'Yes' on Live in Rwanda? field and leaving District field empty","expected_result":"District is required","test_type":"required_field"},
+  {"name":"District Conditional Display Test","what_to_test":"Selecting 'Yes' on Live in Rwanda? field and checking if District field appears","expected_result":"District field appears","test_type":"required_field"},
+  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"Form is submitted successfully","test_type":"successful_submit"}
+]`
+
 function groqApiMessage(err) {
   const e = err?.error ?? err?.response?.data?.error ?? err?.body?.error
   if (typeof e === 'string') {
@@ -115,30 +238,17 @@ async function repairResponseToJsonArray(rawText) {
   const completion = await groqChatCompletionsCreate({
     model: GROQ_PRIMARY_MODEL,
     temperature: 0,
-    max_tokens: 2200,
+    max_tokens: 8192,
     messages: [
       {
+        role: 'system',
+        content: `Convert broken model output into a valid JSON array only. Schema per item: name, what_to_test, expected_result, test_type.
+Preserve every test case and all SRD-quoted text exactly; do not invent new rules or messages.
+Keep what_to_test as numbered steps when present. Output ONLY JSON, no markdown.`
+      },
+      {
         role: 'user',
-        content: `
-Convert the following AI output into a valid JSON array of objects.
-
-Required object schema:
-{
-  "name": string,
-  "what_to_test": string,
-  "expected_result": string,
-  "test_type": "required_field" | "format_validation" | "successful_submit" | "conditional_required" | "conditional_display" | "widget_auto_fill" | "attachment" | "disabled_field"
-}
-
-Rules:
-- Output ONLY JSON (one array), no prose, no markdown.
-- Preserve the original meaning; do not invent new rules.
-- If any key is missing, infer minimally from context.
-- If no test cases are recoverable, return [].
-
-Input to repair:
-${raw}
-`
+        content: `Input to repair into one JSON array:\n\n${raw}`
       }
     ]
   })
@@ -171,14 +281,6 @@ async function groqChatCompletionsCreate(payload) {
 }
 
 async function generateTestCases(srdText, formStructure) {
-  function trimWithHeadTail(text, maxChars) {
-    const raw = String(text || '')
-    if (raw.length <= maxChars) return raw
-    const head = Math.max(1000, Math.floor(maxChars * 0.66))
-    const tail = Math.max(700, maxChars - head)
-    return `${raw.slice(0, head)}\n\n[... SRD truncated for token budget ...]\n\n${raw.slice(-tail)}`
-  }
-
   function compactStructureForPrompt(structure, maxChars) {
     if (!structure) return ''
     const asText = typeof structure === 'string' ? structure : JSON.stringify(structure)
@@ -191,33 +293,6 @@ async function generateTestCases(srdText, formStructure) {
     return []
   }
 
-  function normalizeLabel(field, idx) {
-    const label = String(field?.label || '').trim()
-    const name = String(field?.name || '').trim()
-    const id = String(field?.id || '').trim()
-    return label || name || id || `Field ${idx + 1}`
-  }
-
-  function normalizeType(raw) {
-    const t = String(raw || '').toLowerCase().trim()
-    if (!t) return 'text'
-    if (t === 'select-one' || t === 'select') return 'select'
-    return t
-  }
-
-  function fieldKey(label) {
-    return String(label || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
-  }
-
-  function caseMentionsField(tc, key) {
-    const text = `${tc.name} ${tc.what_to_test} ${tc.expected_result}`.toLowerCase()
-    return key && text.includes(key)
-  }
-
-  function shouldGenerateFormat(type) {
-    return !['checkbox', 'radio', 'submit', 'button', 'hidden'].includes(type)
-  }
-
   function buildCoverageCases(baseCases) {
     const fields = getStructureFields(formStructure)
     if (!fields.length) return baseCases
@@ -226,66 +301,56 @@ async function generateTestCases(srdText, formStructure) {
     const hasSuccessful = out.some(tc => tc.test_type === 'successful_submit')
     if (!hasSuccessful) {
       out.push({
-        name: 'Successful submission with valid data',
-        what_to_test:
-          'Fill every required field with valid values according to the requirements document, then submit the form using the primary submit action.',
+        name: 'Successful Submit Test',
+        what_to_test: 'Filling out all required fields and submitting the form',
         expected_result:
-          'The application accepts the submission: no blocking validation errors remain, and the user reaches the success or confirmation state described in the requirements (use that exact outcome text from the SRD where applicable).',
+          'Form is submitted successfully (use exact success or confirmation wording from the SRD when the document provides it).',
         test_type: 'successful_submit'
       })
     }
 
-    fields.forEach((f, idx) => {
-      const label = normalizeLabel(f, idx)
-      const key = fieldKey(label)
-      const type = normalizeType(f?.type || f?.element)
-      const required = Boolean(f?.required)
-      if (!required) return
-
-      if (required) {
-        const hasRequiredCase = out.some(tc => tc.test_type === 'required_field' && caseMentionsField(tc, key))
-        if (!hasRequiredCase) {
-          out.push({
-            name: `${label} required field validation`,
-            what_to_test: `Leave the "${label}" field empty (do not enter any value), then submit the form.`,
-            expected_result: `The same required-field validation message for "${label}" that is written verbatim in the requirements validation table must appear (paste that exact string from the SRD, not a paraphrase).`,
-            test_type: 'required_field'
-          })
-        }
-      }
-
-      if (shouldGenerateFormat(type)) {
-        const hasFormatCase = out.some(tc => tc.test_type === 'format_validation' && caseMentionsField(tc, key))
-        if (!hasFormatCase) {
-          out.push({
-            name: `${label} format validation`,
-            what_to_test: `Enter a value in "${label}" that violates one specific format or range rule from the requirements (wrong pattern, length, or type), then submit the form.`,
-            expected_result: `The exact format or validation error message for "${label}" defined in the requirements document must be shown (copy the literal SRD wording).`,
-            test_type: 'format_validation'
-          })
-        }
-      }
-    })
+    // Do not synthesize required_field / format_validation rows here — those must come from the SRD via the model
+    // so expected_result always carries real messages and rules, not generic placeholders.
 
     return out
   }
 
+  /** Collapse punctuation / spacing so near-identical LLM rows dedupe as one. */
+  function normalizeDedupeText(s) {
+    return String(s || '')
+      .toLowerCase()
+      .normalize('NFKD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[''`´""]/g, '')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
   function dedupeCases(list) {
-    const seen = new Set()
+    const seenPrimary = new Set()
+    const seenSecondary = new Set()
+    let keptSuccessfulSubmit = false
     const unique = []
     for (const tc of list) {
-      const key = `${tc.test_type}|${tc.name.toLowerCase()}|${tc.what_to_test.toLowerCase()}`
-      if (seen.has(key)) continue
-      seen.add(key)
+      const tt = String(tc.test_type || '').trim()
+      if (tt === 'successful_submit') {
+        if (keptSuccessfulSubmit) continue
+      }
+
+      const n = normalizeDedupeText
+      const keyPrimary = `${tt}|${n(tc.name)}|${n(tc.what_to_test)}`
+      const keySecondary = `${tt}|${n(tc.what_to_test)}|${n(tc.expected_result)}`
+
+      if (seenPrimary.has(keyPrimary)) continue
+      if (seenSecondary.has(keySecondary)) continue
+
+      seenPrimary.add(keyPrimary)
+      seenSecondary.add(keySecondary)
+      if (tt === 'successful_submit') keptSuccessfulSubmit = true
       unique.push(tc)
     }
     return unique
-  }
-
-  function getFieldCount(structure) {
-    if (Array.isArray(structure)) return structure.length
-    if (Array.isArray(structure?.fields)) return structure.fields.length
-    return 0
   }
 
   function normalizeCases(raw) {
@@ -295,16 +360,17 @@ async function generateTestCases(srdText, formStructure) {
         'required_field',
         'format_validation',
         'successful_submit',
-        'conditional_required',
-        'conditional_display',
+        'conditional_field',
         'widget_auto_fill',
         'attachment',
-        'disabled_field'
+        'label_check'
       ]
+      if (t === 'conditional_display' || t === 'conditional_required') return 'conditional_field'
       if (allowed.includes(t)) return t
-      if (t === 'conditional_displayed' || t === 'conditional' || t === 'display_conditional') return 'conditional_display'
-      if (t === 'conditional_required_field' || t === 'required_if') return 'conditional_required'
+      if (t === 'conditional_displayed' || t === 'conditional' || t === 'display_conditional') return 'conditional_field'
+      if (t === 'conditional_required_field' || t === 'required_if') return 'conditional_field'
       if (t === 'optional' || t === 'optional_validation' || t === 'optional_field') return '__drop__'
+      if (t === 'disabled_field' || t === 'disabled') return '__drop__'
       if (t === 'widget_autofill' || t === 'autofill' || t === 'auto_fill') return 'widget_auto_fill'
       if (t === 'file_attachment' || t === 'attachment_validation') return 'attachment'
       return 'required_field'
@@ -330,17 +396,13 @@ async function generateTestCases(srdText, formStructure) {
       if (
         currentType === 'conditional_display' ||
         currentType === 'conditional_displayed' ||
-        currentType === 'display_conditional'
-      ) {
-        return { ...tc, test_type: 'conditional_display' }
-      }
-
-      if (
+        currentType === 'display_conditional' ||
         currentType === 'conditional_required' ||
         currentType === 'conditional_required_field' ||
-        currentType === 'required_if'
+        currentType === 'required_if' ||
+        currentType === 'conditional_field'
       ) {
-        return { ...tc, test_type: 'conditional_required' }
+        return { ...tc, test_type: 'conditional_field' }
       }
 
       if (
@@ -380,30 +442,7 @@ async function generateTestCases(srdText, formStructure) {
         /\brequired\s+if\b/.test(merged)
 
       if (conditionalLeadIn) {
-        if (
-          merged.includes('appear') ||
-          merged.includes('display') ||
-          merged.includes('visible') ||
-          merged.includes('shown') ||
-          merged.includes('show') ||
-          merged.includes('hide')
-        ) {
-          return { ...tc, test_type: 'conditional_display' }
-        }
-        return { ...tc, test_type: 'conditional_required' }
-      }
-
-      if (currentType === 'disabled_field') {
-        const explicitNonEditable =
-          merged.includes('read-only') ||
-          merged.includes('read only') ||
-          merged.includes('cannot be edited') ||
-          merged.includes('not editable') ||
-          merged.includes('field is disabled')
-        if (explicitNonEditable) {
-          return { ...tc, test_type: 'disabled_field' }
-        }
-        return { ...tc, test_type: 'widget_auto_fill' }
+        return { ...tc, test_type: 'conditional_field' }
       }
 
       return tc
@@ -428,165 +467,39 @@ async function generateTestCases(srdText, formStructure) {
 
   async function requestOnce(extraRules = '') {
     const payloadPlans = [
-      { maxTokens: 2600, srdChars: 28000, structureChars: 9000 },
-      { maxTokens: 2200, srdChars: 19000, structureChars: 6000 },
-      { maxTokens: 1800, srdChars: 13000, structureChars: 4000 },
-      { maxTokens: 1400, srdChars: 9000, structureChars: 2200 }
+      { maxTokens: 8192, srdChars: 72000, structureChars: 14000 },
+      { maxTokens: 6000, srdChars: 52000, structureChars: 10000 },
+      { maxTokens: 4500, srdChars: 36000, structureChars: 7000 },
+      { maxTokens: 3200, srdChars: 22000, structureChars: 4500 }
     ]
 
     let lastErr = null
     for (const plan of payloadPlans) {
       try {
-        const srdForPrompt = trimWithHeadTail(srdText, plan.srdChars)
+        const srdForPrompt = trimSrdForPrompt(srdText, plan.srdChars)
         const compactStructure = compactStructureForPrompt(formStructure, plan.structureChars)
-        const structureBlock = compactStructure
-          ? `
-            Here is the actual structure of the form with its real fields:
-            ${compactStructure}
-      `
-          : ''
+        const structureSection = compactStructure
+          ? `=== FORM STRUCTURE (JSON — match field names; rules only from SRD) ===\n${compactStructure}`
+          : '=== FORM STRUCTURE (JSON) ===\nNot provided.'
+
+        const userBody = `Generate the full JSON array of test cases for automation.
+
+=== REQUIREMENTS DOCUMENT (SRD) ===
+${srdForPrompt}
+
+${structureSection}
+
+${extraRules ? `Additional instructions:\n${extraRules}\n` : ''}
+Respond with ONLY one JSON array. Each object must have: name, what_to_test, expected_result, test_type.
+Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_to_test (like the EXEMPLAR), expected_result from SRD or the same concise style as the exemplar.`
 
         const completion = await groqChatCompletionsCreate({
           model: GROQ_PRIMARY_MODEL,
-          temperature: 0.1,
+          temperature: 0,
           max_tokens: plan.maxTokens,
           messages: [
-            {
-              role: 'user',
-              content: `
-            You must base every test case ONLY on the Requirements document (SRD) text below and on the optional form-structure JSON. Do not invent rules, messages, or fields that are not stated there.
-
-            HOW TO READ THE SRD (perform mentally before writing JSON — coverage and accuracy depend on this):
-
-            PASS A — Inventory: Scan the entire SRD for (1) every field or data element the user can enter, (2) every validation rule including format, length, allowed values, age, cross-field rules, (3) every conditional rule (required-if, visible-if), (4) every attachment rule including format and size limits, (5) every widget or auto-fill chain, (6) submit/success behaviour. Note table names, section headings, and row identifiers so you do not skip annexes or appendices.
-
-            PASS B — Messages verbatim: Where the SRD gives an exact user-visible error, warning, or success message (table cell, quoted string, bullet), copy that text into expected_result for the matching test. Prefer character-for-character transcription including punctuation and language. If the SRD only describes the meaning in prose, still write the full intended message as stated, not a one-word placeholder.
-
-            PASS C — One rule → one test: Each distinct validation or behavioural rule becomes its own array element. Multiple formats on one field → multiple format_validation entries. Never merge two rules into one test case.
-
-            PASS D — Cross-check structure: If a JSON form structure is included, every non-derived input field from that structure should appear in at least one test (name, what_to_test, or expected_result) unless the SRD explicitly marks it as system-filled with no tester action.
-
-            PASS E — Gap check: Before finishing, ask whether you missed optional fields, attachments, conditionals, multi-step widgets, or success path — add cases until the SRD is exhaustively covered for automation.
-
-            STRICT RULES FOR EVERY TEST CASE:
-
-            For required_field:
-            — what_to_test must describe leaving the field empty or not filling it
-            — expected_result must contain the exact error message from the SRD validation table
-            — Never describe selecting or filling a value correctly in a required_field test
-
-            For format_validation:
-            — what_to_test must describe entering an invalid value wrong format or a value that violates a specific rule
-            — expected_result must contain the exact error message from the SRD
-            — Never say "enter a valid value" in a format_validation test
-
-            For conditional_required:
-            — what_to_test must describe setting the parent field to the triggering value first then leaving the conditional field empty
-            — Use this exact sentence pattern: "Select [triggerValue] on [parentFieldLabel] field, then leave [targetFieldLabel] field empty"
-            — expected_result must contain the exact error message
-
-            For conditional_display:
-            — Only generate for fields that the SRD explicitly states have a display rule controlled by another field
-            — The parent field must be the field that controls the display not the target field itself
-            — Never generate a conditional_display test where the parent field and target field are from the same cascading group
-            — Use this exact pattern: "Select [triggerValue] on [parentField] field and check if [targetField] field is displayed"
-
-            For fields in a cascading dropdown chain (each level appears only after selecting a parent level):
-            — Always describe the full chain of prerequisite selections in what_to_test.
-            — Use this pattern for display checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then check if [targetField] field is displayed"
-            — Use this pattern for required checks: "Select [triggerValue] on [rootControllerField] field, then select any option on [level1Field] field, then select any option on [level2Field] field, then leave [targetField] field empty"
-            — Identify cascading fields from SRD parent-child display dependencies and wording like selecting one level within a previously selected parent level.
-
-            For widget_auto_fill:
-            — what_to_test must describe entering a valid value in the source field and checking which fields get auto-populated
-            — expected_result must describe which specific fields should be populated
-
-            For successful_submit:
-            — what_to_test must describe filling all required fields with valid values and submitting
-            — expected_result must continue to another section of the form 
-
-            For attachment:
-            — what_to_test must describe the specific scenario: required attachment missing wrong file format or oversized file
-            — expected_result must contain the exact error message from the SRD
-
-            General rules:
-            — Never generate a test case where what_to_test says to fill a field correctly and expected_result says no error
-            — expected_result must always be specific — never just say "Required error message" or "No error" or "Invalid format" without the actual message text from the SRD
-            — Every test case must be actionable without any guesswork
-            — Do not force every test_type on every form. Generate only the test types that are explicitly supported by the SRD for that specific form and field behavior.
-            — If the SRD does not define a rule type (for example: no attachment fields, no widget behavior, no conditional display), do not generate that test_type.
-            — Do not generate optional_field test cases.
-            — Never generate a widget_auto_fill test for a plain input field unless the SRD explicitly describes widget/auto-fill behavior for it.
-            — Never generate an attachment test for any field that is not a file upload/attachment field in the SRD.
-            — Never generate a disabled_field test as conditional_required. Disabled fields may only use widget_auto_fill or disabled_field types.
-
-            STEP 1 — BEFORE generating any test cases, carefully read the entire SRD and identify:
-            — Which fields use widgets — these are fields where the Type column says Widget or has multiple types listed
-            — Which fields are marked as Disabled — these get their values auto-filled from other fields and should NOT be tested with required field tests directly
-            — Which fields have conditional validation — validation rules that only apply when another field has a specific value
-            — Which fields have conditional display — fields that only appear when another field has a specific value
-            — Which fields have auto-fill behavior — described in Widget data column where entering a value populates other fields
-
-            STEP 2 — For widget fields specifically:
-            — If a field has multiple widget types like National ID Widget, NIN Widget, Citizen Application Number — generate separate test cases for each type. For each type test the specific format validation described in the SRD
-            — Always first select the ID Type before testing the ID Number field
-            — Never test a Disabled field directly — instead test the auto-fill behavior by entering a valid value in the source field and verifying the disabled field gets populated
-
-            STEP 3 — For conditional fields:
-            — Always describe in what_to_test exactly what needs to be set first before the field appears or becomes required
-            — Never generate a test case for a conditional field without mentioning the condition that triggers it
-            - The fields might have many fields above it or below forexample like country, province, district, sector, cell and cell, make sure one leads to another and you cover all of them
-
-            STEP 4 — Use the EXACT error messages from the SRD validation rules table — do not make up error messages
-            STEP 5 — Use the EXACT field names from the SRD — do not use option values like Yes, No, Full Time as field names
-
-            You are a senior QA engineer. Your job is to read the SRD document below and generate every possible test case that can be automated on the form.
-
-            For every field in the form, you must consider and generate test cases for ALL of the following that apply:
-
-            1. REQUIRED FIELD TESTS — if the field is required, generate a test that leaves it empty and expects a required error message
-
-            2. FORMAT VALIDATION TESTS — if the field has a format rule such as minimum digits, maximum digits, email format, phone format, age restriction, or date range, generate a SEPARATE test case for each individual format rule
-
-            3. CONDITIONAL REQUIRED TESTS — if a field is only required when another field has a specific value, generate a test that first sets that condition and then leaves the conditional field empty. Always describe in what_to_test which field needs to be set first and to what value
-
-            4. CONDITIONAL DISPLAY TESTS — if a field only appears when another field has a specific value, always describe in what_to_test that the condition must be set first before interacting with that field
-
-            5. WIDGET AUTO-FILL TESTS — if the SRD describes that entering a value in one field automatically populates other fields, generate a test that enters a valid value in the trigger field and checks that all the described fields get automatically filled
-
-            6. ATTACHMENT TESTS — for every file upload or attachment field in the form, generate three separate test cases: one for when the attachment is required and left empty, one for uploading a file with a wrong format, and one for uploading a file that exceeds the maximum allowed size
-
-            7. DISABLED FIELD TESTS — if a field is described as disabled or read-only and gets its value from another field, generate a test confirming it is auto-filled correctly when the source field is filled
-
-            Important rules:
-            - Read every single validation rule, display rule, conditional rule, and widget behavior described in the SRD
-            - Generate a completely separate test case for each individual rule — never combine two rules into one test case
-            - For fields that have multiple format rules, generate one test case per format rule
-            - For conditional fields, always mention in what_to_test exactly which parent field needs to be set and to what value before testing the conditional field
-            - Never skip attachment fields, conditional fields, auto-fill behaviors, or disabled fields
-            - Every test case must be specific and detailed enough that an automated testing tool can execute it without any guessing
-            - Always include at least one successful submit test case at the end
-
-            Requirements document:
-            ${srdForPrompt}
-
-            ${structureBlock}
-
-            If form structure is provided, generate test cases that match those real fields and selectors.
-            ${extraRules}
-
-            Return the test cases as a JSON array like this:
-            [
-              {
-                "name": "Test case name",
-                "what_to_test": "What to test",
-                "expected_result": "Expected result",
-                "test_type": "required_field" | "format_validation" | "successful_submit" | "conditional_required" | "conditional_display" | "widget_auto_fill" | "attachment" | "disabled_field"
-              }
-            ]
-            Return only valid JSON (one array). Do not truncate the list: include every test case implied by passes A–E. If the SRD is long, prioritize completeness over brevity in the array length.
-          `
-            }
+            { role: 'system', content: GENERATE_TEST_CASES_SYSTEM },
+            { role: 'user', content: userBody }
           ]
         })
 
@@ -613,36 +526,7 @@ async function generateTestCases(srdText, formStructure) {
 
   try {
     const firstPass = await requestOnce()
-    const fieldCount = getFieldCount(formStructure)
-    const minimumTarget = fieldCount > 0
-      ? Math.max(25, Math.min(60, fieldCount * 3))
-      : 12
-
-    let mergedForFinalize = firstPass
-    if (firstPass.length < minimumTarget && process.env.GROQ_API_KEY) {
-      const secondPass = await requestOnce(
-        `IMPORTANT COVERAGE PASS — merge with prior output mentally; produce additional cases only where the SRD still has uncovered rules.
-
-      - You must add enough cases so that together with a prior batch the project reaches at least ${minimumTarget} distinct tests when the SRD is large enough to support that count.
-      - Walk the form structure field-by-field again: required, format, conditional, optional, attachment, widget auto-fill, disabled, display rules.
-      - One rule per test case. Use exact SRD messages in expected_result wherever the document states them.
-      - Do not duplicate the same rule; vary name and steps so deduplication can keep both batches.`
-      )
-      mergedForFinalize = dedupeCases([...firstPass, ...secondPass])
-    }
-
-    let out = finalizeCases(mergedForFinalize)
-    if (out.length < minimumTarget && fieldCount > 0 && process.env.GROQ_API_KEY) {
-      try {
-        const repair = await requestOnce(
-          `QUALITY REPAIR — the last batch was too small or failed automated quality checks. Return ONLY a JSON array of new test cases (same schema) that strictly follow every STRICT RULE at the top of this prompt. Each expected_result must contain the real validation or success wording from the SRD (verbatim or clearly quoted), not one-word placeholders. Aim for at least ${minimumTarget} distinct cases if the SRD supports them.`
-        )
-        out = finalizeCases([...out, ...repair])
-      } catch {
-        // keep out
-      }
-    }
-    return out
+    return finalizeCases(firstPass)
   } catch (err) {
     // Retry once for transient network/API failures.
     const msg = String(err?.message || '')
@@ -685,7 +569,7 @@ async function validateManualTestCase({ name, what_to_test, expected_result, srd
             - expected_result: ${expected_result || ''}
 
             Return JSON only:
-            { "valid": true/false, "test_type": "required_field" | "format_validation" | "successful_submit" | "conditional_required" | "conditional_display" | "widget_auto_fill" | "attachment" | "disabled_field", "reason": "short explanation" }
+            { "valid": true/false, "test_type": "required_field" | "format_validation" | "successful_submit" | "conditional_field" | "widget_auto_fill" | "attachment" | "label_check", "reason": "short explanation" }
 
             If the test case does not make sense, is vague, contradicts the form requirements, or cannot be automated, return valid: false.
           `
@@ -698,9 +582,11 @@ async function validateManualTestCase({ name, what_to_test, expected_result, srd
     const parsed = JSON.parse(cleaned)
 
     const valid = Boolean(parsed?.valid)
-    const rawType = String(parsed?.test_type || '')
-    const safeType = ['required_field', 'format_validation', 'successful_submit', 'conditional_required', 'conditional_display', 'widget_auto_fill', 'attachment', 'disabled_field'].includes(rawType)
-      ? rawType
+    const rawType = String(parsed?.test_type || '').trim()
+    const coerced =
+      rawType === 'conditional_display' || rawType === 'conditional_required' ? 'conditional_field' : rawType
+    const safeType = ['required_field', 'format_validation', 'successful_submit', 'conditional_field', 'widget_auto_fill', 'attachment', 'label_check'].includes(coerced)
+      ? coerced
       : 'required_field'
     const reason = String(parsed?.reason || '').trim() || (valid ? 'Valid test case' : 'Invalid test case')
 

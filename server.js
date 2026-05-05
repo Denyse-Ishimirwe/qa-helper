@@ -31,12 +31,12 @@ const ALLOWED_TEST_TYPES = [
   'required_field',
   'format_validation',
   'successful_submit',
+  'conditional_field',
   'conditional_required',
   'conditional_display',
-  'optional_field',
   'widget_auto_fill',
   'attachment',
-  'disabled_field'
+  'label_check'
 ]
 const extensionScanJobs = new Map()
 
@@ -267,11 +267,15 @@ async function fetchNotionSrdText(notionUrl) {
   return text
 }
 
+function isSkippedRunResultRow(r) {
+  return Boolean(r?.skipped) || /^skipped:/i.test(String(r?.notes || '').trim())
+}
+
 async function persistRunResults(projectId, results) {
   const runStartedAt = new Date().toISOString()
   const runFinishedAt = new Date().toISOString()
-  const allPassed = results.every(r => r.passed)
-  const projectStatus = allPassed ? 'Passed' : 'Failed'
+  const anyRealFailure = results.some(r => !isSkippedRunResultRow(r) && !r.passed)
+  const projectStatus = anyRealFailure ? 'Failed' : 'Passed'
 
   const runInsert = await db.run(
     'INSERT INTO test_runs (project_id, run_started_at, run_finished_at, project_status) VALUES (?, ?, ?, ?)',
@@ -299,7 +303,7 @@ async function persistRunResults(projectId, results) {
       `,
       runId,
       r.id,
-      r.passed ? 'Passed' : 'Failed',
+      isSkippedRunResultRow(r) ? 'Skipped' : r.passed ? 'Passed' : 'Failed',
       r.notes || '',
       r.screenshotPath || null,
       tc.name,
@@ -590,9 +594,10 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
         if (jobForScreens?.pendingScreenshots?.length) {
           await applyExtensionScreenshotsToRun(runId, jobForScreens.pendingScreenshots)
         }
-        const passed = results.filter(r => r.passed).length
-        const failed = results.length - passed
-        const summary = `Done - ${passed} passed, ${failed} failed`
+        const skippedN = results.filter(r => isSkippedRunResultRow(r)).length
+        const passedN = results.filter(r => r.passed && !isSkippedRunResultRow(r)).length
+        const failedN = results.filter(r => !r.passed && !isSkippedRunResultRow(r)).length
+        const summary = `Done - ${passedN} passed, ${failedN} failed${skippedN ? `, ${skippedN} skipped` : ''}`
 
         const jobDone = extensionScanJobs.get(jobId)
         if (jobDone) {
@@ -607,8 +612,8 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
               projectId: Number(projectId),
               runId,
               summary,
-              passed,
-              failed,
+              passed: passedN,
+              failed: failedN,
               checks: results.map(r => ({
                 id: r.id,
                 name: r.name,
@@ -745,13 +750,12 @@ app.get('/api/projects', requireAuth, async (req, res) => {
   res.json(projects)
 })
 
-app.post('/api/projects', requireAuth, upload.fields([{ name: 'srd', maxCount: 1 }, { name: 'test_data_file', maxCount: 1 }]), async (req, res) => {
+app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim()
     const form_url = String(req.body?.form_url || '').trim()
     const notion_url = String(req.body?.notion_url || '').trim()
-    const srdFile = req.files?.srd?.[0] || null
-    const testDataFile = req.files?.test_data_file?.[0] || null
+    const srdFile = req.file || null
 
     if (!name) {
       return res.status(400).json({ error: 'Project name is required' })
@@ -768,19 +772,12 @@ app.post('/api/projects', requireAuth, upload.fields([{ name: 'srd', maxCount: 1
       srdText = await fetchNotionSrdText(notion_url)
     }
 
-    let testDataProfileText = '{}'
-    if (testDataFile?.path) {
-      const imported = parseImportedTestDataText(await extractText(testDataFile.path))
-      testDataProfileText = JSON.stringify(imported)
-    }
-
     const result = await db.run(
-      'INSERT INTO projects (user_id, name, form_url, srd_text, test_data_profile) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)',
       req.user.id,
       name,
       form_url || '',
-      srdText,
-      testDataProfileText
+      srdText
     )
 
     res.json({ success: true, id: result.lastInsertRowid })
@@ -1061,170 +1058,6 @@ app.get('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
 
   const testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', req.params.id)
   res.json(testCases)
-})
-
-function parseProjectTestDataProfile(raw) {
-  const text = String(raw || '').trim()
-  if (!text) return {}
-  try {
-    const parsed = JSON.parse(text)
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-    return parsed
-  } catch {
-    return {}
-  }
-}
-
-function parseImportedTestDataText(rawText) {
-  const text = String(rawText || '').trim()
-  if (!text) return {}
-
-  // 1) Try JSON object directly.
-  try {
-    const parsed = JSON.parse(text)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const out = {}
-      for (const [k, v] of Object.entries(parsed)) {
-        const key = String(k || '').trim()
-        const value = String(v ?? '').trim()
-        if (key && value) out[key] = value
-      }
-      return out
-    }
-  } catch {
-    // Continue with line parsing.
-  }
-
-  // 2) Parse "Key: Value", "Key - Value", "Key = Value" lines.
-  const out = {}
-  const lines = text.split(/\r?\n/).map(l => String(l || '').trim()).filter(Boolean)
-  for (const line of lines) {
-    const m = line.match(/^([^:=-]{2,80})\s*[:=-]\s*(.+)$/)
-    if (!m) continue
-    const rawKey = String(m[1] || '').trim()
-    const rawValue = String(m[2] || '').trim()
-    if (!rawKey || !rawValue) continue
-    const key = rawKey
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-    if (!key) continue
-    out[key] = rawValue
-  }
-  return out
-}
-
-function deriveSuggestedTestDataKeys(testCases = []) {
-  const keys = new Set([
-    'first_name',
-    'last_name',
-    'phone',
-    'email',
-    'id_type',
-    'national_id',
-    'nin',
-    'application_number',
-    'dob_adult',
-    'dob_under_18',
-    'live_in_rwanda',
-    'district',
-    'sector',
-    'cell',
-    'village'
-  ])
-  const mapping = [
-    { re: /\bfirst name\b/i, key: 'first_name' },
-    { re: /\blast name|surname\b/i, key: 'last_name' },
-    { re: /\bphone|mobile|tel\b/i, key: 'phone' },
-    { re: /\bemail\b/i, key: 'email' },
-    { re: /\bid type\b/i, key: 'id_type' },
-    { re: /\bnational id|id number\b/i, key: 'national_id' },
-    { re: /\bnin\b/i, key: 'nin' },
-    { re: /\bapplication number|citizen application\b/i, key: 'application_number' },
-    { re: /\bdate of birth|dob\b/i, key: 'dob_adult' },
-    { re: /\blive in rwanda\b/i, key: 'live_in_rwanda' },
-    { re: /\bdistrict\b/i, key: 'district' },
-    { re: /\bsector\b/i, key: 'sector' },
-    { re: /\bcell\b/i, key: 'cell' },
-    { re: /\bvillage\b/i, key: 'village' }
-  ]
-  for (const tc of testCases) {
-    const blob = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`
-    for (const item of mapping) {
-      if (item.re.test(blob)) keys.add(item.key)
-    }
-  }
-  return [...keys]
-}
-
-app.get('/api/projects/:id/test-data', requireAuth, async (req, res) => {
-  try {
-    const ownedProject = await ensureProjectOwner(req, res)
-    if (!ownedProject) return
-    const project = await db.get('SELECT test_data_profile FROM projects WHERE id = ?', req.params.id)
-    const testCases = await db.all(
-      'SELECT name, what_to_test, expected_result FROM test_cases WHERE project_id = ?',
-      req.params.id
-    )
-    return res.json({
-      profile: parseProjectTestDataProfile(project?.test_data_profile),
-      suggested_keys: deriveSuggestedTestDataKeys(testCases)
-    })
-  } catch (err) {
-    console.error('project test-data fetch error:', err)
-    return res.status(500).json({ error: err.message || 'Failed to fetch project test data' })
-  }
-})
-
-app.put('/api/projects/:id/test-data', requireAuth, async (req, res) => {
-  try {
-    const ownedProject = await ensureProjectOwner(req, res)
-    if (!ownedProject) return
-    const rawProfile = req.body?.profile
-    if (!rawProfile || typeof rawProfile !== 'object' || Array.isArray(rawProfile)) {
-      return res.status(400).json({ error: 'profile object is required' })
-    }
-    const cleaned = {}
-    for (const [k, v] of Object.entries(rawProfile)) {
-      const key = String(k || '').trim()
-      if (!key) continue
-      const value = String(v ?? '').trim()
-      if (value) cleaned[key] = value
-    }
-    await db.run(
-      'UPDATE projects SET test_data_profile = ? WHERE id = ?',
-      JSON.stringify(cleaned),
-      req.params.id
-    )
-    return res.json({ success: true, profile: cleaned })
-  } catch (err) {
-    console.error('project test-data save error:', err)
-    return res.status(500).json({ error: err.message || 'Failed to save project test data' })
-  }
-})
-
-app.post('/api/projects/:id/test-data/import', requireAuth, upload.single('test_data_file'), async (req, res) => {
-  try {
-    const ownedProject = await ensureProjectOwner(req, res)
-    if (!ownedProject) return
-    if (!req.file?.path) {
-      return res.status(400).json({ error: 'test_data_file is required' })
-    }
-    const extracted = await extractText(req.file.path)
-    const imported = parseImportedTestDataText(extracted)
-    const existingRow = await db.get('SELECT test_data_profile FROM projects WHERE id = ?', req.params.id)
-    const existing = parseProjectTestDataProfile(existingRow?.test_data_profile)
-    const merged = { ...existing, ...imported }
-    await db.run(
-      'UPDATE projects SET test_data_profile = ? WHERE id = ?',
-      JSON.stringify(merged),
-      req.params.id
-    )
-    return res.json({ success: true, imported_count: Object.keys(imported).length, profile: merged })
-  } catch (err) {
-    console.error('project test-data import error:', err)
-    return res.status(500).json({ error: err.message || 'Failed to import test data file' })
-  }
 })
 
 /**
@@ -1571,12 +1404,12 @@ app.get('/api/projects/:id/export/testcases', requireAuth, async (req, res) => {
       if (type === 'required_field') return 'Required Field'
       if (type === 'format_validation') return 'Format Validation'
       if (type === 'successful_submit') return 'Successful Submit'
+      if (type === 'conditional_field') return 'Conditional Field'
       if (type === 'conditional_required') return 'Conditional Required'
       if (type === 'conditional_display') return 'Conditional Display'
-      if (type === 'optional_field') return 'Optional Field'
       if (type === 'widget_auto_fill') return 'Widget Auto Fill'
       if (type === 'attachment') return 'Attachment'
-      if (type === 'disabled_field') return 'Disabled Field'
+      if (type === 'label_check') return 'Label Check'
       return 'Required Field'
     }
 

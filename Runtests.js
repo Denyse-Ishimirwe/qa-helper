@@ -9,22 +9,21 @@ const SUPPORTED_TEST_TYPES = [
   'required_field',
   'format_validation',
   'successful_submit',
-  'conditional_required',
-  'conditional_display',
-  'optional_field',
+  'conditional_field',
   'widget_auto_fill',
   'attachment',
-  'disabled_field'
+  'label_check'
 ]
 
 function normalizeTestType(rawType) {
   const t = String(rawType || '').toLowerCase().trim()
   if (!t) return 'required_field'
+  if (t === 'conditional_display' || t === 'conditional_required') return 'conditional_field'
+  if (t === 'conditional_displayed' || t === 'conditional' || t === 'display_conditional') return 'conditional_field'
+  if (t === 'conditional_required_field' || t === 'required_if') return 'conditional_field'
   if (SUPPORTED_TEST_TYPES.includes(t)) return t
-  if (t === 'conditional_displayed' || t === 'conditional' || t === 'display_conditional') return 'conditional_display'
   if (t === 'widget_autofill' || t === 'auto_fill' || t === 'autofill') return 'widget_auto_fill'
-  if (t === 'optional' || t === 'optional_validation') return 'optional_field'
-  if (t === 'conditional_required_field' || t === 'required_if') return 'conditional_required'
+  if (t === 'optional' || t === 'optional_validation') return 'required_field'
   if (t === 'file_attachment' || t === 'attachment_validation') return 'attachment'
   return 'required_field'
 }
@@ -73,7 +72,7 @@ Return JSON only — no other text:
 Rules:
 - Return valid: false if the test case is vague, nonsensical, contradicts itself, or cannot be automated by filling a form and clicking submit
 - Return valid: true if it clearly describes a specific automatable form test
-- test_type must be exactly one of: required_field, format_validation, successful_submit, conditional_required, conditional_display, optional_field, widget_auto_fill, attachment, disabled_field
+- test_type must be exactly one of: required_field, format_validation, successful_submit, conditional_field, widget_auto_fill, attachment, label_check
 - required_field: tests that an error appears when a required field is left empty
 - format_validation: tests that an error appears when a field has wrong format (e.g. wrong ID number)
 - successful_submit: tests that the form submits successfully when all fields are correct
@@ -89,8 +88,7 @@ Rules:
     const parsed = JSON.parse(cleaned)
     const valid = Boolean(parsed?.valid)
     const rawType = String(parsed?.test_type || '')
-    const test_type = SUPPORTED_TEST_TYPES.includes(rawType)
-      ? rawType : 'required_field'
+    const test_type = normalizeTestType(rawType)
     const reason = String(parsed?.reason || '').trim() || (valid ? 'Valid test case' : 'Invalid test case')
     return { valid, test_type, reason }
   } catch {
@@ -527,17 +525,6 @@ function pickBestMessageMatch(expected, messages = []) {
     }
   }
   return { bestMessage: best, score: bestScore }
-}
-
-function isLikelyGlobalMessage(msg) {
-  const t = normalizeForCompare(msg)
-  return (
-    t.includes('invalid username or password') ||
-    t.includes('enter your details to continue') ||
-    t.includes('sign in') ||
-    t.includes('log in') ||
-    t.includes('session expired')
-  )
 }
 
 async function detectFieldInvalidState(page, field) {
@@ -1323,8 +1310,8 @@ async function runTests(projectId, options = {}) {
         }
       }
 
-      // CONDITIONAL DISPLAY
-      else if (testType === 'conditional_display') {
+      // CONDITIONAL FIELD — visibility (per expected_result / what_to_test) then required-if-visible
+      else if (testType === 'conditional_field') {
         const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
         const targetField = match.field
         if (!targetField) {
@@ -1354,125 +1341,87 @@ async function runTests(projectId, options = {}) {
         await applyConditionValue(page, controllerField, conditionValue)
         await page.waitForTimeout(500)
 
-        const expectedVisible = !/not\s+appear|does\s+not\s+appear|hidden|hide|not\s+visible/i
-          .test(`${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase())
+        const probe = `${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase()
+        const expectsHidden = /not\s+appear|does\s+not\s+appear|hidden|hide|not\s+visible|not\s+displayed|not\s+shown|displayed\s*:\s*no|is\s+displayed\s*:\s*no/i.test(probe)
         const visible = await isVisible(page, targetField.selector)
-        passed = expectedVisible ? visible : !visible
 
-        if (passed) {
-          notes = expectedVisible
-            ? `Passed: "${targetField.label}" appeared after applying the condition as expected.`
-            : `Passed: "${targetField.label}" stayed hidden after applying the condition as expected.`
-        } else {
-          notes = expectedVisible
-            ? `Failed: "${targetField.label}" did not appear after applying the condition.`
-            : `Failed: "${targetField.label}" appeared, but it was expected to stay hidden for this condition.`
-          failureWaitSelectors = [targetField.selector]
-        }
-      }
-
-      else if (testType === 'conditional_required') {
-        const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
-        const targetField = match.field
-        if (!targetField) {
-          const note = 'Failed: could not identify the conditional required field on the live form.'
-          const screenshotPath = await captureAtFailure(tc.id)
-          await saveCaseResult(false, note, screenshotPath)
-          continue
-        }
-
-        const conditionValue = detectConditionValueToken(tc)
-        const controllerField = findConditionControllerField(tc, runtimeFields)
-        const targetType = normalizeType(targetField.type)
-        const targetLabelNorm = toNormalizedText(targetField.label || '')
-        await fillAllFields(page, runtimeFields, {
-          excludeSelectors: [targetField.selector],
-          excludeNames: targetField.name ? [targetField.name] : [],
-          excludePredicate: (f) => {
-            const fType = normalizeType(f?.type)
-            if (targetType === 'radio' && fType === 'radio') {
-              const sameName = Boolean(targetField.name) && String(f?.name || '') === String(targetField.name)
-              const sameLabel = toNormalizedText(f?.label || '') === targetLabelNorm
-              return sameName || sameLabel
-            }
-            return false
+        if (expectsHidden) {
+          passed = !visible
+          if (passed) {
+            notes = `Passed: "${targetField.label}" stayed hidden after applying the condition as expected.`
+          } else {
+            notes = `Failed: "${targetField.label}" appeared, but it was expected to stay hidden for this condition.`
+            failureWaitSelectors = [targetField.selector]
           }
-        })
-        await applyConditionValue(page, controllerField, conditionValue)
-        await clearField(page, targetField)
-        await clickSubmit(page).catch(() => {})
-        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
-
-        const [fieldError, success] = await Promise.all([
-          targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-          isVisible(page, '#successMsg')
-        ])
-        const visibleMessages = await collectVisibleValidationMessages(page)
-        const invalidState = await detectFieldInvalidState(page, targetField)
-        const evidence = evaluateValidationEvidence({
-          expectedText: tc.expected_result,
-          field: targetField,
-          visibleMessages,
-          fieldError,
-          invalidState
-        })
-        passed = success === false && evidence.hasEvidence
-
-        if (passed) {
-          notes = `Passed: when the condition was applied, leaving "${targetField.label}" empty correctly triggered validation and blocked submission.`
-          if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
         } else {
-          notes = `Failed: conditional required behavior for "${targetField.label}" was not enforced as expected.`
-          if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
-          failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+          if (!visible) {
+            passed = false
+            notes = `Failed: "${targetField.label}" did not appear after applying the condition (cannot assert required behaviour).`
+            failureWaitSelectors = [targetField.selector]
+          } else {
+            await clearField(page, targetField)
+            await clickSubmit(page).catch(() => {})
+            await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
+
+            const [fieldError, success] = await Promise.all([
+              targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
+              isVisible(page, '#successMsg')
+            ])
+            const visibleMessages = await collectVisibleValidationMessages(page)
+            const invalidState = await detectFieldInvalidState(page, targetField)
+            const evidence = evaluateValidationEvidence({
+              expectedText: tc.expected_result,
+              field: targetField,
+              visibleMessages,
+              fieldError,
+              invalidState
+            })
+            passed = success === false && evidence.hasEvidence
+
+            if (passed) {
+              notes = `Passed: "${targetField.label}" is visible after the condition, and leaving it empty correctly triggered validation.`
+              if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
+            } else {
+              notes = `Failed: conditional field "${targetField.label}" was visible but required validation was not enforced as expected.`
+              if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
+              failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+            }
+          }
         }
       }
 
-      else if (testType === 'optional_field') {
+      else if (testType === 'label_check') {
         const match = matchFieldFromTestCaseInSet(tc, runtimeFields)
         const targetField = match.field
         if (!targetField) {
-          const note = 'Failed: could not identify the optional field on the live form.'
+          const note = 'Failed: could not identify the field for label_check.'
           const screenshotPath = await captureAtFailure(tc.id)
           await saveCaseResult(false, note, screenshotPath)
           continue
         }
-
-        await fillAllFields(page, runtimeFields, { excludeSelectors: [targetField.selector] })
-        await clearField(page, targetField)
-        await clickSubmit(page).catch(() => {})
-        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector], 1200)
-        const [fieldError, success] = await Promise.all([
-          targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-          isVisible(page, '#successMsg')
-        ])
-        const visibleMessages = (await collectVisibleValidationMessages(page))
-          .filter(msg => !isLikelyGlobalMessage(msg))
-        const invalidState = await detectFieldInvalidState(page, targetField)
-        const evidence = evaluateValidationEvidence({
-          expectedText: tc.expected_result,
-          field: targetField,
-          visibleMessages,
-          fieldError,
-          invalidState
+        const check = await page.locator(targetField.selector).first().evaluate((el) => {
+          const id = el.id || ''
+          let label = ''
+          if (id) {
+            const byFor = document.querySelector(`label[for="${id}"]`)
+            if (byFor?.textContent?.trim()) label = byFor.textContent.trim()
+          }
+          if (!label) {
+            const wrapped = el.closest('label')
+            if (wrapped?.textContent?.trim()) label = wrapped.textContent.trim()
+          }
+          const placeholder = String(el.getAttribute('placeholder') || '').trim()
+          return { label, placeholder }
         })
-        const targetRequiredMessage = visibleMessages.some(msg => {
-          const m = normalizeForCompare(msg)
-          const label = normalizeForCompare(targetField.label)
-          return Boolean(label) && m.includes(label) && /required|must|missing|mandatory|enter|select|choose/i.test(m)
-        })
-        const strongSemanticMatch = evidence.score >= 0.6 && evidence.mentionsTarget
-        const optionalFieldHasError = Boolean(fieldError) || Boolean(invalidState) || targetRequiredMessage || strongSemanticMatch
-        passed = optionalFieldHasError === false
-
-        if (passed) {
-          notes = `Passed: "${targetField.label}" was left empty and no required validation appeared for that field, which matches optional behavior.`
-          notes += success ? '\nSubmission signal: success message visible.' : '\nSubmission signal: success message not visible.'
-        } else {
-          notes = `Failed: "${targetField.label}" appears to be treated as required, but this test expects it to be optional.`
-          if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
-          failureWaitSelectors = [targetField.errorSelector, targetField.selector]
-        }
+        const expected = String(tc.expected_result || tc.what_to_test || '')
+        const expLabel = (expected.match(/label:\s*"([^"]*)"/i)?.[1] || '').trim()
+        const expPlaceholder = (expected.match(/placeholder:\s*"([^"]*)"/i)?.[1] || '').trim()
+        const labelOk = expLabel ? check.label === expLabel : Boolean(check.label)
+        const placeholderOk = expPlaceholder ? check.placeholder === expPlaceholder : true
+        passed = labelOk && placeholderOk
+        notes = passed
+          ? `Passed: label_check matched for "${targetField.label}".`
+          : `Failed: label_check mismatch. Expected label "${expLabel}" placeholder "${expPlaceholder}", got label "${check.label}" placeholder "${check.placeholder}".`
       }
 
       else if (testType === 'widget_auto_fill') {
@@ -1604,6 +1553,30 @@ async function runTests(projectId, options = {}) {
         completed: index + 1
       })
 
+      if (testType === 'successful_submit' && passed) {
+        const skipNote =
+          'Skipped: successful submit completed earlier in this run — case not executed (results page may differ from the form).'
+        for (let j = index + 1; j < testCases.length; j += 1) {
+          const rest = testCases[j]
+          await db.run('UPDATE test_cases SET status = ?, notes = ? WHERE id = ?', 'Skipped', skipNote, rest.id)
+          results.push({
+            id: rest.id,
+            name: rest.name,
+            passed: false,
+            notes: skipNote,
+            screenshotPath: null,
+            generationReason: rest.generation_reason || ''
+          })
+        }
+        emitProgress({
+          phase: 'running_tests',
+          message: `Stopping after successful submit (${testCases.length - index - 1} case(s) skipped).`,
+          total: testCases.length,
+          completed: testCases.length
+        })
+        break
+      }
+
     } catch (err) {
       const note = `Failed: runtime error — ${String(err?.message || 'Unknown error')}`
       testLog(`RESULT: ✗ Failed — ${note}`)
@@ -1638,8 +1611,9 @@ async function runTests(projectId, options = {}) {
 
   await browser.close()
 
-  const allPassed = results.every(r => r.passed)
-  const anyFailed = results.some(r => !r.passed)
+  const skippedRow = (r) => /^skipped:/i.test(String(r.notes || '').trim())
+  const allPassed = results.length > 0 && results.every(r => r.passed || skippedRow(r))
+  const anyFailed = results.some(r => !r.passed && !skippedRow(r))
   const newStatus = allPassed ? 'Passed' : anyFailed ? 'Failed' : 'In Progress'
 
   await db.run("UPDATE projects SET status = ?, last_tested = datetime('now') WHERE id = ?", newStatus, projectId)

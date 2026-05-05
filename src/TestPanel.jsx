@@ -9,6 +9,13 @@ function normalizeTestStatus(status) {
   return 'Not Run'
 }
 
+/** Map legacy conditional types to the unified type for display and editing. */
+function normalizeTestTypeUi(raw) {
+  const t = String(raw || '').trim()
+  if (t === 'conditional_display' || t === 'conditional_required') return 'conditional_field'
+  return t || 'required_field'
+}
+
 function TestPanel({ project, token, onClose }) {
   const [testCases, setTestCases] = useState([])
   const [loading, setLoading] = useState(false)
@@ -139,7 +146,7 @@ function TestPanel({ project, token, onClose }) {
       name: tc.name,
       what_to_test: tc.what_to_test,
       expected_result: tc.expected_result,
-      test_type: tc.test_type || 'required_field'
+      test_type: normalizeTestTypeUi(tc.test_type)
     })
   }
 
@@ -333,12 +340,10 @@ function TestPanel({ project, token, onClose }) {
               <option value="required_field">required_field</option>
               <option value="format_validation">format_validation</option>
               <option value="successful_submit">successful_submit</option>
-              <option value="conditional_required">conditional_required</option>
-              <option value="conditional_display">conditional_display</option>
-              <option value="optional_field">optional_field</option>
+              <option value="conditional_field">conditional_field</option>
               <option value="widget_auto_fill">widget_auto_fill</option>
               <option value="attachment">attachment</option>
-              <option value="disabled_field">disabled_field</option>
+              <option value="label_check">label_check</option>
             </select>
             {addError && <p className="panel-error">{addError}</p>}
             <div className="card-btns" style={{ marginTop: '12px' }}>
@@ -454,12 +459,10 @@ function TestPanel({ project, token, onClose }) {
                       <option value="required_field">required_field</option>
                       <option value="format_validation">format_validation</option>
                       <option value="successful_submit">successful_submit</option>
-                      <option value="conditional_required">conditional_required</option>
-                      <option value="conditional_display">conditional_display</option>
-                      <option value="optional_field">optional_field</option>
+                      <option value="conditional_field">conditional_field</option>
                       <option value="widget_auto_fill">widget_auto_fill</option>
                       <option value="attachment">attachment</option>
-                      <option value="disabled_field">disabled_field</option>
+                      <option value="label_check">label_check</option>
                     </select>
                     <div className="card-btns">
                       <button className="btn-save" onClick={() => handleSaveEdit(tc.id)}>Save</button>
@@ -486,7 +489,7 @@ function TestPanel({ project, token, onClose }) {
                     <div className="card-body">
                       <div className="card-field">
                         <span className="field-label">Test type</span>
-                        <span className="field-value">{tc.test_type || 'required_field'}</span>
+                        <span className="field-value">{normalizeTestTypeUi(tc.test_type)}</span>
                       </div>
                       <div className="card-field">
                         <span className="field-label">What to test</span>
