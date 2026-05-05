@@ -35,7 +35,7 @@
             For label_placeholder:
             — Generate only when SRD/form structure explicitly defines expected field label text or placeholder text.
             — what_to_test must name the target field and state to verify visible label text and/or placeholder text.
-            — expected_result must contain explicit expected text in quotes, e.g. Label: "First Name", Placeholder: "Enter first name".
+            — expected_result must contain explicit expected text in quotes, e.g. Label: "<label from SRD or form structure>", Placeholder: "<placeholder from SRD or form structure>".
 
             For label_check:
             — This type is separate from required_field: it never tests leaving a field empty or required errors. Do not give the test case a name that sounds like a required-field test (never use "required", "empty", or "validation" in the name for this type).
@@ -91,8 +91,8 @@
             — Which fields have auto-fill behavior — described in Widget data column where entering a value populates other fields
 
             STEP 2 — For widget fields specifically:
-            — If a field has multiple widget types like National ID Widget, NIN Widget, Citizen Application Number — generate separate test cases for each type. For each type test the specific format validation described in the SRD
-            — Always first select the ID Type before testing the ID Number field
+            — If the SRD lists multiple widget or entry types for one field, generate separate test cases per type using the SRD’s names (do not use example product names from this file).
+            — When the SRD requires choosing a type or category before another field, select that first in what_to_test, using the SRD’s field labels
             — Never test a Disabled field directly — instead test the auto-fill behavior by entering a valid value in the source field and verifying the disabled field gets populated
 
             STEP 3 — For conditional fields:

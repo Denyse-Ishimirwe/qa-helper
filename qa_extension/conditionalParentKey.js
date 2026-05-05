@@ -50,6 +50,17 @@
   function parseConditionalSpec(tc) {
     const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.name || ''}`
 
+    // "Selecting 'Yes' on <Parent> field ..." / Selecting \"Yes\" on ... (product QA style)
+    const selectingQuotedOn = text.match(
+      /selecting\s+['"]([^'"]+)['"]\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*,|\s*then\b|\s*$)/i
+    )
+    if (selectingQuotedOn) {
+      return {
+        parentLabel: trimParentQuestionLabel(selectingQuotedOn[2]),
+        triggerValue: normalizeConditionalTrigger(selectingQuotedOn[1])
+      }
+    }
+
     const afterSelectingYesNo = text.match(
       /after\s+selecting\s+(yes|no)\s+(?:for|on)\s+(.+?)(?:\s*$|\s+and\b|\s+field\b)/i
     )

@@ -1398,6 +1398,41 @@ function primaryLocationTierIndex(el) {
   return idx >= 0 ? idx : 999
 }
 
+/** True when this ng-select/combobox sits in a district/sector/cell/village (or province) cascade row. */
+function isLocationCascadeSelectRoot(root) {
+  if (!root) return false
+  const step = primaryLocationStepForControl(root)
+  return Boolean(step && LOCATION_CASCADE_STEPS.includes(step))
+}
+
+/**
+ * Next unfilled step in the location chain only (lowest tier first), up to the tier under test.
+ * Does not touch unrelated dropdowns (nationality, etc.).
+ */
+function pickNextLocationCascadeDropdown(fieldLabel) {
+  const wantStep = locationStepFromFieldLabel(fieldLabel)
+  const maxTier = wantStep && LOCATION_CASCADE_STEPS.includes(wantStep)
+    ? LOCATION_CASCADE_STEPS.indexOf(wantStep)
+    : LOCATION_CASCADE_STEPS.length - 1
+
+  const ranked = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+    .filter(el => isVisible(el) && ngSelectRootAppearsUnselected(el))
+    .map(el => {
+      const step = primaryLocationStepForControl(el)
+      const tier =
+        step && LOCATION_CASCADE_STEPS.includes(step) ? LOCATION_CASCADE_STEPS.indexOf(step) : 999
+      return {
+        el,
+        tier,
+        top: Number(el.getBoundingClientRect?.().top ?? 0)
+      }
+    })
+    .filter(x => x.tier < 999 && x.tier <= maxTier)
+    .sort((a, b) => a.tier - b.tier || a.top - b.top)
+
+  return ranked[0]?.el || null
+}
+
 /** Which location tier this test targets (e.g. "Sector" → sector). */
 function locationStepFromFieldLabel(fieldLabel) {
   const lower = normalizeText(String(fieldLabel || ''))
@@ -1465,51 +1500,13 @@ async function resolveWithCascadeChain(fieldLabel, fieldName, options = {}) {
   if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
     return target
   }
-  const contextNorm = normalizeLabelText(`${fieldLabel || ''} ${fieldName || ''} ${options?.contextHint || ''}`)
-  const targetTokens = new Set(
-    String(contextNorm || '')
-      .split(/\s+/)
-      .filter(t => t.length > 2)
-  )
-  const locationOrder = ['district', 'sector', 'cell', 'village']
-  const touched = new Set()
-  const maxDepth = Number(options?.maxCascadeDepth || 8)
+  const maxDepth = Number(options?.maxCascadeDepth || 14)
   for (let i = 0; i < maxDepth; i += 1) {
-    const candidates = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
-      .filter(el => isVisible(el) && ngSelectRootAppearsUnselected(el))
-      .map(el => {
-        const key = String(el.id || el.getAttribute?.('formcontrolname') || el.getAttribute?.('name') || '')
-        const container = getControlContainer(el) || el.closest('formly-field, formly-wrapper-form-field, .form-group, .field') || el
-        const scopeNorm = normalizeLabelText(`${el.textContent || ''} ${container?.textContent || ''}`)
-        let score = 0
-        for (const t of targetTokens) {
-          if (scopeNorm.includes(t)) score += 2
-        }
-        for (let idx = 0; idx < locationOrder.length; idx += 1) {
-          const k = locationOrder[idx]
-          if (scopeNorm.includes(k)) score += (locationOrder.length - idx)
-        }
-        if (touched.has(el) || (key && touched.has(key))) score -= 3
-        const tierIdx = primaryLocationTierIndex(el)
-        const top = Number(el.getBoundingClientRect?.().top ?? 0)
-        return { el, score, key, tierIdx, top }
-      })
-      .sort((a, b) => {
-        if (a.tierIdx !== b.tierIdx) return a.tierIdx - b.tierIdx
-        if (a.score !== b.score) return b.score - a.score
-        return a.top - b.top
-      })
-    const next = candidates[0]?.el || null
+    const next = pickNextLocationCascadeDropdown(fieldLabel)
     if (!next) break
-    const nextKey = candidates[0]?.key || ''
     scrollTestTargetIntoView(next)
     await wait(55)
-    const changed = await selectFirstNonEmptyNgSelect(next)
-    touched.add(next)
-    if (nextKey) touched.add(nextKey)
-    if (!changed) {
-      await wait(55)
-    }
+    await selectFirstNonEmptyNgSelect(next)
     await wait(170)
     target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
     if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
@@ -1545,7 +1542,7 @@ function pickVisibleCascadeDropdowns() {
 }
 
 async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, contextHint = '') {
-  for (let iteration = 0; iteration < 4; iteration += 1) {
+  for (let iteration = 0; iteration < 14; iteration += 1) {
     const target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
       allowContinue: false,
       contextHint
@@ -1558,35 +1555,55 @@ async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, 
       return target
     }
 
-    const dropdowns = pickVisibleCascadeDropdowns()
-      .map(el => ({ el, tier: primaryLocationTierIndex(el), top: Number(el.getBoundingClientRect?.().top ?? 0) }))
-      .sort((a, b) => a.tier - b.tier || a.top - b.top)
-      .map(x => x.el)
-    if (dropdowns.length === 0) continue
-    for (const dd of dropdowns) {
-      const tag = String(dd.tagName || '').toLowerCase()
-      if (tag === 'select') {
-        const options = Array.from(dd.options || [])
-        const nonEmpty = options.find(opt => String(opt.value || '').trim())
-        if (nonEmpty) {
-          dd.value = nonEmpty.value
-          dispatchInputEvents(dd)
-        }
-      } else {
-        await selectFirstNonEmptyNgSelect(dd)
-      }
+    const nextLoc = pickNextLocationCascadeDropdown(fieldLabel)
+    if (nextLoc) {
+      scrollTestTargetIntoView(nextLoc)
+      await wait(45)
+      await selectFirstNonEmptyNgSelect(nextLoc)
       await wait(220)
-      const check = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+      const checkLoc = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
         allowContinue: false,
         contextHint
       })
       if (
-        check?.element &&
-        isVisible(check.element) &&
-        resolvedTargetMatchesLocationStep(fieldLabel, check)
+        checkLoc?.element &&
+        isVisible(checkLoc.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, checkLoc)
       ) {
-        return check
+        return checkLoc
       }
+      continue
+    }
+
+    const dropdowns = pickVisibleCascadeDropdowns()
+      .filter(dd => !isLocationCascadeSelectRoot(dd))
+      .map(el => ({ el, tier: primaryLocationTierIndex(el), top: Number(el.getBoundingClientRect?.().top ?? 0) }))
+      .sort((a, b) => a.tier - b.tier || a.top - b.top)
+      .map(x => x.el)
+    const dd = dropdowns[0]
+    if (!dd) continue
+    const tag = String(dd.tagName || '').toLowerCase()
+    if (tag === 'select') {
+      const opts = Array.from(dd.options || [])
+      const nonEmpty = opts.find(opt => String(opt.value || '').trim())
+      if (nonEmpty) {
+        dd.value = nonEmpty.value
+        dispatchInputEvents(dd)
+      }
+    } else {
+      await selectFirstNonEmptyNgSelect(dd)
+    }
+    await wait(220)
+    const check = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+      allowContinue: false,
+      contextHint
+    })
+    if (
+      check?.element &&
+      isVisible(check.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, check)
+    ) {
+      return check
     }
   }
   return { element: null, kind: 'unknown' }
@@ -2515,6 +2532,8 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   const widgetWaitMs = Math.min(8000, Math.max(200, Number(options.widgetWaitMs) || 2400))
   const manualLike = options.manualLike !== false
   const fillEvenIfPopulated = options.fillEvenIfPopulated === true
+  /** When testing a location cascade field, do not bulk-fill district/sector/cell/village ng-selects — the cascade resolver fills them in order. */
+  const deferCascadeChains = options.deferCascadeChains === true
   const extraSkips = Array.isArray(options.skipControls) ? options.skipControls.filter(Boolean) : []
   const controls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
   const handledRadioGroups = new Set()
@@ -2556,6 +2575,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     }
     if (kind === 'ng-select') {
       const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
+      if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
       if (handledNgSelectRoots.has(root)) continue
       if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) continue
       handledNgSelectRoots.add(root)
@@ -2630,6 +2650,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   for (const root of ngRoots) {
     if (!isVisible(root)) continue
     if (excludePredicate(root)) continue
+    if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
     if (!ngSelectRootAppearsUnselected(root)) continue
     await selectFirstNonEmptyNgSelect(root)
     await wait(200)
@@ -3030,6 +3051,9 @@ async function executeTestCase(tc, runContext = {}) {
   const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
     .filter(Boolean)
     .join(' | ')
+  const locCascadeHint = /\b(district|sector|cell|village|province|location)\b/i.test(
+    `${fieldLabel} ${fieldName} ${ctxHint}`
+  )
   let target = testType === 'successful_submit'
     ? { element: null, kind: 'unknown' }
     : await resolveTargetWithTypeHints(fieldLabel, fieldName, {
@@ -3144,21 +3168,21 @@ async function executeTestCase(tc, runContext = {}) {
     conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
     // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
   } else if (executableTypes.has(testType) && !(testType === 'required_field' && requiredFieldRunPreflightDone)) {
-    await fillAllFieldsWithValidValues(target, { manualLike: true })
+    await fillAllFieldsWithValidValues(target, {
+      manualLike: true,
+      deferCascadeChains: locCascadeHint
+    })
   }
 
   let field = target.element
   if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType)) {
-    const locCascade = /\b(district|sector|cell|village|province|location)\b/i.test(
-      `${fieldLabel} ${fieldName} ${ctxHint}`
-    )
     const expectsHiddenPrefill = expectsConditionalFieldHidden(tc)
     const prefillMax =
-      isConditionalFieldTestType(testType) && expectsHiddenPrefill ? 2 : locCascade ? 3 : 4
+      isConditionalFieldTestType(testType) && expectsHiddenPrefill ? 2 : locCascadeHint ? 3 : 4
     const prefillFill =
       isConditionalFieldTestType(testType) && expectsHiddenPrefill
         ? { widgetWaitMs: 1200 }
-        : locCascade
+        : locCascadeHint
           ? { widgetWaitMs: 1600 }
           : {}
     const bySectionAdvance = await resolveWithPrefillAcrossSections(

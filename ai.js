@@ -79,6 +79,7 @@ You must base every test case ONLY on the Requirements document (SRD) in the use
 
 ANTI-HALLUCINATION (highest priority):
 — Do NOT invent validation rules, error messages, field labels, conditional behaviour, or success text. Every test must trace to something explicitly stated in the SRD (tables, annexes, bullets, quoted strings).
+— Never reuse field names, option labels, form titles, or example messages from this prompt or the STYLE EXEMPLAR below. Those are formatting templates only. Every real label and message must come from the SRD and/or form-structure JSON for this project.
 — If the SRD does not mention an attachment field, widget auto-fill, or conditional rule, do NOT generate that test_type for it.
 — For expected_result: paste the exact user-visible message from the SRD when the document provides it. If the SRD only describes the rule in prose, quote that prose and add "(SRD section/table reference)" — never fabricate UI copy.
 — Prefer fewer faithful tests over many vague ones. Never pad the array.
@@ -94,48 +95,64 @@ REQUIRED PRODUCT STYLE (follow this layout so tests match the QA template — SR
 Use concise English. Field labels in names and sentences must match the SRD / form (same spelling and capitalization as the form).
 
 name (title pattern):
-— Mandatory field empty test: "{FieldLabel} Required Field Test"  (e.g. First Name Required Field Test)
+— Mandatory field empty test: "{FieldLabel} Required Field Test" (use the real label text from the SRD/form JSON, not examples from this prompt)
 — SRD-optional field empty test: "{FieldLabel} Optional Field Test"
-— Single format rule: "{FieldLabel} {RuleShortName} Test"  (e.g. Date of Birth Age Restriction Test)
+— Single format rule: "{FieldLabel} {RuleShortName} Test"
 — Visibility-only check: "{FieldLabel} Conditional Display Test"
 — Submit: "Successful Submit Test"
 
-what_to_test (one clear sentence; short — NOT long numbered steps unless the SRD requires a cascade chain):
-— Required empty: "Leaving {FieldLabel} field empty"
-— Optional empty (expect no error): same leaving-empty wording; pair with name "... Optional Field Test" and expected_result "No error message"
-— Parent + required empty: "Selecting '{Value}' on {ParentFieldLabel} field and leaving {TargetFieldLabel} field empty"
-— Parent + visibility check: "Selecting '{Value}' on {ParentFieldLabel} field and checking if {TargetFieldLabel} field appears"
-— Format / rule: "Entering …" describing the invalid input in plain English (e.g. date below minimum age)
+CONDITIONAL FIELDS (visibility / required-if / display-if — test_type MUST be conditional_field, never required_field):
+— Whenever the SRD says a field appears, becomes required, or stays hidden based on another field’s value, use conditional_field.
+— Parent condition must appear in what_to_test so automation can parse it. Use this pattern (quotes around value optional but recommended): Selecting '<TriggerValue>' on <ParentFieldLabel> field …
+— expected_result MUST use structured lines (SRD messages inside quotes):
+  • Target visible and required when empty: Displayed: Yes; Required: Yes; Validation: "<exact SRD error for empty target>"
+  • Target must stay hidden: Displayed: No; Required: N/A (hidden by condition)
+  • Visibility-only (assert field shows; no required error in same case): Displayed: Yes; Required: N/A; <short visibility phrase from SRD or "<Label> field appears">
+
+CASCADING DROPDOWNS / ORDERED CHAINS (country→region→district→… or any SRD chain where each level unlocks the next):
+— what_to_test MUST list the chain in SRD order before the final action. One flowing sentence or several short sentences joined with "then".
+— Template: Selecting '<Trigger>' on <RootParent> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, [continue each level], then leave <TargetLabel> field empty — OR end with checking if <TargetLabel> field appears for display-only cases.
+— Include every intermediate level the SRD requires; do not skip "between" fields. Use real labels from the SRD/form JSON for each level.
+— If the target IS deep in the chain (e.g. Village after District→Sector→Cell), still write the full prerequisite chain in what_to_test.
+
+what_to_test — other cases (keep concise when no cascade):
+— Required empty (non-conditional): "Leaving {FieldLabel} field empty"
+— Optional empty (expect no error): pair with name "... Optional Field Test" and expected_result "No error message"
+— Single parent + target (no cascade): "Selecting '{Value}' on {ParentFieldLabel} field and leaving {TargetFieldLabel} field empty" OR visibility check with "checking if {TargetFieldLabel} field appears"
+— Format / rule: "Entering …" (invalid condition per SRD)
 — Successful submit: "Filling out all required fields and submitting the form"
 
-expected_result:
-— Prefer exact user-visible strings from the SRD; if the exemplar uses short canonical phrases ("First name is required", "District is required") and the SRD matches that meaning, you may use that style.
-— Optional-field negative test: "No error message"
-— Visibility: "{FieldLabel} field appears" (or exact SRD wording)
-— Submit: "Form is submitted successfully" or exact success message from SRD
+expected_result (non-conditional):
+— Prefer exact SRD strings. Optional-field negative test: "No error message". Submit: success wording from SRD.
 
-conditional_field / widget_auto_fill / attachment / label_check: still use this short name + what_to_test style where possible; for strict automation, conditional_field may use expected_result format Displayed: Yes; Required: Yes; Validation: "…" when the SRD requires combined visibility + required checks.
+widget_auto_fill / attachment / label_check: use same concise style; rules still come only from the SRD.
 
 General:
 — Never placeholders only ("Required error", "See SRD").
 — Never disabled_field type.
-— Widget flows (e.g. ID type before ID number): reflect SRD order inside what_to_test in the same short sentence style.
+— Widget flows (choose widget type before dependent fields when the SRD says so): reflect SRD order inside what_to_test in the same short sentence style.
 
 Output schema per element:
 { "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check" }
 
-STYLE EXEMPLAR (structure only — replace with real SRD fields and messages):
+STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens):
 [
-  {"name":"First Name Required Field Test","what_to_test":"Leaving First Name field empty","expected_result":"First name is required","test_type":"required_field"},
-  {"name":"Last Name Optional Field Test","what_to_test":"Leaving Last Name field empty","expected_result":"No error message","test_type":"required_field"},
-  {"name":"Date of Birth Age Restriction Test","what_to_test":"Entering a date of birth that is below 18 years old","expected_result":"Must be above 18 years old","test_type":"format_validation"},
-  {"name":"District Required Field Test","what_to_test":"Selecting 'Yes' on Live in Rwanda? field and leaving District field empty","expected_result":"District is required","test_type":"required_field"},
-  {"name":"District Conditional Display Test","what_to_test":"Selecting 'Yes' on Live in Rwanda? field and checking if District field appears","expected_result":"District field appears","test_type":"required_field"},
-  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"Form is submitted successfully","test_type":"successful_submit"}
+  {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field"},
+  {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field"},
+  {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation"},
+  {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field"},
+  {"name":"<TargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <TargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <TargetFieldLabel> field appears","test_type":"conditional_field"},
+  {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field"},
+  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit"}
 ]`
 
 function groqApiMessage(err) {
-  const e = err?.error ?? err?.response?.data?.error ?? err?.body?.error
+  if (!err) return ''
+  if (typeof err.message === 'string' && err.message.trim()) return err.message.trim()
+
+  const data = err?.response?.data
+  const e = err?.error ?? data?.error ?? err?.body?.error ?? data
+
   if (typeof e === 'string') {
     try {
       const j = JSON.parse(e)
@@ -144,8 +161,27 @@ function groqApiMessage(err) {
       return e
     }
   }
-  if (e && typeof e === 'object') return String(e.message || e.error || JSON.stringify(e))
-  return String(err?.message || err || '')
+
+  if (e && typeof e === 'object') {
+    const nested =
+      (typeof e.message === 'string' && e.message) ||
+      (typeof e.error === 'string' && e.error) ||
+      (e.error && typeof e.error === 'object' && typeof e.error.message === 'string' && e.error.message)
+    if (nested) return String(nested).trim()
+    try {
+      return JSON.stringify(e).slice(0, 700)
+    } catch {
+      return '[Groq error object]'
+    }
+  }
+
+  if (data && typeof data === 'object' && typeof data.message === 'string') return data.message
+
+  try {
+    return JSON.stringify(data ?? err).slice(0, 700)
+  } catch {
+    return String(err)
+  }
 }
 
 function isGroqRateLimitError(err) {
@@ -172,12 +208,19 @@ function humanizeGroqRateLimit(apiMessage) {
 
 function isGroqRequestTooLargeError(err) {
   const status = err?.status ?? err?.response?.status ?? err?.statusCode
-  const msg = String(groqApiMessage(err) || err?.message || '')
+  const msg = `${groqApiMessage(err)} ${String(err?.message || '')}`.toLowerCase()
   if (status === 413) return true
-  if (/request too large/i.test(msg)) return true
-  if (/tokens per minute|TPM/i.test(msg)) return true
+  if (/request too large|payload too large|context length/i.test(msg)) return true
+  if (/tokens per minute|\btpm\b|rate.*token|token.*limit/i.test(msg)) return true
   if (/limit\s+\d+.*requested\s+\d+/i.test(msg)) return true
+  if (/maximum context|exceeds.*token/i.test(msg)) return true
   return false
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms)
+  })
 }
 
 function extractFirstJsonArrayBlock(text) {
@@ -405,6 +448,14 @@ async function generateTestCases(srdText, formStructure) {
         return { ...tc, test_type: 'conditional_field' }
       }
 
+      if (/displayed\s*:/i.test(String(tc.expected_result || ''))) {
+        return { ...tc, test_type: 'conditional_field' }
+      }
+      const wtt = String(tc.what_to_test || '')
+      if (/selecting\s+['"]/i.test(wtt) && /\bon\s+.+\s+field\b/i.test(wtt)) {
+        return { ...tc, test_type: 'conditional_field' }
+      }
+
       if (
         merged.includes('auto-fill') ||
         merged.includes('autofill') ||
@@ -466,17 +517,28 @@ async function generateTestCases(srdText, formStructure) {
   }
 
   async function requestOnce(extraRules = '') {
+    const envMaxSrd = Number(process.env.GROQ_GENERATE_MAX_SRD_CHARS)
+    const srdCap =
+      Number.isFinite(envMaxSrd) && envMaxSrd >= 4000 ? Math.floor(envMaxSrd) : null
+
     const payloadPlans = [
-      { maxTokens: 8192, srdChars: 72000, structureChars: 14000 },
-      { maxTokens: 6000, srdChars: 52000, structureChars: 10000 },
-      { maxTokens: 4500, srdChars: 36000, structureChars: 7000 },
-      { maxTokens: 3200, srdChars: 22000, structureChars: 4500 }
+      { maxTokens: 4096, srdChars: 32000, structureChars: 8000 },
+      { maxTokens: 4096, srdChars: 26000, structureChars: 6500 },
+      { maxTokens: 3072, srdChars: 20000, structureChars: 5500 },
+      { maxTokens: 3072, srdChars: 16000, structureChars: 4500 },
+      { maxTokens: 2048, srdChars: 12000, structureChars: 4000 },
+      { maxTokens: 2048, srdChars: 9000, structureChars: 3500 },
+      { maxTokens: 1536, srdChars: 6500, structureChars: 3000 },
+      { maxTokens: 1536, srdChars: 4500, structureChars: 2500 }
     ]
 
     let lastErr = null
-    for (const plan of payloadPlans) {
+    for (let planIdx = 0; planIdx < payloadPlans.length; planIdx += 1) {
+      const plan = payloadPlans[planIdx]
       try {
-        const srdForPrompt = trimSrdForPrompt(srdText, plan.srdChars)
+        let effSrdChars = plan.srdChars
+        if (srdCap) effSrdChars = Math.min(effSrdChars, srdCap)
+        const srdForPrompt = trimSrdForPrompt(srdText, effSrdChars)
         const compactStructure = compactStructureForPrompt(formStructure, plan.structureChars)
         const structureSection = compactStructure
           ? `=== FORM STRUCTURE (JSON — match field names; rules only from SRD) ===\n${compactStructure}`
@@ -513,14 +575,19 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
-        if (isGroqRequestTooLargeError(err)) continue
+        if (isGroqRequestTooLargeError(err)) {
+          if (planIdx + 1 < payloadPlans.length) await sleep(2300)
+          continue
+        }
         throw err
       }
     }
+    const detail = groqApiMessage(lastErr) || String(lastErr?.message || 'unknown')
     throw new Error(
-      `SRD payload is too large for current Groq TPM limits. Please retry after reducing SRD size or upgrading Groq tier. Last error: ${String(
-        groqApiMessage(lastErr) || lastErr?.message || 'unknown'
-      ).slice(0, 280)}`
+      `Could not complete generation within Groq limits (payload size or tokens-per-minute). The app already retried with smaller SRD chunks. Options: shorten the SRD text, set GROQ_GENERATE_MAX_SRD_CHARS (e.g. 20000), use a smaller model via GROQ_MODEL / GROQ_FALLBACK_MODEL, wait one minute and retry, or upgrade your Groq tier. Last error: ${detail.slice(
+        0,
+        420
+      )}`
     )
   }
 
