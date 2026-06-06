@@ -600,6 +600,10 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
+        // A 429 must NEVER trigger the payload-size retry loop — firing more
+        // calls while rate-limited only deepens the limit. Bail out so the
+        // outer handler can do its single 60s-backoff retry.
+        if (isGroqRateLimitError(err)) throw err
         if (isGroqRequestTooLargeError(err)) {
           if (planIdx + 1 < payloadPlans.length) await sleep(2300)
           continue
@@ -620,6 +624,22 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
     const firstPass = await requestOnce()
     return finalizeCases(firstPass)
   } catch (err) {
+    // 429 rate limit: wait 60s and try exactly once more. No tight loop —
+    // hammering a rate-limited endpoint only deepens the limit.
+    if (isGroqRateLimitError(err)) {
+      console.error('[ai] Gemini 429 rate limit — waiting 60s before a single retry.')
+      await sleep(60000)
+      try {
+        const retried = await requestOnce()
+        return finalizeCases(retried)
+      } catch (err2) {
+        if (isGroqRateLimitError(err2)) {
+          throw new Error('Gemini is still rate-limited after waiting 60 seconds. Please wait a minute and click Generate again. (Free-tier limit reached.)')
+        }
+        throw err2
+      }
+    }
+
     // Retry once for transient network/API failures.
     const msg = String(err?.message || '')
     const code = String(err?.cause?.code || '')
