@@ -1,38 +1,48 @@
-import fs from 'fs'
+import fs from 'fs/promises'
 import path from 'path'
 import mammoth from 'mammoth'
-import { PdfReader } from 'pdfreader'
+import { PDFParse } from 'pdf-parse'
+
+/**
+ * Per-line cleanup matching the old pdfreader-based extractor:
+ * join split letter-spaces, split camelCase tokens, collapse whitespace.
+ */
+function formatPdfLine(line) {
+  return line
+    .replace(/(?<=[a-zA-Z])\s(?=[a-zA-Z])/g, '')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function formatPdfPageText(raw) {
+  return raw
+    .split(/\r?\n/)
+    .map(formatPdfLine)
+    .filter(Boolean)
+    .join('\n')
+}
 
 async function extractText(filePath) {
   const ext = path.extname(filePath).toLowerCase()
 
   if (ext === '.pdf') {
-    return new Promise((resolve, reject) => {
-      let rows = {}
-
-      new PdfReader().parseFileItems(filePath, (err, item) => {
-        if (err) {
-          reject(new Error(err))
-        } else if (!item) {
-          const text = Object.keys(rows)
-  .sort((a, b) => a - b)
-  .map(y => {
-    const line = rows[y].join(' ')
-   return line.replace(/(?<=[a-zA-Z])\s(?=[a-zA-Z])/g, '')
-           .replace(/([a-z])([A-Z])/g, '$1 $2')
-           .replace(/\s+/g, ' ')
-           .trim()
-  })
-  .join('\n')
-resolve(text)
-          
-        } else if (item.text) {
-          const row = item.y
-          if (!rows[row]) rows[row] = []
-          rows[row].push(item.text.trim())
-        }
+    const data = await fs.readFile(filePath)
+    const parser = new PDFParse({ data: new Uint8Array(data) })
+    try {
+      // lineEnforce / cellSeparator approximate pdfreader's Y-row + horizontal gaps
+      const result = await parser.getText({
+        lineEnforce: true,
+        lineThreshold: 4.5,
+        cellSeparator: ' ',
+        cellThreshold: 9,
+        pageJoiner: ''
       })
-    })
+      const pages = result.pages.map((p) => formatPdfPageText(p.text)).filter(Boolean)
+      return pages.join('\n\n').trim()
+    } finally {
+      await parser.destroy()
+    }
   }
 
   if (ext === '.doc' || ext === '.docx') {

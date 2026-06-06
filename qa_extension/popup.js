@@ -405,9 +405,6 @@ async function collectSessionCookies(activeUrl) {
       merged.push(c)
     }
   }
-  // #region agent log
-  fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H1',location:'qa_extension/popup.js:collectSessionCookies',message:'Collected extension session cookies',data:{targetCount:targets.length,totalCookies:merged.length,domains:Array.from(new Set(merged.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   return merged
 }
 
@@ -432,9 +429,6 @@ async function runFromExtension() {
       const fields = await scanFieldsFromTab(tabs[0].id)
       if (!fields.length) throw new Error('No fields found on active page')
       const sessionCookies = await collectSessionCookies(String(tabs[0].url || ''))
-      // #region agent log
-      fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H2',location:'qa_extension/popup.js:runFromExtension',message:'Sending extension-scan request',data:{projectId,urlHost:(()=>{try{return new URL(String(tabs[0].url||'')).host}catch{return''}})(),sessionCookiesCount:sessionCookies.length},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
 
       setStatus('Connecting to QA Helper...', true)
       const res = await fetch(`${API_BASE}/api/extension-scan`, {
@@ -518,8 +512,8 @@ async function runExtensionTests() {
     const activeTab = tabs?.[0]
     if (!activeTab?.id) throw new Error('Could not access active tab')
 
-    setStatus('Starting background run...', true)
-    renderProgress(0, 1, 'Preparing tests...')
+    setStatus('Running tests...', true)
+    renderProgress(0, 1, 'Running tests...')
 
     const started = await new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(

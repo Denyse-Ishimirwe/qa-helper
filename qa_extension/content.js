@@ -144,11 +144,7 @@ function scanFormFields() {
 function wait(ms) {
   return new Promise((resolve, reject) => {
     const raw = Number(ms || 0)
-    // Light pacing so runs stay closer to 3–5 min for a full suite.
-    const paced =
-      raw <= 0 ? 0
-        : raw < 120 ? raw + 18
-          : Math.min(Math.round(raw * 1.04), raw + 70)
+    const paced = raw <= 0 ? 0 : raw
     const started = Date.now()
     const step = () => {
       if (cancelCurrentTestRequested) {
@@ -357,12 +353,23 @@ function resolveLocationCascadeChild(fieldLabel, contextHint = '') {
   if (!locationWrap && candidates.length > 0) locationWrap = candidates[0]
   if (!locationWrap) return { element: null, kind: 'unknown' }
   const selects = Array.from(locationWrap.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
-  for (const sel of selects) {
-    const blob = normalizeLabelText(
-      `${getControlContainer(sel)?.textContent || ''} ${sel.textContent || ''}`
-    )
-    if (blob.includes(step)) return { element: sel, kind: 'ng-select' }
+
+  // Use each dropdown's OWN placeholder text to identify which level it is.
+  // All dropdowns share the same parent wrapper so container text always contains
+  // all level names — checking individual placeholder avoids matching the wrong level.
+  function getSelectOwnText(sel) {
+    const placeholder = sel.querySelector('.ng-placeholder')?.textContent || ''
+    const input = sel.querySelector('input[placeholder]')?.getAttribute('placeholder') || ''
+    const ownText = placeholder || input || sel.getAttribute('placeholder') || ''
+    return normalizeLabelText(ownText)
   }
+
+  for (const sel of selects) {
+    const ownText = getSelectOwnText(sel)
+    if (ownText && ownText.includes(step)) return { element: sel, kind: 'ng-select' }
+  }
+
+  // Fallback: use index position in the cascade order
   const idx = steps.indexOf(step)
   if (idx >= 0 && selects[idx]) return { element: selects[idx], kind: 'ng-select' }
   return { element: null, kind: 'unknown' }
@@ -457,9 +464,9 @@ function getVisibleValidationEntries() {
 
 async function getVisibleValidationEntriesWithRetry(opts = {}) {
   const quick = Boolean(opts.quick)
-  const initialWaitMs = quick ? 320 : 1100
-  const maxMs = quick ? 640 : 1400
-  const stepMs = quick ? 80 : 120
+  const initialWaitMs = quick ? 180 : 600
+  const maxMs = quick ? 360 : 800
+  const stepMs = quick ? 60 : 90
   await wait(initialWaitMs)
   const tries = Math.ceil(maxMs / stepMs)
   let last = []
@@ -580,6 +587,18 @@ function looksAggregatedDiscoveryLine(norm) {
   return n.length > 180 || reqCount > 2
 }
 
+/** Pull the human validation line from expected_result (run notes + matching). Supports Displayed/Required/Validation: … and plain "City is required". */
+function extractValidationMessageForRunNotes(expectedResult) {
+  const s = String(expectedResult || '').trim()
+  if (!s) return ''
+  const quoted = s.match(/validation\s*:\s*["'“”]([^"'“”\n]+)["'“”]/i)
+  if (quoted) return quoted[1].trim()
+  const plain = s.match(/validation\s*:\s*([^;\n]+?)(?:\s*;|\s*$)/i)
+  if (plain) return plain[1].replace(/^["'“”\s]+|["'“”\s]+$/g, '').trim()
+  if (!/displayed\s*:|required\s*:/i.test(s) && s.length < 220) return s
+  return ''
+}
+
 /** Require multiple label tokens when the field name has several words (reduces wrong-field matches on long error blobs). */
 function labelStrongMatch(norm, targetNorm) {
   const parts = sanitizeSearchLabel(targetNorm).split(/\s+/).filter(Boolean)
@@ -668,37 +687,69 @@ function pickMatchedMessage(entries, expectedResult, targetLabel = '', targetFie
 function pickMatchedMessageForConditionalRequired(entries, expectedResult, targetLabel = '', targetField = null) {
   const targetEl = targetField?.element
   if (!targetEl || !Array.isArray(entries) || entries.length === 0) return ''
-  const expectedNorm = normalizeLabelText(String(expectedResult || ''))
+  const validationNeedle = extractValidationMessageForRunNotes(expectedResult)
+  const expectedNorm = normalizeLabelText(String(validationNeedle || expectedResult || ''))
   const targetNorm = sanitizeSearchLabel(targetLabel)
   const loginPageSignals = /enter your details|sign in|username or password|invalid username/i
 
-  let inContainer = entries.filter(entry => {
-    const norm = normalizeLabelText(entry?.text || '')
-    if (!norm || loginPageSignals.test(norm)) return false
-    const msgEl = entry?.element
-    return Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
-  })
-  if (inContainer.length === 0) {
-    inContainer = entries.filter(entry => {
-      const norm = normalizeLabelText(entry?.text || '')
-      if (!norm || loginPageSignals.test(norm)) return false
-      return labelStrongMatch(norm, targetNorm)
-    })
+  function scorePool(pool) {
+    return pool
+      .map(({ entry, norm, associated, labelHit }) => {
+        let score = 0
+        if (expectedNorm) {
+          if (messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)) score += 130
+          else if (messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)) score += 90
+        }
+        if (labelHit) score += 75
+        if (associated) score += 55
+        if (isGenericRequiredLikeMessage(norm)) score += targetNorm.length >= 8 ? 8 : 22
+        if (looksAggregatedDiscoveryLine(norm)) score -= 200
+        if (norm.length > 160) score -= 40
+        return { entry, score }
+      })
+      .sort((a, b) => b.score - a.score)
   }
-  if (inContainer.length === 0) return ''
 
-  const byPhrase = inContainer.find(e =>
-    messageContainsThreeConsecutiveWordsFromExpected(normalizeLabelText(e.text), expectedNorm)
-  )
-  if (byPhrase) return byPhrase.text
+  let scoped = entries
+    .map(entry => {
+      const norm = normalizeLabelText(entry?.text || '')
+      if (!norm || loginPageSignals.test(norm)) return null
+      const msgEl = entry?.element
+      const associated = Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+      const labelHit = labelStrongMatch(norm, targetNorm)
+      if (!associated && !labelHit) return null
+      return { entry, norm, associated, labelHit }
+    })
+    .filter(Boolean)
 
-  // For required checks, container-scoped generic required messages are acceptable.
-  const generic = inContainer.find(e => isGenericRequiredLikeMessage(normalizeLabelText(e.text)))
-  if (generic) return generic.text
+  if (scoped.length === 0) {
+    scoped = entries
+      .map(entry => {
+        const norm = normalizeLabelText(entry?.text || '')
+        if (!norm || loginPageSignals.test(norm)) return null
+        const labelHit = labelStrongMatch(norm, targetNorm)
+        if (!labelHit) return null
+        return { entry, norm, associated: false, labelHit }
+      })
+      .filter(Boolean)
+  }
 
-  const byLabel = inContainer.find(e => labelStrongMatch(normalizeLabelText(e.text), targetNorm))
-  if (byLabel) return byLabel.text
-  return ''
+  let ranked = scorePool(scoped)
+  if (!ranked.length || ranked[0].score < 25) {
+    const loose = entries
+      .map(entry => {
+        const norm = normalizeLabelText(entry?.text || '')
+        if (!norm || loginPageSignals.test(norm)) return null
+        const msgEl = entry?.element
+        const associated = Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+        const labelHit = labelStrongMatch(norm, targetNorm)
+        return { entry, norm, associated, labelHit }
+      })
+      .filter(Boolean)
+    ranked = scorePool(loose)
+  }
+
+  return ranked[0]?.entry?.text || ''
 }
 
 function dispatchInputEvents(el) {
@@ -736,17 +787,29 @@ function forceClearRadioGroupSelection(fieldEl) {
   let changed = false
   for (const radio of group) {
     if (radio.checked) changed = true
+    // Use click on a hidden sibling to deselect, then dispatch real events
     radio.checked = false
     radio.defaultChecked = false
     radio.removeAttribute?.('checked')
-    dispatchInputEvents(radio)
-    dispatchBlurEvent(radio)
+    radio.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    radio.dispatchEvent(new Event('change', { bubbles: true }))
+    radio.dispatchEvent(new Event('input', { bubbles: true }))
+    radio.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
   }
   const holder = getRadioGroupContainer(fieldEl) || fieldEl?.closest?.('fieldset, .form-group, .field')
   if (holder) {
     holder.dispatchEvent(new Event('input', { bubbles: true }))
     holder.dispatchEvent(new Event('change', { bubbles: true }))
     holder.dispatchEvent(new Event('blur', { bubbles: true }))
+  }
+  // Also try clicking any visible "deselect" affordance Angular renders
+  const container = getRadioGroupContainer(fieldEl)
+  if (container) {
+    const checked = container.querySelector('input[type="radio"]:checked')
+    if (checked) {
+      checked.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      checked.dispatchEvent(new Event('change', { bubbles: true }))
+    }
   }
   return changed
 }
@@ -1118,6 +1181,24 @@ function findRadiosForLabel(fieldLabel) {
 
 function findNgSelectForLabel(fieldLabel) {
   const comps = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+
+  // For cascade-step labels (district/sector/cell/village/province) all dropdowns
+  // share one wrapper, so container/wrapper text contains every step name and
+  // generic text matching always returns the first ng-select (District). Match
+  // on each dropdown's own placeholder, which is unique per level.
+  const cascadeStep = locationStepFromFieldLabel(fieldLabel)
+  if (cascadeStep) {
+    const stepRe = new RegExp(`\\b${cascadeStep}\\b`, 'i')
+    for (const comp of comps) {
+      const placeholder =
+        comp.querySelector?.('.ng-placeholder')?.textContent ||
+        comp.querySelector?.('input[placeholder]')?.getAttribute('placeholder') ||
+        comp.getAttribute?.('placeholder') || ''
+      if (stepRe.test(normalizeLabelText(placeholder))) return comp
+    }
+    return null
+  }
+
   for (const norm of expandLabelSearchTerms(fieldLabel)) {
     if (!norm) continue
     for (const comp of comps) {
@@ -1244,24 +1325,46 @@ async function clearCustomDatePickerValue(inputEl) {
   const host =
     inputEl.closest('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
     inputEl.parentElement
+
+  // Step 1: focus and select-all then delete
+  inputEl.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
   inputEl.click?.()
+  await wait(80)
   inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }))
+  await wait(40)
   inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
-  setInputValueNative(inputEl, '')
-  inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+  inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }))
+  await wait(40)
+
+  // Step 2: native value setter (bypasses Angular value accessor for the display input)
+  const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+  if (descriptor?.set) descriptor.set.call(inputEl, '')
+  else inputEl.value = ''
+
+  // Step 3: fire full Angular event sequence
+  inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
   inputEl.dispatchEvent(new Event('change', { bubbles: true }))
-  inputEl.dispatchEvent(new Event('blur', { bubbles: true }))
+  inputEl.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
+  inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Backspace', bubbles: true }))
+
+  // Step 4: clear all related inputs inside the host (day/month/year splits)
   const related = Array.from(host?.querySelectorAll?.('input') || [])
   for (const inp of related) {
-    setInputValueNative(inp, '')
+    if (descriptor?.set) descriptor.set.call(inp, '')
+    else inp.value = ''
     inp.removeAttribute?.('value')
     inp.dispatchEvent(new Event('input', { bubbles: true }))
     inp.dispatchEvent(new Event('change', { bubbles: true }))
-    inp.dispatchEvent(new Event('blur', { bubbles: true }))
+    inp.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
   }
-  document.body?.click?.()
-  await wait(300)
-  return String(inputEl.value || '').trim() === '' && related.every(inp => String(inp.value || '').trim() === '')
+
+  // Step 5: click outside to close any open picker panel
+  document.body?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await wait(350)
+
+  const allClear = String(inputEl.value || '').trim() === '' &&
+    related.every(inp => String(inp.value || '').trim() === '')
+  return allClear
 }
 
 function formatDateIso(date) {
@@ -1376,6 +1479,20 @@ const LOCATION_CASCADE_STEPS = ['district', 'sector', 'cell', 'village', 'provin
 
 /** Earliest location keyword in the field wrapper reading order (district before sector, …). */
 function primaryLocationStepForControl(el) {
+  if (!el) return ''
+
+  // Check this element's own placeholder first — most reliable for cascade dropdowns
+  // where all levels share one wrapper (container text contains all level names).
+  const placeholder =
+    el.querySelector?.('.ng-placeholder')?.textContent ||
+    el.querySelector?.('input[placeholder]')?.getAttribute('placeholder') ||
+    el.getAttribute?.('placeholder') || ''
+  const placeholderNorm = normalizeLabelText(placeholder)
+  for (const w of LOCATION_CASCADE_STEPS) {
+    if (new RegExp(`\\b${w}\\b`, 'i').test(placeholderNorm)) return w
+  }
+
+  // Fallback: check the wrapper text
   if (!el?.closest) return ''
   const wrap = el.closest('formly-field, formly-wrapper-form-field') || getControlContainer(el)
   const lower = String(wrap?.textContent || '').slice(0, 800).toLowerCase()
@@ -1497,22 +1614,83 @@ async function resolveTargetWithTypeHints(fieldLabel, fieldName, options = {}) {
 
 async function resolveWithCascadeChain(fieldLabel, fieldName, options = {}) {
   let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
-  if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
     return target
   }
+
   const maxDepth = Number(options?.maxCascadeDepth || 14)
+  let lastSuccessfulSelect = false
+
   for (let i = 0; i < maxDepth; i += 1) {
     const next = pickNextLocationCascadeDropdown(fieldLabel)
     if (!next) break
+
     scrollTestTargetIntoView(next)
-    await wait(55)
-    await selectFirstNonEmptyNgSelect(next)
-    await wait(170)
+    await wait(80)
+
+    // Wait for this dropdown to be enabled (not disabled/loading)
+    let enabledAndReady = false
+    for (let readyCheck = 0; readyCheck < 20; readyCheck += 1) {
+      const isDisabled =
+        next.hasAttribute('disabled') ||
+        next.getAttribute('aria-disabled') === 'true' ||
+        next.classList.contains('ng-select-disabled') ||
+        String(next.getAttribute('class') || '').includes('disabled')
+      const hasPlaceholder = Boolean(
+        next.querySelector('.ng-placeholder') &&
+        isVisible(next.querySelector('.ng-placeholder'))
+      )
+      const alreadySelected = !ngSelectRootAppearsUnselected(next)
+      if ((!isDisabled && hasPlaceholder) || alreadySelected) {
+        enabledAndReady = true
+        break
+      }
+      await wait(300)
+    }
+
+    if (!enabledAndReady) {
+      // Dropdown never became ready — chain is stuck
+      break
+    }
+
+    // Skip if already has a selection
+    if (!ngSelectRootAppearsUnselected(next)) {
+      target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
+      if (
+        target.element &&
+        isVisible(target.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, target)
+      ) {
+        return target
+      }
+      continue
+    }
+
+    lastSuccessfulSelect = await selectFirstNonEmptyNgSelect(next)
+
+    if (!lastSuccessfulSelect) {
+      // Options never loaded for this level — stop here,
+      // don't try deeper levels that depend on this one
+      break
+    }
+
+    // After selecting, wait for the next level to unlock
+    await wait(500)
+
     target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
-    if (target.element && isVisible(target.element) && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+    if (
+      target.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
       return target
     }
   }
+
   return target
 }
 
@@ -1542,7 +1720,7 @@ function pickVisibleCascadeDropdowns() {
 }
 
 async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, contextHint = '') {
-  for (let iteration = 0; iteration < 14; iteration += 1) {
+  for (let iteration = 0; iteration < 10; iteration += 1) {
     const target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
       allowContinue: false,
       contextHint
@@ -1560,7 +1738,7 @@ async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, 
       scrollTestTargetIntoView(nextLoc)
       await wait(45)
       await selectFirstNonEmptyNgSelect(nextLoc)
-      await wait(220)
+      await wait(500)
       const checkLoc = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
         allowContinue: false,
         contextHint
@@ -1593,7 +1771,7 @@ async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, 
     } else {
       await selectFirstNonEmptyNgSelect(dd)
     }
-    await wait(220)
+    await wait(500)
     const check = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
       allowContinue: false,
       contextHint
@@ -1649,12 +1827,21 @@ function findContinueButton() {
 async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
   const button = findContinueButton()
   if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  // Snapshot so we can detect an unintended section advance — e.g. when the
+  // field we cleared / set-invalid didn't actually block submit and Continue
+  // moved the form on. detectFormAdvanced checks both URL change and whether
+  // the captured section element is no longer visible.
+  const urlBefore = String(location.href || '')
+  const sectionEl = targetField?.closest?.(
+    'formly-group, formly-field, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field'
+  ) || null
   scrollTestTargetIntoView(button)
   await wait(280)
   button.click()
   const entries = await getVisibleValidationEntriesWithRetry()
   const matched = pickMatchedMessage(entries, expectedResult, targetLabel, targetField, whatToTest)
-  return { ok: true, messages: entries.map(e => e.text), matched }
+  const sectionAdvanced = detectFormAdvanced(urlBefore, sectionEl)
+  return { ok: true, messages: entries.map(e => e.text), matched, sectionAdvanced }
 }
 
 function getInvalidValueForFormat(tc) {
@@ -1951,56 +2138,136 @@ async function runWidgetAutoFillTest(tc, fieldLabel, fieldName) {
 async function clearNgSelectValue(selectRoot) {
   if (!selectRoot) return
   const root = selectRoot.closest('ng-select, .ng-select, [role="combobox"]') || selectRoot
-  const clearBtn = root.querySelector('.ng-clear-wrapper, .ng-value-icon, button[aria-label*="clear" i]')
+
+  // Attempt 1: use ng-select's own clear button
+  const clearBtn = root.querySelector('.ng-clear-wrapper, .ng-value-icon.left, button[aria-label*="clear" i], [title*="clear" i]')
   if (clearBtn && isVisible(clearBtn)) {
+    clearBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
     clearBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    await wait(100)
-    return
+    await wait(150)
+    if (!ngSelectRootAppearsUnselected(root)) {
+      // try again
+      clearBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(100)
+    }
+    if (ngSelectRootAppearsUnselected(root)) return
   }
+
+  // Attempt 2: open dropdown then press Escape to reset
   root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-  await wait(120)
+  await wait(160)
   const filterInput = root.querySelector('input[type="text"], input:not([type="hidden"])')
   if (filterInput) {
     filterInput.focus()
     filterInput.value = ''
-    dispatchInputEvents(filterInput)
-    dispatchBlurEvent(filterInput)
+    filterInput.dispatchEvent(new Event('input', { bubbles: true }))
   }
-  const escTarget = root.querySelector('input') || root
+  const escTarget = filterInput || root.querySelector('input') || root
   escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-  dispatchInputEvents(root)
+  await wait(100)
+
+  // Attempt 3: fire Angular-compatible change event on the host with null value
+  root.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: null }))
+  root.dispatchEvent(new Event('input', { bubbles: true }))
+
+  // Attempt 4: find and trigger the internal Angular writeValue by dispatching on the ng-select host element
+  const ngSelectHost = root.closest('ng-select') || root
+  ngSelectHost.dispatchEvent(new CustomEvent('ngModelChange', { bubbles: true, detail: null }))
+  ngSelectHost.dispatchEvent(new Event('change', { bubbles: true }))
+
+  await wait(80)
 }
 
 async function selectFirstNonEmptyNgSelect(selectRoot) {
   if (!selectRoot) return false
   const root = selectRoot.closest('ng-select, .ng-select, [role="combobox"]') || selectRoot
   const before = readControlValue(root)
-  root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-  await wait(180)
-  const visibleOptions = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option, [role="listbox"] [role="option"], .ng-option, [role="option"]'))
-    .filter(el => isVisible(el))
-  let option = visibleOptions.find(el => {
-    const txt = normalizeLabelText(el.textContent)
-    return txt && !/select|choose/.test(txt)
-  })
-  if (!option) {
-    const scoped = Array.from(
-      (root.closest('formly-field, formly-wrapper-form-field, .form-group, .field') || root.parentElement || document)
-        .querySelectorAll('.ng-option, [role="option"]')
-    ).filter(el => isVisible(el))
-    option = scoped.find(el => {
-      const txt = normalizeLabelText(el.textContent)
-      return txt && !/select|choose/.test(txt)
+
+  // Open the dropdown — use native .click() on the inner .ng-select-container
+  // because ng-select v3+ binds its open handler there, not on the wrapper.
+  // Synthetic dispatchEvent on the wrapper is silently ignored by some Irembo
+  // dropdowns, leaving the panel closed and the 6s option poll wasted.
+  const opener = root.querySelector('.ng-select-container, [role="combobox"]') || root
+  if (typeof opener.click === 'function') opener.click()
+  else root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await wait(120)
+
+  // Poll for options to appear — up to 6 seconds total for slow API responses
+  const optionSelectors = [
+    '.ng-dropdown-panel .ng-option',
+    '[role="listbox"] [role="option"]',
+    '.ng-option',
+    '[role="option"]'
+  ]
+  let visibleOptions = []
+  const maxWaitMs = 6000
+  const stepMs = 300
+  const tries = Math.ceil(maxWaitMs / stepMs)
+
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    // Collect all visible non-placeholder options
+    visibleOptions = Array.from(
+      document.querySelectorAll(optionSelectors.join(', '))
+    ).filter(el => {
+      if (!isVisible(el)) return false
+      const txt = normalizeLabelText(el.textContent || '')
+      return txt && !/^(select|choose|loading|\.\.\.)\b/i.test(txt)
     })
+
+    // Also check scoped options inside the field's own container
+    if (visibleOptions.length === 0) {
+      const scope =
+        root.closest('formly-field, formly-wrapper-form-field, .form-group, .field') ||
+        root.parentElement ||
+        document
+      visibleOptions = Array.from(
+        scope.querySelectorAll('.ng-option, [role="option"]')
+      ).filter(el => {
+        if (!isVisible(el)) return false
+        const txt = normalizeLabelText(el.textContent || '')
+        return txt && !/^(select|choose|loading|\.\.\.)\b/i.test(txt)
+      })
+    }
+
+    if (visibleOptions.length > 0) break
+
+    // If dropdown closed itself (no panel visible), re-open it
+    const panelOpen = document.querySelector(
+      '.ng-dropdown-panel, [role="listbox"]'
+    )
+    if (!panelOpen || !isVisible(panelOpen)) {
+      const reopener = root.querySelector('.ng-select-container, [role="combobox"]') || root
+      if (typeof reopener.click === 'function') reopener.click()
+      else root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(120)
+    }
+
+    await wait(stepMs)
   }
-  if (option) {
+
+  let result = false
+  if (visibleOptions.length === 0) {
+    // Close dropdown cleanly and report failure
+    const escTarget = root.querySelector('input') || root
+    escTarget.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+    )
+    result = false
+  } else {
+    // Pick the first real option
+    const option = visibleOptions[0]
+    option.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }))
     option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
-    await wait(140)
-    return normalizeLabelText(readControlValue(root)) !== normalizeLabelText(before)
+    await wait(200)
+
+    // Confirm something was actually selected
+    const after = readControlValue(root)
+    result =
+      normalizeLabelText(after) !== normalizeLabelText(before) &&
+      Boolean(normalizeLabelText(after))
   }
-  const escTarget = root.querySelector('input') || root
-  escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-  return false
+
+  return result
 }
 
 async function selectIdTypeOptionByNeedle(idTypeTarget, needleNorm) {
@@ -2154,15 +2421,46 @@ async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHi
 
 /** Uses conditionalParentKey.js (same logic as the background worker). */
 function parseConditionalSpec(tc) {
-  const fn = globalThis.qaHelperParseConditionalSpec
-  if (typeof fn !== 'function') return { parentLabel: '', triggerValue: '' }
-  return fn(tc)
+  const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.name || ''}`
+
+  function trimParent(s) {
+    return String(s || '').trim().replace(/\?+$/, '').trim()
+  }
+
+  function normTrigger(raw) {
+    const l = String(raw || '').trim().toLowerCase()
+    if (l === 'yes') return 'Yes'
+    if (l === 'no') return 'No'
+    return String(raw || '').trim()
+  }
+
+  const m1 = text.match(/selecting\s+['"]([^'"]+)['"]\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*,|\s*then\b|\s*$)/i)
+  if (m1) return { parentLabel: trimParent(m1[2]), triggerValue: normTrigger(m1[1]) }
+
+  const m2 = text.match(/after\s+selecting\s+(yes|no)\s+(?:for|on)\s+(.+?)(?:\s*$|\s+and\b|\s+field\b)/i)
+  if (m2) return { parentLabel: trimParent(m2[2]), triggerValue: normTrigger(m2[1]) }
+
+  const m3 = text.match(/when\s+(.+?)\s+is\s+(yes|no)\b/i)
+  if (m3) return { parentLabel: trimParent(m3[1]), triggerValue: normTrigger(m3[2]) }
+
+  const m4 = text.match(/select\s*['"]?\s*(yes|no)\s*['"]?\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*$)/i)
+  if (m4) return { parentLabel: trimParent(m4[2]), triggerValue: normTrigger(m4[1]) }
+
+  const m5 = text.match(/when\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m5) return { parentLabel: trimParent(m5[1]), triggerValue: normTrigger(String(m5[2] || '').trim()) }
+
+  const m6 = text.match(/if\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m6) return { parentLabel: trimParent(m6[1]), triggerValue: normTrigger(String(m6[2] || '').trim()) }
+
+  return { parentLabel: '', triggerValue: '' }
 }
 
 function parentSetupKeyFromTc(tc) {
-  const fn = globalThis.qaHelperParentSetupKey
-  if (typeof fn !== 'function') return ''
-  return String(fn(tc) || '')
+  const spec = parseConditionalSpec(tc)
+  const p = sanitizeSearchLabel(String(spec.parentLabel || '').trim().replace(/\?+$/, '').trim())
+  const t = normalizeText(spec.triggerValue)
+  if (!p || !t) return ''
+  return `${p}::${t}`
 }
 
 function resolveConditionalParentField(spec) {
@@ -2240,8 +2538,8 @@ async function resolveTargetAfterCondition(fieldLabel, fieldName, options = {}) 
       }
     }
   }
-  for (let i = 0; i < 3; i += 1) {
-    await wait(120)
+  for (let i = 0; i < 4; i += 1) {
+    await wait(i < 3 ? 150 : 280)
     target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
     if (
       target.element &&
@@ -2249,6 +2547,22 @@ async function resolveTargetAfterCondition(fieldLabel, fieldName, options = {}) 
       resolvedTargetMatchesLocationStep(fieldLabel, target)
     ) {
       return target
+    }
+    const hintedRadios = findRadiosForLabel(fieldLabel)
+    if (hintedRadios.length > 0 && isVisible(hintedRadios[0])) {
+      return { element: hintedRadios[0], kind: 'radio' }
+    }
+    const hintedDate = findDateInputForLabel(fieldLabel)
+    if (hintedDate && isVisible(hintedDate)) {
+      return { element: hintedDate, kind: 'date' }
+    }
+    const hintedNg = findNgSelectForLabel(fieldLabel)
+    if (
+      hintedNg &&
+      isVisible(hintedNg) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, { element: hintedNg, kind: 'ng-select' })
+    ) {
+      return { element: hintedNg, kind: 'ng-select' }
     }
   }
   const byCascade = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
@@ -2384,8 +2698,14 @@ async function applyAnySelectionStep(fieldLabel, stepText) {
   if (!target?.element) return false
   const kind = target.kind || detectFieldKind(target.element)
   if (kind === 'ng-select') {
+    // Already has a value — skip immediately, no wait. Saves a small amount
+    // per cascade step but more importantly makes the intent obvious:
+    // "filled cascade tier = do nothing".
+    if (!ngSelectRootAppearsUnselected(target.element)) {
+      return true
+    }
     await selectFirstNonEmptyNgSelect(target.element)
-    await wait(380)
+    await wait(700)
     return true
   }
   if (kind === 'radio') {
@@ -2439,6 +2759,13 @@ async function applyValueSelectionStep(fieldLabel, triggerValue, stepText) {
         return lowerTrigger && (val === lowerTrigger || lab === lowerTrigger || val.includes(lowerTrigger) || lab.includes(lowerTrigger))
       })
       if (match) {
+        // Skip the click + 420ms wait when the correct radio is already selected.
+        // Re-clicking an already-checked radio is a no-op for the value but still
+        // fires Angular change events through Formly, which can re-evaluate every
+        // dependent field's visibility expression and churn cascade ng-selects —
+        // costing several seconds per parseAndExecuteSteps call. Mirrors the
+        // .checked signal that isParentRadioAlreadySet uses in executeTestCase.
+        if (match.checked) return true
         match.click()
         dispatchInputEvents(match)
         await wait(420)
@@ -2477,7 +2804,8 @@ async function parseAndExecuteSteps(whatToTest) {
     const step = rawStep.replace(/^[,;:\s-]+/, '').trim()
     if (!step) continue
 
-    const anyOn = step.match(/\bselect\s+any\s+option\s+on\s+(?:the\s+)?(.+?)(?:\s+field\b|\s*$)/i)
+    // Matches "select any option on X" and "select any valid option on X"
+    const anyOn = step.match(/\bselect\s+any\s+(?:valid\s+)?option\s+on\s+(?:the\s+)?(.+?)(?:\s+field\b|\s*$)/i)
     if (anyOn?.[1]) {
       const fieldLabel = normalizeStepFieldLabel(anyOn[1])
       await applyAnySelectionStep(fieldLabel, step)
@@ -2486,8 +2814,13 @@ async function parseAndExecuteSteps(whatToTest) {
 
     const anyField = step.match(/\bselect\s+any\s+(.+?)(?:\s+field\b|\s*$)/i)
     if (anyField?.[1]) {
-      const fieldLabel = normalizeStepFieldLabel(anyField[1])
-      await applyAnySelectionStep(fieldLabel, step)
+      // Strip noise like "valid option on" that bleeds in from unmatched steps
+      const raw = normalizeStepFieldLabel(anyField[1])
+      const fieldLabel = raw
+        .replace(/^valid\s+option\s+on\s+/i, '')
+        .replace(/^option\s+on\s+/i, '')
+        .trim()
+      if (fieldLabel) await applyAnySelectionStep(fieldLabel, step)
       continue
     }
 
@@ -2578,6 +2911,19 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
       if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
       if (handledNgSelectRoots.has(root)) continue
       if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) continue
+      // Skip disabled ng-selects — most commonly cascade children whose parent
+      // hasn't been selected yet. Calling selectFirstNonEmptyNgSelect on them
+      // polls 6s for options that won't load until the parent fires, burning
+      // ~18s/pass on a 3-tier cascade. They get retried on the next pass once
+      // the parent is filled. Not added to handledNgSelectRoots so the retry
+      // can happen.
+      // Use classList (exact-class match) and explicit attribute checks; a
+      // substring scan for "disabled" can over-match unrelated class names.
+      const isDisabled =
+        root.hasAttribute?.('disabled') ||
+        root.getAttribute?.('aria-disabled') === 'true' ||
+        root.classList?.contains('ng-select-disabled') === true
+      if (isDisabled) continue
       handledNgSelectRoots.add(root)
       await selectFirstNonEmptyNgSelect(root)
       continue
@@ -2675,7 +3021,98 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     }
   }
 
-  await wait(350)
+  await wait(120)
+}
+
+function countVisibleEmptyFillableControls() {
+  const controls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
+  const handledRadioGroups = new Set()
+  const handledNgSelectRoots = new Set()
+  let missing = 0
+
+  for (const control of controls) {
+    if (!isVisible(control)) continue
+    const kind = detectFieldKind(control)
+
+    if (kind === 'radio') {
+      const name = String(control.name || '').trim()
+      const key = name || getLabelText(control) || String(control.id || '')
+      if (!key || handledRadioGroups.has(key)) continue
+      handledRadioGroups.add(key)
+      const group = collectRadioGroup(control, name)
+      const anyChecked = group.some(r => r.checked)
+      if (!anyChecked) missing += 1
+      continue
+    }
+
+    if (kind === 'ng-select') {
+      const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
+      if (handledNgSelectRoots.has(root)) continue
+      handledNgSelectRoots.add(root)
+      if (ngSelectRootAppearsUnselected(root)) missing += 1
+      continue
+    }
+
+    if (kind === 'select') {
+      if (control.disabled || control.readOnly) continue
+      if (!String(control.value || '').trim()) missing += 1
+      continue
+    }
+
+    if (control.disabled || control.readOnly) continue
+    const type = String(control.type || '').toLowerCase()
+    if (type === 'hidden' || type === 'file') continue
+    if (type === 'checkbox') {
+      if (!control.checked) missing += 1
+      continue
+    }
+    if (!String(control.value || '').trim()) missing += 1
+  }
+
+  return missing
+}
+
+async function ensureAllVisibleFieldsFilledForSubmit(fillOptions, maxPasses = 4) {
+  let remaining = Infinity
+  let passes = 0
+  for (let i = 0; i < maxPasses; i += 1) {
+    await fillAllFieldsWithValidValues(null, fillOptions)
+    await wait(180)
+    remaining = countVisibleEmptyFillableControls()
+    passes = i + 1
+    if (remaining === 0) break
+  }
+  return { passes, remaining }
+}
+
+/** successful_submit: fill current step, then Continue/Next so later wizard fields mount, repeat (cap), final fill.
+ *
+ * Short-circuits on URL change after every Continue click — once the form has
+ * advanced to a new page (final submit, or wizard navigation), the test is
+ * already a pass; no point burning more fill cycles. */
+async function runSuccessfulSubmitFillSequence(fillOptions, maxWizardSteps = 3) {
+  let lastRemaining = -1
+  let noProgressRounds = 0
+  const urlAtStart = String(location.href || '')
+  for (let step = 0; step < maxWizardSteps; step += 1) {
+    const { remaining } = await ensureAllVisibleFieldsFilledForSubmit(fillOptions, 3)
+    console.log('[QA-submit] wizard step', step + 1, 'remaining empty fields:', remaining)
+    if (remaining === lastRemaining && remaining > 0) noProgressRounds += 1
+    else noProgressRounds = 0
+    lastRemaining = remaining
+    if (noProgressRounds >= 2) break
+
+    const btn = findContinueButton()
+    if (!btn) break
+    scrollTestTargetIntoView(btn)
+    await wait(280)
+    btn.click()
+    await wait(450)
+
+    // Stop the moment Continue actually advanced the form.
+    if (String(location.href || '') !== urlAtStart) return
+  }
+  await ensureAllVisibleFieldsFilledForSubmit(fillOptions, 3)
 }
 
 function collectDiscoveryRequiredErrors() {
@@ -2732,11 +3169,20 @@ async function clickContinueWithoutValidationRead() {
 
 async function requiredFieldRunPreflightStepAB() {
   throwIfCancelled()
+  // Only click Continue if the form has visible empty fields. With state
+  // carrying across tests (skipFormResetAfter: true) and the preflight
+  // re-triggered on every primeAfterNavigation, a fully-filled form would
+  // let preflight Continue advance the page unintentionally — losing the
+  // section the bucketer thinks it's on. Skip the click in that case; we
+  // still capture whatever validation entries are currently visible.
+  if (countVisibleEmptyFillableControls() === 0) {
+    discoveredRequiredErrors = collectDiscoveryRequiredErrors()
+    return
+  }
   await clickContinueWithoutValidationRead()
-  await wait(1500)
+  await wait(500)
   discoveredRequiredErrors = collectDiscoveryRequiredErrors()
-  await fillAllFieldsWithValidValues(null, { manualLike: true, widgetWaitMs: 2400 })
-  await wait(280)
+  await wait(80)
 }
 
 const REQUIRED_FIELD_CONTAINER_MSG_SEL = [
@@ -2814,7 +3260,6 @@ async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
   }
   if (kind === 'ng-select') {
     const ng =
-      findNgSelectForLabel(fieldLabel) ||
       target.closest?.('ng-select, .ng-select, [role="combobox"]') ||
       target
     await selectFirstNonEmptyNgSelect(ng)
@@ -2894,14 +3339,14 @@ async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, fiel
   const clicked = await clickContinueWithoutValidationRead()
   if (!clicked.ok) {
     await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-    await wait(350)
+    await wait(120)
     return { passed: false, message: clicked.error, skipFullResetAfter: true }
   }
-  await wait(1500)
+  await wait(700)
 
   if (detectFormAdvanced(urlBefore, sectionEl)) {
     await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-    await wait(350)
+    await wait(120)
     return {
       passed: false,
       message: 'Form advanced — field was not properly cleared',
@@ -2922,13 +3367,28 @@ async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, fiel
       target,
       String(tc?.what_to_test || '')
     )
-    const msg = (matched || containerEntries.map(e => e.text).join('; ')).trim()
+    let rawDom = matched
+    if (!rawDom) {
+      const best = containerEntries.find(e => {
+        const n = normalizeLabelText(e.text)
+        return !looksAggregatedDiscoveryLine(n) && labelStrongMatch(n, sanitizeSearchLabel(fieldLabel))
+      })
+      rawDom = best ? best.text : ''
+    }
+    if (!rawDom && containerEntries.length === 1) rawDom = containerEntries[0].text
+    const domNorm = normalizeLabelText(rawDom || '')
+    const runNote =
+      rawDom && !looksAggregatedDiscoveryLine(domNorm)
+        ? String(rawDom).trim()
+        : rawDom
+          ? String(rawDom).trim().slice(0, 280)
+          : 'Passed: validation shown for empty field'
     await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-    await wait(350)
+    await wait(120)
     return {
       passed: true,
       message: appendRunStartMappingNote(
-        msg.slice(0, 800) || 'Passed: validation shown for empty field',
+        String(runNote || 'Passed: validation shown for empty field').slice(0, 800),
         preflightLine
       ),
       skipFullResetAfter: true,
@@ -2955,12 +3415,17 @@ async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, fiel
     String(tc?.what_to_test || '')
   )
   if (looseMatched) {
+    const looseNorm = normalizeLabelText(looseMatched || '')
+    const note =
+      looseMatched && !looksAggregatedDiscoveryLine(looseNorm)
+        ? String(looseMatched).trim()
+          : String(looseMatched || '').trim().slice(0, 280) || 'Passed: validation matched for empty field'
     await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-    await wait(350)
+    await wait(120)
     return {
       passed: true,
       message: appendRunStartMappingNote(
-        looseMatched.slice(0, 800) || 'Passed: validation matched for empty field',
+        String(note || 'Passed: validation matched for empty field').slice(0, 800),
         preflightLine
       ),
       skipFullResetAfter: true,
@@ -2970,24 +3435,28 @@ async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, fiel
 
   if (preflightLine) {
     await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-    await wait(350)
+    await wait(120)
+    const shown = String(preflightLine || '').trim()
     return {
       passed: true,
-      message: 'Passed: required validation for this field was already shown during run-start preflight.',
+      message: shown
+        ? shown.slice(0, 800)
+        : 'Passed: required validation for this field was already shown during run-start preflight.',
       skipFullResetAfter: true,
       preflightMapped: true
     }
   }
 
   await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
-  await wait(350)
+  await wait(120)
   const hint =
     discoveredRequiredErrors.length > 0
       ? ` Run-start discovery had ${discoveredRequiredErrors.length} message(s): ${discoveredRequiredErrors.slice(0, 4).join(' | ')}`
       : ''
+  const kindLabel = target?.kind || 'unknown'
   return {
     passed: false,
-    message: `Failed: no validation message in target field container after Continue.${hint}`.slice(0, 900),
+    message: `Failed: "${fieldLabel}" (${kindLabel}) — field was cleared and Continue clicked but no matching validation message appeared. This usually means the field did not register as empty in Angular's model.${hint}`.slice(0, 900),
     skipFullResetAfter: true
   }
 }
@@ -3004,6 +3473,18 @@ function expectsConditionalFieldHidden(tc) {
 
 function shouldStripConditionalClauseForFieldLabel(testType) {
   return testType === 'conditional_display' || testType === 'conditional_field'
+}
+
+function isParentRadioAlreadySet(parentField, triggerValue) {
+  if (!parentField || parentField.type !== 'radio') return false
+  const lowerTrigger = normalizeText(triggerValue)
+  const radios = collectRadioGroup(parentField, parentField.name || '')
+  const match = radios.find(r => {
+    const val = normalizeText(r.value)
+    const label = normalizeText(getLabelText(r) || r.closest('label')?.textContent || '')
+    return val === lowerTrigger || label === lowerTrigger || val.includes(lowerTrigger) || label.includes(lowerTrigger)
+  })
+  return Boolean(match?.checked)
 }
 
 async function executeTestCase(tc, runContext = {}) {
@@ -3090,10 +3571,10 @@ async function executeTestCase(tc, runContext = {}) {
     const conditionalParentField = resolveConditionalParentField(spec)
     const setupKey = parentSetupKeyFromTc(tc)
     conditionalSetupKey = setupKey
-    const skipParentApply = Boolean(
-      setupKey &&
-      String(runContext.previousParentSetupKey || '') === setupKey
-    )
+    // Skip re-clicking the parent if already in correct state.
+    // Re-clicking an already-selected radio on Angular forms re-triggers
+    // change detection which can reset the entire cascade chain.
+    const skipParentApply = isParentRadioAlreadySet(conditionalParentField, spec.triggerValue)
     conditionalTrace = `Condition: ${String(spec.parentLabel || 'unknown').trim() || 'unknown'}=${String(spec.triggerValue || 'unknown').trim() || 'unknown'}${skipParentApply ? ' [same parent — batch]' : ''}`
 
     if (!skipParentApply) {
@@ -3115,7 +3596,7 @@ async function executeTestCase(tc, runContext = {}) {
           parentSetupKey: setupKey
         }
       }
-      await wait(320)
+      await wait(150)
     } else {
       await wait(70)
     }
@@ -3127,32 +3608,56 @@ async function executeTestCase(tc, runContext = {}) {
     const rwandaYesLocation =
       normalizeText(spec.triggerValue) === 'yes' && /\b(district|sector|cell|village)\b/.test(locNorm)
 
-    const settled = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
-    const quickReady =
-      settled.element &&
-      isVisible(settled.element) &&
-      resolvedTargetMatchesLocationStep(fieldLabel, settled)
+    // Visibility-only conditional tests (Required: N/A, not "stays hidden") only need
+    // the field to be visible. parseAndExecuteSteps already applied the SRD prerequisites,
+    // so the cascade-fill trio below — resolveWithCascadeChain / resolveTargetAfterCondition
+    // / resolveConditionalRequiredWithCascadeLoop — is dead work here (those loops exist
+    // to make fields fillable, not visible) and is the main source of multi-minute hangs.
+    const isVisibilityOnlyTest =
+      /required\s*:\s*n\/a/i.test(String(tc?.expected_result || '')) &&
+      !expectsConditionalFieldHidden(tc)
 
-    if (quickReady) {
-      target = settled
-    } else {
-      const chainTarget = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
-      if (chainTarget.element && isVisible(chainTarget.element)) {
-        target = chainTarget
+    if (isVisibilityOnlyTest) {
+      let probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
+      for (let i = 0; i < 5; i += 1) {
+        if (
+          probed?.element &&
+          isVisible(probed.element) &&
+          resolvedTargetMatchesLocationStep(fieldLabel, probed)
+        ) break
+        await wait(200)
+        probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
       }
-      const afterConditionTarget = await resolveTargetAfterCondition(fieldLabel, fieldName, {
-        rwandaYesLocation,
-        contextHint: ctxHint
-      })
-      if (afterConditionTarget.element && isVisible(afterConditionTarget.element)) {
-        target = afterConditionTarget
-      } else if (!target.element) {
-        target = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+      if (probed?.element && isVisible(probed.element)) target = probed
+    } else {
+      const settled = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+      const quickReady =
+        settled.element &&
+        isVisible(settled.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, settled)
+
+      if (quickReady) {
+        target = settled
+      } else {
+        const chainTarget = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+        if (chainTarget.element && isVisible(chainTarget.element)) {
+          target = chainTarget
+        }
+        const afterConditionTarget = await resolveTargetAfterCondition(fieldLabel, fieldName, {
+          rwandaYesLocation,
+          contextHint: ctxHint
+        })
+        if (afterConditionTarget.element && isVisible(afterConditionTarget.element)) {
+          target = afterConditionTarget
+        } else if (!target.element) {
+          target = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+        }
       }
     }
     const expectsHiddenForCascade = expectsConditionalFieldHidden(tc)
     if (
       !expectsHiddenForCascade &&
+      !isVisibilityOnlyTest &&
       (!target?.element || !isVisible(target.element))
     ) {
       const deep = await resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, ctxHint)
@@ -3167,7 +3672,11 @@ async function executeTestCase(tc, runContext = {}) {
     }
     conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
     // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
-  } else if (executableTypes.has(testType) && !(testType === 'required_field' && requiredFieldRunPreflightDone)) {
+  } else if (
+    executableTypes.has(testType) &&
+    !isConditionalFieldTestType(testType) &&
+    !(testType === 'required_field' && requiredFieldRunPreflightDone)
+  ) {
     await fillAllFieldsWithValidValues(target, {
       manualLike: true,
       deferCascadeChains: locCascadeHint
@@ -3175,7 +3684,18 @@ async function executeTestCase(tc, runContext = {}) {
   }
 
   let field = target.element
-  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType)) {
+  const isConditionalType = isConditionalFieldTestType(testType)
+  const sameConditionalBatch =
+    isConditionalType &&
+    Boolean(conditionalSetupKey) &&
+    String(runContext.previousParentSetupKey || '') === String(conditionalSetupKey)
+  // User preference: only successful_submit should be allowed to auto-continue sections.
+  const allowAutoContinueForTargetResolution = testType === 'successful_submit'
+  const shouldRunSectionPrefillFallback =
+    allowAutoContinueForTargetResolution &&
+    ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType) &&
+    !(sameConditionalBatch && isConditionalType)
+  if (!field && shouldRunSectionPrefillFallback) {
     const expectsHiddenPrefill = expectsConditionalFieldHidden(tc)
     const prefillMax =
       isConditionalFieldTestType(testType) && expectsHiddenPrefill ? 2 : locCascadeHint ? 3 : 4
@@ -3204,7 +3724,7 @@ async function executeTestCase(tc, runContext = {}) {
       ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
     }
   }
-  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType)) {
+  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display'].includes(testType)) {
     return {
       passed: false,
       message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page`,
@@ -3251,23 +3771,49 @@ async function executeTestCase(tc, runContext = {}) {
       String(tc?.what_to_test || '')
     )
     if (!clicked.ok) return { passed: false, message: clicked.error }
-    return { passed: Boolean(clicked.matched), message: clicked.matched || '' }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — field did not block submit. Subsequent tests on this section are unreliable.`
+      }
+    }
+    // Clean up: restore a valid value so the invalid value used to trigger
+    // format validation doesn't poison subsequent tests (especially
+    // successful_submit, which would otherwise be blocked by this field).
+    try {
+      await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    } catch {
+      // Refill failure is non-fatal — the test result is already determined.
+    }
+    return {
+      passed: Boolean(clicked.matched),
+      message: clicked.matched || '',
+      skipFullResetAfter: true
+    }
   }
 
   if (testType === 'label_check') {
-    const actualLabel = String(getLabelText(field) || '').trim()
-    const actualPlaceholder = String(field?.getAttribute?.('placeholder') || '').trim()
-    const source = String(tc?.expected_result || tc?.what_to_test || '')
-    const expectedLabel = String(source.match(/label:\s*"([^"]*)"/i)?.[1] || '').trim()
-    const expectedPlaceholder = String(source.match(/placeholder:\s*"([^"]*)"/i)?.[1] || '').trim()
-    const labelOk = expectedLabel ? actualLabel === expectedLabel : Boolean(actualLabel)
-    const placeholderOk = expectedPlaceholder ? actualPlaceholder === expectedPlaceholder : true
-    const passed = labelOk && placeholderOk
+    // Field must be present and visible on the page.
+    if (!field || !isVisible(field)) {
+      return { skipped: true, reason: 'field not present' }
+    }
+    // Strip ONLY asterisks and collapse whitespace — applied identically to both sides.
+    const normalizeLabelForCompare = v =>
+      String(v || '').replace(/\*/g, '').replace(/\s+/g, ' ').trim()
+    // Expected label comes from the SRD field label.
+    const expectedLabel = normalizeLabelForCompare(tc?.field_label)
+    if (!expectedLabel) {
+      return { skipped: true, reason: 'no expected label in SRD' }
+    }
+    // Actual visible label (getLabelText falls back to aria-label).
+    const actualLabel = normalizeLabelForCompare(getLabelText(field))
+    // Exact, case-sensitive match. Placeholder is never checked.
+    const passed = actualLabel === expectedLabel
     return {
       passed,
       message: passed
-        ? `Label check passed for ${fieldLabel || fieldName || tc?.name || 'field'}`
-        : `Expected label "${expectedLabel}" and placeholder "${expectedPlaceholder}", got label "${actualLabel}" and placeholder "${actualPlaceholder}"`
+        ? `Label matches: "${actualLabel}"`
+        : `Expected label "${expectedLabel}", got label "${actualLabel}"`
     }
   }
 
@@ -3290,13 +3836,25 @@ async function executeTestCase(tc, runContext = {}) {
       return {
         passed: false,
         message: `Conditional field did not become visible.${conditionalTrace ? ` ${conditionalTrace}` : ''}`.slice(0, 900),
+      }
+    }
+
+    // Visibility-only check — "Displayed: Yes; Required: N/A"
+    // No need to clear the field and check required validation
+    const isVisibilityOnly = /required\s*:\s*n\/a/i.test(String(tc?.expected_result || ''))
+    if (isVisibilityOnly) {
+      await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+      await wait(150)
+      return {
+        passed: true,
+        message: `Field is visible as expected.${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.trim(),
+        skipFullResetAfter: true,
         ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
       }
     }
 
     if (target.kind === 'ng-select') {
-      const ng = findNgSelectForLabel(fieldLabel) || field
-      await clearNgSelectValue(ng)
+      await clearNgSelectValue(field)
     } else if (target.kind === 'date') {
       const dateInput = findDateInputForLabel(fieldLabel) || field
       dateInput.value = ''
@@ -3320,6 +3878,13 @@ async function executeTestCase(tc, runContext = {}) {
         ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
       }
     }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — field did not block submit. Subsequent tests on this section are unreliable.`,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
     const visibleAfter = await getVisibleValidationEntriesWithRetry({ quick: true })
     const strict = pickMatchedMessageForConditionalRequired(
       visibleAfter,
@@ -3327,49 +3892,74 @@ async function executeTestCase(tc, runContext = {}) {
       fieldLabel,
       target
     )
-    const base = strict || ''
     const passed = Boolean(strict)
     const visOk = 'Field shown and is required.'
+    const domStrict = String(strict || '').trim()
+    const passNote =
+      domStrict && !looksAggregatedDiscoveryLine(normalizeLabelText(domStrict))
+        ? domStrict
+        : domStrict
+          ? domStrict.slice(0, 280)
+          : ''
+    const firstVisible = visibleAfter.length ? String(visibleAfter[0].text || '').trim() : ''
+    if (target.kind === 'ng-select') {
+      const ng = field.closest?.('ng-select, .ng-select, [role="combobox"]') || field
+      await selectFirstNonEmptyNgSelect(ng)
+      await wait(800)
+    } else if (target.kind === 'select' || String(field?.tagName || '').toLowerCase() === 'select') {
+      const selectEl = field
+      const option = Array.from(selectEl?.options || []).find(opt => {
+        if (!opt || opt.disabled) return false
+        const value = String(opt.value || '').trim()
+        const txt = normalizeLabelText(opt.textContent || '')
+        if (!value) return false
+        return txt && !/select|choose/.test(txt)
+      })
+      if (option) {
+        selectEl.value = option.value
+        dispatchInputEvents(selectEl)
+        dispatchBlurEvent(selectEl)
+        await wait(90)
+      }
+    }
     return {
       passed,
       message: passed
-        ? `${visOk} ${base}${conditionalTrace ? `${base ? ' | ' : ''}${conditionalTrace}` : ''}`.trim()
-        : `${visOk} Required validation did not match: ${base || 'no matching message'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.slice(0, 900),
+        ? `${visOk} ${passNote || 'Validation matched.'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.trim()
+        : `${visOk} Required validation did not match: ${firstVisible || domStrict || 'no matching message'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.slice(0, 900),
+      skipFullResetAfter: passed,
       ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
     }
   }
 
   if (testType === 'successful_submit') {
-    for (let round = 0; round < 2; round += 1) {
-      await fillAllFieldsWithValidValues(null)
-      await wait(160)
-      const button = findContinueButton()
-      if (!button) break
-      scrollTestTargetIntoView(button)
-      await wait(280)
-      button.click()
-      await wait(550)
+    const submitFillOpts = {
+      manualLike: true,
+      fillEvenIfPopulated: false,
+      widgetWaitMs: 1200,
+      deferCascadeChains: false
     }
-    await fillAllFieldsWithValidValues(null)
-    const finalBtn = findContinueButton()
-    if (finalBtn) {
-      scrollTestTargetIntoView(finalBtn)
-      await wait(280)
-      finalBtn.click()
+    const urlBefore = String(location.href || '')
+    await runSuccessfulSubmitFillSequence(submitFillOpts)
+    await wait(400)
+    const urlAfter = String(location.href || '')
+    if (urlAfter !== urlBefore) {
+      return {
+        passed: true,
+        message: `Form advanced: navigated from ${urlBefore} to ${urlAfter}`.slice(0, 500)
+      }
     }
-    await wait(260)
-    let entries = getVisibleValidationEntries()
-    if (entries.length === 0) {
-      return { passed: true, message: 'Passed: no validation errors after multi-step fill and submit.' }
-    }
-    entries = await getVisibleValidationEntriesWithRetry()
+    let entries = await getVisibleValidationEntriesWithRetry()
     const messages = entries.map(e => String(e.text || '').trim()).filter(Boolean)
-    if (messages.length === 0) {
-      return { passed: true, message: 'Passed: no validation errors after multi-step fill and submit.' }
+    if (messages.length > 0) {
+      const meaningful = messages.filter(m => m.replace(/[\s*•·]/g, '').length > 1)
+      const summary = meaningful.length ? meaningful.join('; ') : messages.join('; ')
+      return { passed: false, message: summary.slice(0, 500) }
     }
-    const meaningful = messages.filter(m => m.replace(/[\s*•·]/g, '').length > 1)
-    const summary = meaningful.length ? meaningful.join('; ') : messages.join('; ') || 'Validation errors still present'
-    return { passed: false, message: summary.slice(0, 500) }
+    return {
+      passed: false,
+      message: 'Section did not advance after fill + Continue click — URL unchanged and no validation entries.'
+    }
   }
 
   if (testType === 'widget_auto_fill') {
@@ -3417,6 +4007,12 @@ async function executeTestCase(tc, runContext = {}) {
       String(tc?.what_to_test || '')
     )
     if (!clicked.ok) return { passed: false, message: clicked.error }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing attachment "${fieldLabel || tc?.name || 'field'}" — file did not block submit. Subsequent tests on this section are unreliable.`
+      }
+    }
     const matched = String(clicked.matched || '').trim()
     return {
       passed: Boolean(matched),
@@ -3457,17 +4053,6 @@ async function resetFormStateAfterTest(targetField) {
     dispatchBlurEvent(el)
   }
 
-  // Keep upcoming required-field tests reliable: ensure no radio remains selected from prior tests.
-  const allRadios = Array.from(document.querySelectorAll('input[type="radio"]')).filter(isVisible)
-  for (const radio of allRadios) {
-    if (!radio.checked) continue
-    radio.checked = false
-    radio.defaultChecked = false
-    radio.removeAttribute?.('checked')
-    dispatchInputEvents(radio)
-    dispatchBlurEvent(radio)
-  }
-
   // Ensure date-picker model values do not leak into the next test.
   const allCustomDateInputs = Array.from(
     document.querySelectorAll('irembogov-custom-date-picker input, irembogov-irembo-date-picker input')
@@ -3476,13 +4061,183 @@ async function resetFormStateAfterTest(targetField) {
     await clearCustomDatePickerValue(input)
   }
 
-  await wait(300)
+  await wait(80)
+}
+
+/**
+ * Section signature — a stable fingerprint of the currently-visible section.
+ * Used by the multi-section bucketer in background.js to detect when clicking
+ * Continue actually advanced the form (Irembo forms stay on the same URL
+ * between sections, so location.href is not a usable signal here).
+ *
+ * Made of three layers, most-stable first:
+ *   1. Visible heading text (h1-h4, formly-group label/title-style nodes).
+ *   2. Visible formly-field DOM ids in source order.
+ *   3. Visible top-level control ids/names in source order (bounded).
+ *
+ * If any of these layers changes after a Continue click, the section is
+ * considered to have advanced.
+ */
+function getSectionSignature() {
+  const parts = []
+  const headingSel = 'h1, h2, h3, h4, formly-group > label, .step-title, .wizard-title, .section-title'
+  for (const h of document.querySelectorAll(headingSel)) {
+    if (!isVisible(h)) continue
+    const txt = String(h.textContent || '').trim()
+    if (txt) parts.push(`H:${txt.slice(0, 80)}`)
+  }
+  for (const f of document.querySelectorAll('formly-field, formly-wrapper-form-field')) {
+    if (!isVisible(f)) continue
+    const id = String(f.id || '').trim()
+    if (id) parts.push(`F:${id}`)
+  }
+  const controlSel = 'ng-select, input, select, textarea'
+  let controlCount = 0
+  for (const c of document.querySelectorAll(controlSel)) {
+    if (controlCount >= 40) break
+    if (!isVisible(c)) continue
+    const key = String(c.id || c.getAttribute?.('name') || '').trim()
+    if (!key) continue
+    parts.push(`C:${key}`)
+    controlCount += 1
+  }
+  return parts.join('|')
+}
+
+/**
+ * Fast read-only check: can this test case be executed on the current section?
+ *
+ *  - successful_submit: always reachable (it operates on Continue/Submit).
+ *  - conditional_field types: parent field must be visible (parent gates the
+ *    cascade; if it's here, the test can apply the trigger and the target
+ *    will then appear).
+ *  - all other types: the target field itself must be visible.
+ *
+ * No cascade walking, no waits — uses the same label resolvers as the test
+ * runner so behaviour stays consistent.
+ */
+function probeFieldVisibility(tc) {
+  const testType = String(tc?.test_type || '').trim()
+  if (testType === 'successful_submit') return true
+
+  if (isConditionalFieldTestType(testType)) {
+    try {
+      const spec = parseConditionalSpec(tc)
+      if (spec?.parentLabel) {
+        const parent = resolveConditionalParentField(spec)
+        return Boolean(parent && isVisible(parent))
+      }
+    } catch {
+      // Fall through to target-field check if spec parsing throws.
+    }
+  }
+
+  const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+  const fieldLabel = sanitizeSearchLabel(
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+  )
+  if (!fieldLabel) return false
+
+  const ng = findNgSelectForLabel(fieldLabel)
+  if (ng && isVisible(ng)) return true
+  const radios = findRadiosForLabel(fieldLabel)
+  if (radios.length > 0 && isVisible(radios[0])) return true
+  const date = findDateInputForLabel(fieldLabel)
+  if (date && isVisible(date)) return true
+
+  const fieldName = String(tc?.field_name || '').trim()
+  if (fieldName) {
+    try {
+      const escaped = fieldName.replace(/[\\"]/g, '\\$&')
+      const byName = document.querySelector(`[name="${escaped}"], [id="${escaped}"]`)
+      if (byName && isVisible(byName)) return true
+    } catch {
+      // Bad selector chars — fall through to label scan.
+    }
+  }
+
+  const needle = String(fieldLabel || '').toLowerCase()
+  if (needle) {
+    const inputs = Array.from(document.querySelectorAll('input, select, textarea'))
+    // Build a (text) candidate list for each visible input. For each input:
+    //   1. Take getLabelText() — the for/id-tied label (strong signal when set).
+    //   2. ALSO read a label element from the closest formly wrapper — Irembo's
+    //      plain text inputs (ID Number, Email Address) often have their visible
+    //      label as a sibling, NOT tied via for/id, so getLabelText returns ''.
+    //   3. Prefer the for/id-tied label; fall back to the wrapper label.
+    const candidates = []
+    for (const input of inputs) {
+      if (!isVisible(input)) continue
+      const directLabel = normalizeLabelText(getLabelText(input) || '')
+      let wrapLabel = ''
+      const wrap = input.closest('formly-field, formly-wrapper-form-field')
+      if (wrap) {
+        const labelEl = wrap.querySelector('label, .form-label, .field-label, formly-label, mat-label')
+        if (labelEl) wrapLabel = normalizeLabelText(labelEl.textContent || '')
+      }
+      const text = directLabel || wrapLabel
+      if (!text) continue
+      candidates.push(text)
+    }
+    // Two-pass match: exact first, then substring fallback. Prevents
+    // "District" matching "Processing District" purely by substring overlap
+    // when a residential "District" field also exists on the page.
+    for (const text of candidates) {
+      if (text === needle) return true
+    }
+    for (const text of candidates) {
+      if (text.includes(needle)) return true
+    }
+  }
+
+  return false
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'QA_HELPER_CANCEL_CURRENT_TEST') {
     cancelCurrentTestRequested = true
     sendResponse({ ok: true })
+    return true
+  }
+  if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {
+    try {
+      const visible = probeFieldVisibility(message?.testCase || {})
+      sendResponse({ ok: true, visible: Boolean(visible) })
+    } catch (err) {
+      // Fail-open so a probe error doesn't strand a test in the deferred pile.
+      sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_ADVANCE_AND_PROBE') {
+    ;(async () => {
+      try {
+        cancelCurrentTestRequested = false
+        const signatureBefore = getSectionSignature()
+        const fillOpts = {
+          manualLike: true,
+          fillEvenIfPopulated: false,
+          widgetWaitMs: 2400,
+          deferCascadeChains: false
+        }
+        await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 4)
+        const clicked = await clickContinueWithoutValidationRead()
+        if (!clicked.ok) {
+          sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false })
+          return
+        }
+        await wait(900)
+        const signatureAfter = getSectionSignature()
+        sendResponse({
+          ok: true,
+          sectionChanged: signatureBefore !== signatureAfter,
+          signatureBeforeLen: signatureBefore.length,
+          signatureAfterLen: signatureAfter.length
+        })
+      } catch (err) {
+        sendResponse({ ok: false, sectionChanged: false, error: String(err?.message || 'Failed to advance section') })
+      }
+    })()
     return true
   }
   if (message?.type === 'QA_HELPER_SCAN_FIELDS') {

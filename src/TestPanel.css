@@ -689,6 +689,7 @@
 
 .summary-passed { color: #155724; }
 .summary-failed { color: #721c24; }
+.summary-skipped { color: #856404; }
 .summary-notrun { color: #666; }
 
 .panel-comparison {
@@ -817,6 +818,11 @@
   background: #fff6f6 !important;
 }
 
+.card-skipped {
+  border-color: #e0c36a !important;
+  background: #fffdf5 !important;
+}
+
 .tc-status {
   font-size: 11px;
   font-weight: bold;
@@ -833,6 +839,11 @@
 .tc-failed {
   background: #f8d7da;
   color: #721c24;
+}
+
+.tc-skipped {
+  background: #fff3cd;
+  color: #856404;
 }
 
 .tc-notrun {

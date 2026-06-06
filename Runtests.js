@@ -57,8 +57,8 @@ async function isOnLoginPage(page) {
 // AI-generated test cases already have a test_type — skip validation for them
 
 async function validateManualTestCase({ name, what_to_test, expected_result }) {
-  const key = process.env.GROQ_API_KEY
-  if (!key) return { valid: false, test_type: 'required_field', reason: 'GROQ_API_KEY not set' }
+  const key = process.env.GOOGLE_API_KEY
+  if (!key) return { valid: false, test_type: 'required_field', reason: 'GOOGLE_API_KEY not set' }
 
   const content = `
 You are a strict QA validator. A tester manually wrote this test case for a registration form:
@@ -810,9 +810,6 @@ async function runTests(projectId, options = {}) {
   const context = page.context()
   const extensionCookies = Array.isArray(options.sessionCookies) ? options.sessionCookies : []
   const targetUrlForSession = String(options.overrideUrl || project.form_url || '').trim()
-  // #region agent log
-  fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:initCookies',message:'Runner received session cookies',data:{targetUrlHost:(()=>{try{return new URL(targetUrlForSession).host}catch{return''}})(),sessionCookiesCount:extensionCookies.length,cookieDomains:Array.from(new Set(extensionCookies.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion
   if (extensionCookies.length > 0 && targetUrlForSession) {
     try {
       const mapped = extensionCookies
@@ -847,15 +844,9 @@ async function runTests(projectId, options = {}) {
         .filter(Boolean)
       if (mapped.length > 0) {
         await context.addCookies(mapped)
-        // #region agent log
-        fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:addCookies',message:'Runner added cookies to browser context',data:{mappedCookiesCount:mapped.length,mappedDomains:Array.from(new Set(mapped.map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
       }
     } catch (err) {
       testLog(`Session cookie import skipped: ${String(err?.message || err)}`)
-      // #region agent log
-      fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H3',location:'Runtests.js:runTests:addCookies:catch',message:'Runner failed to add cookies',data:{error:String(err?.message||err)},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
     }
   }
   const results = []
@@ -948,9 +939,6 @@ async function runTests(projectId, options = {}) {
       }
       hasLoadedOnce = true
       if (index === 0) {
-        // #region agent log
-        fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H4',location:'Runtests.js:runTests:firstNavigation',message:'Runner first loaded URL',data:{currentUrl:page.url()},timestamp:Date.now()})}).catch(()=>{});
-        // #endregion
       }
 
       const scannedRuntimeFields = mapScannedFieldsToRuntime(options.scannedFields || [])
@@ -1610,13 +1598,6 @@ async function runTests(projectId, options = {}) {
   }
 
   await browser.close()
-
-  const skippedRow = (r) => /^skipped:/i.test(String(r.notes || '').trim())
-  const allPassed = results.length > 0 && results.every(r => r.passed || skippedRow(r))
-  const anyFailed = results.some(r => !r.passed && !skippedRow(r))
-  const newStatus = allPassed ? 'Passed' : anyFailed ? 'Failed' : 'In Progress'
-
-  await db.run("UPDATE projects SET status = ?, last_tested = datetime('now') WHERE id = ?", newStatus, projectId)
 
   return results
 }

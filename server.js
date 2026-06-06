@@ -9,9 +9,8 @@ import upload from './multer.js'
 import extractText from './upload.js'
 import generateTestCases, { analyzeFormStructure } from './ai.js'
 import runTests from './Runtests.js'
-import XLSX from 'xlsx'
 import ExcelJS from 'exceljs'
-import bcrypt from 'bcrypt'
+import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { launchChromiumBrowser } from './playwright-launch.js'
 
@@ -271,7 +270,52 @@ function isSkippedRunResultRow(r) {
   return Boolean(r?.skipped) || /^skipped:/i.test(String(r?.notes || '').trim())
 }
 
-async function persistRunResults(projectId, results) {
+/**
+ * Dashboard status from live test_cases rows (single source of truth).
+ * - Not Tested: project has no test cases yet.
+ * - In Progress: there are cases, but none finished yet (all Not Run), or a partial run with no failures so far.
+ * - Failed: at least one case is Failed (even if others are still Not Run).
+ * - Passed: every case is Passed or Skipped (none Failed, none waiting Not Run).
+ */
+async function recomputeProjectStatusFromTestCases(projectId) {
+  await dbReady
+  const row = await db.get(
+    `
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN UPPER(TRIM(COALESCE(status, ''))) IN ('', 'NOT RUN') THEN 1 ELSE 0 END) AS not_run,
+      SUM(CASE WHEN UPPER(TRIM(COALESCE(status, ''))) = 'FAILED' THEN 1 ELSE 0 END) AS failed,
+      SUM(CASE WHEN UPPER(TRIM(COALESCE(status, ''))) IN ('PASSED', 'SKIPPED') THEN 1 ELSE 0 END) AS ok
+    FROM test_cases
+    WHERE project_id = ?
+    `,
+    projectId
+  )
+  const total = Number(row?.total || 0)
+  if (total === 0) {
+    await db.run("UPDATE projects SET status = 'Not Tested' WHERE id = ?", projectId)
+    return
+  }
+
+  const notRun = Number(row?.not_run || 0)
+  const failed = Number(row?.failed || 0)
+  const ok = Number(row?.ok || 0)
+
+  let newStatus
+  if (notRun === total) {
+    newStatus = 'In Progress'
+  } else if (failed > 0) {
+    newStatus = 'Failed'
+  } else if (notRun === 0 && ok === total) {
+    newStatus = 'Passed'
+  } else {
+    newStatus = 'In Progress'
+  }
+
+  await db.run("UPDATE projects SET status = ?, last_tested = datetime('now') WHERE id = ?", newStatus, projectId)
+}
+
+async function persistRunResults(projectId, results, options = {}) {
   const runStartedAt = new Date().toISOString()
   const runFinishedAt = new Date().toISOString()
   const anyRealFailure = results.some(r => !isSkippedRunResultRow(r) && !r.passed)
@@ -315,6 +359,10 @@ async function persistRunResults(projectId, results) {
     )
   }
 
+  if (!options.deferProjectStatusRecompute) {
+    await recomputeProjectStatusFromTestCases(projectId)
+  }
+
   return { runId, projectStatus }
 }
 
@@ -336,6 +384,22 @@ function saveExtensionScreenshot(runId, testCaseId, dataUrl) {
   const fileName = `tc-${testCaseId}-${Date.now()}.${ext}`
   const fullPath = path.join(dir, fileName)
   fs.writeFileSync(fullPath, Buffer.from(m[2], 'base64'))
+  return `/uploads/screenshots/extension/run-${runId}/${fileName}`
+}
+
+/** Async variant — used by the batched upload endpoint so many screenshots
+ * can be written to disk concurrently via Promise.all instead of one fsync
+ * at a time. Returns null on malformed data URL to match the sync helper. */
+async function saveExtensionScreenshotAsync(runId, testCaseId, dataUrl) {
+  const m = String(dataUrl || '').match(/^data:image\/(png|jpeg|jpg);base64,(.+)$/i)
+  if (!m) return null
+  const ext = String(m[1] || 'png').toLowerCase() === 'png' ? 'png' : 'jpg'
+  const baseDir = ensureUploadsBaseDir()
+  const dir = path.join(baseDir, 'screenshots', 'extension', `run-${runId}`)
+  await fs.promises.mkdir(dir, { recursive: true })
+  const fileName = `tc-${testCaseId}-${Date.now()}.${ext}`
+  const fullPath = path.join(dir, fileName)
+  await fs.promises.writeFile(fullPath, Buffer.from(m[2], 'base64'))
   return `/uploads/screenshots/extension/run-${runId}/${fileName}`
 }
 
@@ -395,7 +459,7 @@ async function ensureProjectOwner(req, res) {
 async function ensureTestCaseOwner(req, res) {
   const row = await db.get(
     `
-    SELECT tc.id AS test_case_id, p.user_id
+    SELECT tc.id AS test_case_id, tc.project_id AS project_id, p.user_id
     FROM test_cases tc
     JOIN projects p ON p.id = tc.project_id
     WHERE tc.id = ?
@@ -511,9 +575,6 @@ app.post('/api/extension-scan', requireAuth, async (req, res) => {
     console.log('[extension-scan] URL:', extensionUrl || 'unknown')
     console.log('[extension-scan] projectId:', projectId)
     console.log('[extension-scan] Fields:', safeFields)
-    // #region agent log
-    fetch('http://127.0.0.1:7811/ingest/193ceff3-13cc-4a5d-8fcb-570fabc3b13e',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'64e698'},body:JSON.stringify({sessionId:'64e698',runId:'pre-fix-auth',hypothesisId:'H2',location:'server.js:/api/extension-scan',message:'Received extension scan payload',data:{projectId:Number(projectId),fieldsCount:safeFields.length,sessionCookiesCount:Array.isArray(sessionCookies)?sessionCookies.length:0,sessionCookieDomains:Array.from(new Set((Array.isArray(sessionCookies)?sessionCookies:[]).map(c=>String(c?.domain||'').toLowerCase()).filter(Boolean))).slice(0,20)},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
 
     const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
     extensionScanJobs.set(jobId, {
@@ -914,11 +975,8 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
       )
     }
 
-    // Fix 1: Update project status to In Progress
-    await db.run(
-      "UPDATE projects SET status = 'In Progress', last_tested = datetime('now') WHERE id = ?",
-      req.params.id
-    )
+    // Align project status with new test_cases (typically all Not Run → In Progress).
+    await recomputeProjectStatusFromTestCases(req.params.id)
 
     res.json({ success: true, testCases })
 
@@ -1232,6 +1290,11 @@ app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) 
     const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
+    const skipTypes = String(req.query.skipTypes || '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean)
+
     const rows = await db.all(
       `
       SELECT id, name, test_type, what_to_test, expected_result
@@ -1242,7 +1305,11 @@ app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) 
       req.params.id
     )
 
-    const formatted = rows.map(tc => {
+    const filtered = skipTypes.length > 0
+      ? rows.filter(tc => !skipTypes.includes(String(tc.test_type || '')))
+      : rows
+
+    const formatted = filtered.map(tc => {
       const inferred = inferFieldLabelAndName(tc)
       return {
         id: tc.id,
@@ -1300,34 +1367,59 @@ app.post('/api/projects/:id/extension-run', requireAuth, async (req, res) => {
       screenshotPath: null
     }))
 
-    const { runId } = await persistRunResults(req.params.id, persistPayload)
+    const { runId } = await persistRunResults(req.params.id, persistPayload, {
+      deferProjectStatusRecompute: true
+    })
 
-    for (const result of normalized) {
-      let notes = result.notes
-      let screenshotPath = null
-      if (result.screenshotDataUrl) {
-        screenshotPath = saveExtensionScreenshot(runId, result.id, result.screenshotDataUrl)
-        if (screenshotPath) {
-          notes = `${notes}${notes ? '\n' : ''}Screenshot: ${screenshotPath}`
+    // 1) Save all screenshots to disk in parallel (independent files, no contention).
+    const screenshotResults = await Promise.all(
+      normalized.map(async (result) => {
+        if (!result.screenshotDataUrl) return { result, screenshotPath: null }
+        try {
+          const screenshotPath = await saveExtensionScreenshotAsync(
+            runId,
+            result.id,
+            result.screenshotDataUrl
+          )
+          return { result, screenshotPath }
+        } catch (err) {
+          console.error('extension screenshot save error:', err)
+          return { result, screenshotPath: null }
         }
-      }
+      })
+    )
 
-      const status = result.passed ? 'Passed' : (String(result.notes || '').toLowerCase().startsWith('skipped:') ? 'Skipped' : 'Failed')
-      await db.run(
-        'UPDATE test_cases SET status = ?, notes = ? WHERE id = ?',
-        status,
-        notes,
-        result.id
-      )
-      await db.run(
-        'UPDATE test_run_results SET status = ?, notes = ?, screenshot_path = ? WHERE run_id = ? AND test_case_id = ?',
-        status,
-        notes,
-        screenshotPath,
-        runId,
-        result.id
-      )
-    }
+    // 2) Build the per-row UPDATE payloads off the hot path.
+    const updates = screenshotResults.map(({ result, screenshotPath }) => {
+      const noteWithShot = screenshotPath
+        ? `${result.notes}${result.notes ? '\n' : ''}Screenshot: ${screenshotPath}`
+        : result.notes
+      const status = result.passed
+        ? 'Passed'
+        : String(result.notes || '').toLowerCase().startsWith('skipped:')
+          ? 'Skipped'
+          : 'Failed'
+      return { id: result.id, status, notes: noteWithShot, screenshotPath }
+    })
+
+    // 3) Send every UPDATE as a single atomic batch. Libsql / Turso runs the
+    //    whole batch in one server-side transaction; better-sqlite3 wraps it
+    //    in .transaction(). Either way we get one commit/fsync at the end
+    //    instead of one per statement (the per-statement fsyncs were what
+    //    made this loop take minutes).
+    const batchStmts = updates.flatMap(u => [
+      {
+        sql: 'UPDATE test_cases SET status = ?, notes = ? WHERE id = ?',
+        args: [u.status, u.notes, u.id]
+      },
+      {
+        sql: 'UPDATE test_run_results SET status = ?, notes = ?, screenshot_path = ? WHERE run_id = ? AND test_case_id = ?',
+        args: [u.status, u.notes, u.screenshotPath, runId, u.id]
+      }
+    ])
+    await db.batch(batchStmts)
+
+    await recomputeProjectStatusFromTestCases(req.params.id)
 
     return res.json({ ok: true, runId: Number(runId) })
   } catch (err) {
@@ -1510,7 +1602,9 @@ app.delete('/api/test_cases/:id', requireAuth, async (req, res) => {
     const ownedTestCase = await ensureTestCaseOwner(req, res)
     if (!ownedTestCase) return
 
+    const projectId = Number(ownedTestCase.project_id || 0)
     await db.run('DELETE FROM test_cases WHERE id = ?', req.params.id)
+    if (projectId) await recomputeProjectStatusFromTestCases(projectId)
     res.json({ success: true, message: 'Test case deleted' })
   } catch (err) {
     console.error(err)
@@ -1719,13 +1813,23 @@ app.get('/api/projects/:id/runs/:runId/export.xlsx', requireAuth, async (req, re
       created_at: r.created_at
     }))
 
-    const workbook = XLSX.utils.book_new()
-    const summaryWorksheet = XLSX.utils.json_to_sheet(runSummarySheet)
-    const resultsWorksheet = XLSX.utils.json_to_sheet(resultSheet)
-    XLSX.utils.book_append_sheet(workbook, summaryWorksheet, 'Run Summary')
-    XLSX.utils.book_append_sheet(workbook, resultsWorksheet, 'Test Results')
+    const workbook = new ExcelJS.Workbook()
+    const summaryWs = workbook.addWorksheet('Run Summary')
+    summaryWs.addRow(['key', 'value'])
+    for (const row of runSummarySheet) {
+      summaryWs.addRow([row.key, row.value])
+    }
 
-    const buffer = XLSX.write(workbook, { type: 'buffer', bookType: 'xlsx' })
+    const resultsWs = workbook.addWorksheet('Test Results')
+    if (resultSheet.length > 0) {
+      const columns = Object.keys(resultSheet[0])
+      resultsWs.addRow(columns)
+      for (const row of resultSheet) {
+        resultsWs.addRow(columns.map((c) => row[c]))
+      }
+    }
+
+    const buffer = Buffer.from(await workbook.xlsx.writeBuffer())
     const fileName = `project-${projectId}-run-${runId}.xlsx`
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
@@ -1760,6 +1864,8 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
       expected_result,
       safeTestType
     )
+
+    await recomputeProjectStatusFromTestCases(project_id)
 
     res.json({ success: true, id: result.lastInsertRowid })
 

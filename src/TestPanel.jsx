@@ -6,6 +6,7 @@ function normalizeTestStatus(status) {
   const s = String(status || '').trim().toLowerCase()
   if (s === 'passed') return 'Passed'
   if (s === 'failed') return 'Failed'
+  if (s === 'skipped') return 'Skipped'
   return 'Not Run'
 }
 
@@ -16,7 +17,7 @@ function normalizeTestTypeUi(raw) {
   return t || 'required_field'
 }
 
-function TestPanel({ project, token, onClose }) {
+function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const [testCases, setTestCases] = useState([])
   const [loading, setLoading] = useState(false)
   const [running, setRunning] = useState(false)
@@ -112,6 +113,7 @@ function TestPanel({ project, token, onClose }) {
         return
       }
       await fetchTestCases()
+      await onProjectsNeedRefresh?.()
     } catch {
       alert('Failed to generate test cases')
     } finally {
@@ -133,6 +135,7 @@ function TestPanel({ project, token, onClose }) {
       }
       await fetchTestCases()
       await fetchComparison()
+      await onProjectsNeedRefresh?.()
     } catch {
       alert('Failed to run tests')
     } finally {
@@ -171,12 +174,14 @@ function TestPanel({ project, token, onClose }) {
 
   async function handleDelete(id) {
     try {
-      await fetch(`/api/test_cases/${id}`, {
+      const res = await fetch(`/api/test_cases/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       })
+      if (!res.ok) return
       setConfirmDelete(null)
       await fetchTestCases()
+      await onProjectsNeedRefresh?.()
     } catch (err) {
       console.error('Failed to delete:', err)
     }
@@ -201,6 +206,7 @@ function TestPanel({ project, token, onClose }) {
         setShowAddForm(false)
         setAddError('')
         await fetchTestCases()
+        await onProjectsNeedRefresh?.()
       }
     } catch (err) {
       console.error('Failed to add:', err)
@@ -209,6 +215,7 @@ function TestPanel({ project, token, onClose }) {
 
   const passed = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Passed').length
   const failed = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Failed').length
+  const skipped = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Skipped').length
   const notRun = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Not Run').length
   const hasPreviousRun = Boolean(comparison?.previous_run)
 
@@ -299,6 +306,7 @@ function TestPanel({ project, token, onClose }) {
             <div className="summary-row summary-counts">
               <span className="summary-passed">✓ {passed} passed</span>
               <span className="summary-failed">✗ {failed} failed</span>
+              {skipped > 0 && <span className="summary-skipped">⊘ {skipped} skipped</span>}
               <span className="summary-notrun">○ {notRun} not run</span>
             </div>
           </div>
@@ -427,7 +435,7 @@ function TestPanel({ project, token, onClose }) {
               return (
               <div
                 className={`panel-card ${
-                  st === 'Passed' ? 'card-passed' : st === 'Failed' ? 'card-failed' : ''
+                  st === 'Passed' ? 'card-passed' : st === 'Failed' ? 'card-failed' : st === 'Skipped' ? 'card-skipped' : ''
                 }`}
                 key={tc.id}
               >
@@ -476,10 +484,22 @@ function TestPanel({ project, token, onClose }) {
                       <span className="card-name">{tc.name}</span>
                       <span
                         className={`tc-status ${
-                          st === 'Passed' ? 'tc-passed' : st === 'Failed' ? 'tc-failed' : 'tc-notrun'
+                          st === 'Passed'
+                            ? 'tc-passed'
+                            : st === 'Failed'
+                              ? 'tc-failed'
+                              : st === 'Skipped'
+                                ? 'tc-skipped'
+                                : 'tc-notrun'
                         }`}
                       >
-                        {st === 'Passed' ? '✓ Passed' : st === 'Failed' ? '✗ Failed' : 'Not Run'}
+                        {st === 'Passed'
+                          ? '✓ Passed'
+                          : st === 'Failed'
+                            ? '✗ Failed'
+                            : st === 'Skipped'
+                              ? '⊘ Skipped'
+                              : 'Not Run'}
                       </span>
                       <div className="card-btns">
                         <button className="btn-edit" onClick={() => startEdit(tc)}>Edit</button>

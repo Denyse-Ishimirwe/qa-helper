@@ -27,6 +27,7 @@ function Dashboard({ email, token, onLogout }) {
 
   useEffect(() => {
     fetchProjects()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only load; fetchProjects is stable for this effect
   }, [])
 
   useEffect(() => {
@@ -65,6 +66,11 @@ function Dashboard({ email, token, onLogout }) {
       }
 
       setProjects(data)
+      setSelectedProject(prev => {
+        if (!prev) return null
+        const next = data.find(p => Number(p.id) === Number(prev.id))
+        return next || prev
+      })
     } catch (err) {
       setProjects([])
       setProjectsLoadError("We couldn't load your projects at the moment. Please refresh and try again.")
@@ -291,6 +297,7 @@ function Dashboard({ email, token, onLogout }) {
         <TestPanel
           project={selectedProject}
           token={token}
+          onProjectsNeedRefresh={fetchProjects}
           onClose={() => {
             setSelectedProject(null)
             fetchProjects()
@@ -379,6 +386,8 @@ function Dashboard({ email, token, onLogout }) {
               placeholder="Enter project name"
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !loading) handleCreateProject() }}
+              autoFocus
             />
             <label>Form URL</label>
             <input
@@ -386,6 +395,7 @@ function Dashboard({ email, token, onLogout }) {
               placeholder="https://example.com/form (optional)"
               value={formUrl}
               onChange={(e) => setFormUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !loading) handleCreateProject() }}
             />
             <label>Requirements Document</label>
             <input
@@ -399,6 +409,7 @@ function Dashboard({ email, token, onLogout }) {
               placeholder="https://www.notion.so/..."
               value={notionUrl}
               onChange={(e) => setNotionUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !loading) handleCreateProject() }}
             />
             {error && <p className="error-msg">{error}</p>}
             <div className="modal-buttons">

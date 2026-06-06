@@ -1,10 +1,26 @@
 import 'dotenv/config'
-import bcrypt from 'bcrypt'
+import bcrypt from 'bcryptjs'
 import path from 'node:path'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+/** Dev-only: corporate proxies often break TLS to Turso; opt in via LIBSQL_RELAX_TLS=1 (see .env.example). */
+function applyOptionalDevTursoTlsRelax() {
+  if (process.env.NODE_ENV === 'production') return
+  const on = process.env.LIBSQL_RELAX_TLS === '1' || process.env.TURSO_RELAX_TLS === '1'
+  if (!on) return
+  const hasUrl = Boolean((process.env.LIBSQL_URL || process.env.TURSO_DATABASE_URL || '').trim())
+  if (!hasUrl) return
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+  console.warn(
+    '[qa-helper] LIBSQL_RELAX_TLS=1: TLS verification is disabled for this Node process so Turso can connect. ' +
+      'Use only on trusted dev machines. Prefer NODE_EXTRA_CA_CERTS with your corporate root CA when possible.'
+  )
+}
+
+applyOptionalDevTursoTlsRelax()
 
 function libsqlEnv() {
   const url = (process.env.LIBSQL_URL || process.env.TURSO_DATABASE_URL || '').trim()
@@ -329,7 +345,15 @@ async function initSqlite() {
 
 function isLikelyTursoNetworkFailure(err) {
   const msg = String(err?.message || err?.cause?.message || err || '')
-  return /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|fetch failed|getaddrinfo|ENOTFOUND/i.test(msg)
+  const code = String(err?.code || err?.errno || err?.type || '')
+  if (
+    /UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED_CERT_IN_CHAIN|CERT_HAS_EXPIRED|unable to verify the first certificate/i.test(
+      msg + code
+    )
+  ) {
+    return true
+  }
+  return /ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|fetch failed|getaddrinfo/i.test(msg)
 }
 
 export const dbReady = (async () => {
@@ -351,8 +375,8 @@ export const dbReady = (async () => {
       }
       if (!isLikelyTursoNetworkFailure(err)) throw err
       console.warn(
-        '[qa-helper] Turso host unreachable (e.g. ENOTFOUND). Using local SQLite instead. ' +
-          'Update or remove LIBSQL_URL / TURSO_DATABASE_URL in .env, or create a new DB at https://turso.tech.',
+        '[qa-helper] Turso connection failed (network or TLS). Using local SQLite instead. ' +
+          'Fix corporate proxy/CA (NODE_EXTRA_CA_CERTS), or remove LIBSQL_URL / TURSO_DATABASE_URL in .env for pure local dev.',
         String(err?.message || err).slice(0, 280)
       )
       _turso = null
@@ -402,6 +426,45 @@ const db = {
       return _sqlite.exec(sql)
     }
     await _turso.executeMultiple(sql)
+  },
+
+  /**
+   * Run an array of parametrized statements atomically.
+   * Each item is `{ sql, args }` where `args` is an array (omit / empty for no params).
+   *
+   * Why this exists: BEGIN/COMMIT via db.exec() does NOT work against Turso
+   * because each db call is its own HTTP request — there is no shared
+   * connection holding a transaction open. Libsql exposes a real batch
+   * primitive that runs every statement in a single server-side transaction;
+   * better-sqlite3 exposes the equivalent via `.transaction(fn)`. This method
+   * abstracts both.
+   *
+   * Use this for hot paths that issue many writes (e.g. the extension-run
+   * upload), so SQLite/Turso commits/fsyncs once instead of per-statement.
+   */
+  async batch(statements) {
+    await dbReady
+    const items = Array.isArray(statements) ? statements : []
+    if (items.length === 0) return
+    if (_sqlite) {
+      const prepared = new Map()
+      const tx = _sqlite.transaction((rows) => {
+        for (const row of rows) {
+          let stmt = prepared.get(row.sql)
+          if (!stmt) {
+            stmt = _sqlite.prepare(row.sql)
+            prepared.set(row.sql, stmt)
+          }
+          stmt.run(...(Array.isArray(row.args) ? row.args : []))
+        }
+      })
+      tx(items)
+      return
+    }
+    await _turso.batch(
+      items.map(s => ({ sql: s.sql, args: Array.isArray(s.args) ? s.args : [] })),
+      'write'
+    )
   }
 }
 

@@ -1,15 +1,10 @@
-import Groq from 'groq-sdk'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import 'dotenv/config'
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY)
 
-/** Primary model (large). Override with GROQ_MODEL. */
-const GROQ_PRIMARY_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim()
-/**
- * Used automatically when the primary model returns 429 (e.g. daily token cap).
- * Smaller models have separate limits on Groq. Override with GROQ_FALLBACK_MODEL or set to '' to disable.
- */
-const GROQ_FALLBACK_MODEL = String(process.env.GROQ_FALLBACK_MODEL ?? 'llama-3.1-8b-instant').trim()
+/** Gemini model. Override with GEMINI_MODEL. Exported as GROQ_PRIMARY_MODEL for back-compat. */
+const GROQ_PRIMARY_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.0-flash').trim()
 
 /** Generic head+tail truncation (form JSON, etc.). */
 function trimWithHeadTail(text, maxChars) {
@@ -108,12 +103,23 @@ CONDITIONAL FIELDS (visibility / required-if / display-if — test_type MUST be 
   • Target visible and required when empty: Displayed: Yes; Required: Yes; Validation: "<exact SRD error for empty target>"
   • Target must stay hidden: Displayed: No; Required: N/A (hidden by condition)
   • Visibility-only (assert field shows; no required error in same case): Displayed: Yes; Required: N/A; <short visibility phrase from SRD or "<Label> field appears">
+— DEDUPLICATION RULE: If you are already generating a Required Field Test for a conditional field (Displayed: Yes; Required: Yes), do NOT also generate a Conditional Display Test for the same field and same parent condition. The required test already proves visibility. Only generate a Conditional Display Test when there is NO required test for that field — for example when a field appears but is optional, or when testing that a field stays hidden.
 
-CASCADING DROPDOWNS / ORDERED CHAINS (country→region→district→… or any SRD chain where each level unlocks the next):
-— what_to_test MUST list the chain in SRD order before the final action. One flowing sentence or several short sentences joined with "then".
-— Template: Selecting '<Trigger>' on <RootParent> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, [continue each level], then leave <TargetLabel> field empty — OR end with checking if <TargetLabel> field appears for display-only cases.
-— Include every intermediate level the SRD requires; do not skip "between" fields. Use real labels from the SRD/form JSON for each level.
-— If the target IS deep in the chain (e.g. Village after District→Sector→Cell), still write the full prerequisite chain in what_to_test.
+CASCADING DROPDOWNS / ORDERED CHAINS (any SRD chain where each level unlocks the next):
+— what_to_test MUST list ONLY the steps needed to REACH the target field, then the final action on the target itself.
+— CRITICAL RULE: Only include levels that come BEFORE the target in the chain. The target is the field being tested — it must be the last step (left empty or checked for visibility). Never select the target as an intermediate step.
+— Each level in the chain that comes before the target uses: "then select any valid option on <LevelLabel> field"
+— The target itself uses: "then leave <TargetLabel> field empty" (for required tests) or "then checking if <TargetLabel> field appears" (for display tests)
+— The chain depth comes entirely from the SRD. If the SRD says Level A unlocks Level B which unlocks Level C, then:
+  • Testing Level A: just apply the parent trigger, then act on Level A
+  • Testing Level B: apply trigger, select Level A, then act on Level B
+  • Testing Level C: apply trigger, select Level A, select Level B, then act on Level C
+— This prerequisite chaining rule applies to BOTH conditional outcomes:
+  • Displayed: Yes; Required: N/A (visibility-only)
+  • Displayed: Yes; Required: Yes; Validation: ...
+  If the target is not the first dependent level, what_to_test must include all prior levels before the target.
+— Use the exact field labels from the SRD for every level. Never hardcode form-specific names.
+— Never skip intermediate levels the SRD defines as required prerequisites.
 
 what_to_test — other cases (keep concise when no cascade):
 — Required empty (non-conditional): "Leaving {FieldLabel} field empty"
@@ -135,14 +141,15 @@ General:
 Output schema per element:
 { "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check" }
 
-STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens):
+STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
   {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field"},
   {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field"},
   {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation"},
   {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field"},
-  {"name":"<TargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <TargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <TargetFieldLabel> field appears","test_type":"conditional_field"},
+  {"name":"<OptionalConditionalFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <OptionalConditionalFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalConditionalFieldLabel> field appears","test_type":"conditional_field"},
   {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field"},
+  {"name":"<OptionalDeepTargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then select any valid option on <Level2Label> field, and checking if <OptionalDeepTargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalDeepTargetFieldLabel> field appears","test_type":"conditional_field"},
   {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit"}
 ]`
 
@@ -198,12 +205,12 @@ function humanizeGroqRateLimit(apiMessage) {
   if (m) {
     const mins = parseInt(m[1], 10)
     const secs = Math.min(59, Math.ceil(parseFloat(m[2], 10)))
-    return `Groq rate limit (daily tokens for this model). Try again in about ${mins}m ${secs}s, or retry now using a smaller model: set GROQ_FALLBACK_MODEL (default: llama-3.1-8b-instant). Upgrade: https://console.groq.com/settings/billing`
+    return `Gemini rate limit or quota exceeded. Try again in about ${mins}m ${secs}s, or switch model via GEMINI_MODEL. Check quota: https://aistudio.google.com/`
   }
   if (/try again in/i.test(msg)) {
-    return `Groq rate limit. ${msg.slice(0, 280)}`
+    return `Gemini rate limit. ${msg.slice(0, 280)}`
   }
-  return `Groq rate limit or quota issue. ${msg.slice(0, 280)}`
+  return `Gemini rate limit or quota issue. ${msg.slice(0, 280)}`
 }
 
 function isGroqRequestTooLargeError(err) {
@@ -281,7 +288,7 @@ async function repairResponseToJsonArray(rawText) {
   const completion = await groqChatCompletionsCreate({
     model: GROQ_PRIMARY_MODEL,
     temperature: 0,
-    max_tokens: 8192,
+    max_tokens: 4000,
     messages: [
       {
         role: 'system',
@@ -299,27 +306,45 @@ Keep what_to_test as numbered steps when present. Output ONLY JSON, no markdown.
   return parseJsonArrayOrThrow(repaired)
 }
 
-/** @param {Record<string, unknown>} payload */
+/**
+ * Gemini-backed chat shim. Takes the OpenAI-style payload the rest of this file
+ * builds ({ model?, temperature?, max_tokens?, messages:[{role,content}] }) and
+ * returns the same { choices:[{ message:{ content } }] } shape callers expect.
+ * Kept named groqChatCompletionsCreate for back-compat with existing imports.
+ * @param {Record<string, unknown>} payload
+ */
 async function groqChatCompletionsCreate(payload) {
-  const preferred = (payload.model || GROQ_PRIMARY_MODEL).trim()
-  const fallback = GROQ_FALLBACK_MODEL && GROQ_FALLBACK_MODEL !== preferred ? GROQ_FALLBACK_MODEL : ''
+  const messages = Array.isArray(payload.messages) ? payload.messages : []
+  const systemInstruction =
+    messages.filter(m => m.role === 'system').map(m => String(m.content || '')).join('\n\n').trim()
+  const userText =
+    messages.filter(m => m.role !== 'system').map(m => String(m.content || '')).join('\n\n').trim()
+
+  const generationConfig = {}
+  if (typeof payload.temperature === 'number') generationConfig.temperature = payload.temperature
+  if (Number(payload.max_tokens) > 0) generationConfig.maxOutputTokens = Number(payload.max_tokens)
+
+  const model = genAI.getGenerativeModel({
+    model: (payload.model || GROQ_PRIMARY_MODEL).trim(),
+    ...(systemInstruction ? { systemInstruction } : {}),
+    ...(Object.keys(generationConfig).length ? { generationConfig } : {})
+  })
 
   try {
-    return await groq.chat.completions.create({ ...payload, model: preferred })
+    const result = await model.generateContent(userText)
+    const resp = result?.response
+    const text = typeof resp?.text === 'function' ? resp.text() : ''
+    if (!String(text || '').trim()) {
+      const finishReason = resp?.candidates?.[0]?.finishReason || 'unknown'
+      const usedModel = (payload.model || GROQ_PRIMARY_MODEL).trim()
+      console.error(`[ai] Gemini returned empty text (finishReason=${finishReason}, model=${usedModel})`)
+      throw new Error(`Gemini returned no text (finishReason=${finishReason}). If MAX_TOKENS, the model spent the token budget on internal reasoning — raise max_tokens or use a non-thinking model like gemini-2.0-flash.`)
+    }
+    return { choices: [{ message: { content: String(text) } }] }
   } catch (err) {
-    if (!isGroqRateLimitError(err)) throw err
-    const primaryMsg = groqApiMessage(err)
-    if (!fallback) {
-      throw new Error(humanizeGroqRateLimit(primaryMsg))
-    }
-    try {
-      return await groq.chat.completions.create({ ...payload, model: fallback })
-    } catch (err2) {
-      if (!isGroqRateLimitError(err2)) throw err2
-      throw new Error(
-        `${humanizeGroqRateLimit(groqApiMessage(err2))} (fallback model ${fallback} is also limited.)`
-      )
-    }
+    console.error('[ai] Gemini generateContent failed:', String(err?.message || err))
+    if (isGroqRateLimitError(err)) throw new Error(humanizeGroqRateLimit(groqApiMessage(err)))
+    throw err
   }
 }
 
@@ -522,8 +547,8 @@ async function generateTestCases(srdText, formStructure) {
       Number.isFinite(envMaxSrd) && envMaxSrd >= 4000 ? Math.floor(envMaxSrd) : null
 
     const payloadPlans = [
-      { maxTokens: 4096, srdChars: 32000, structureChars: 8000 },
-      { maxTokens: 4096, srdChars: 26000, structureChars: 6500 },
+      { maxTokens: 4000, srdChars: 32000, structureChars: 8000 },
+      { maxTokens: 4000, srdChars: 26000, structureChars: 6500 },
       { maxTokens: 3072, srdChars: 20000, structureChars: 5500 },
       { maxTokens: 3072, srdChars: 16000, structureChars: 4500 },
       { maxTokens: 2048, srdChars: 12000, structureChars: 4000 },
@@ -584,7 +609,7 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
     }
     const detail = groqApiMessage(lastErr) || String(lastErr?.message || 'unknown')
     throw new Error(
-      `Could not complete generation within Groq limits (payload size or tokens-per-minute). The app already retried with smaller SRD chunks. Options: shorten the SRD text, set GROQ_GENERATE_MAX_SRD_CHARS (e.g. 20000), use a smaller model via GROQ_MODEL / GROQ_FALLBACK_MODEL, wait one minute and retry, or upgrade your Groq tier. Last error: ${detail.slice(
+      `Could not complete generation within Gemini limits (payload size or quota). The app already retried with smaller SRD chunks. Options: shorten the SRD text, set GROQ_GENERATE_MAX_SRD_CHARS (e.g. 20000), switch model via GEMINI_MODEL, wait a moment and retry, or check your Gemini quota at https://aistudio.google.com/. Last error: ${detail.slice(
         0,
         420
       )}`

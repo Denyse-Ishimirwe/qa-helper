@@ -119,7 +119,9 @@ async function migrateSqlite(dbPath) {
   } catch (err) {
     try {
       db.exec('ROLLBACK')
-    } catch {}
+    } catch {
+      /* ignore if no open transaction */
+    }
     throw err
   } finally {
     db.close()

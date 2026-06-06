@@ -1,23 +1,76 @@
-/* global chrome, fetch */
-importScripts('conditionalParentKey.js')
+/* global chrome */
+
 
 function isConditionalChainType(t) {
   const x = String(t || '').trim()
   return x === 'conditional_display' || x === 'conditional_required' || x === 'conditional_field'
 }
 
-function nextCaseContinuesConditionalChain(cur, next) {
+function normalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function sanitizeSearchLabel(value) {
+  return normalizeText(value).replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+function parseConditionalSpec(tc) {
+  const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.name || ''}`
+
+  function trimParent(s) {
+    return String(s || '').trim().replace(/\?+$/, '').trim()
+  }
+
+  function normTrigger(raw) {
+    const l = String(raw || '').trim().toLowerCase()
+    if (l === 'yes') return 'Yes'
+    if (l === 'no') return 'No'
+    return String(raw || '').trim()
+  }
+
+  const m1 = text.match(/selecting\s+['"]([^'"]+)['"]\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*,|\s*then\b|\s*$)/i)
+  if (m1) return { parentLabel: trimParent(m1[2]), triggerValue: normTrigger(m1[1]) }
+
+  const m2 = text.match(/after\s+selecting\s+(yes|no)\s+(?:for|on)\s+(.+?)(?:\s*$|\s+and\b|\s+field\b)/i)
+  if (m2) return { parentLabel: trimParent(m2[2]), triggerValue: normTrigger(m2[1]) }
+
+  const m3 = text.match(/when\s+(.+?)\s+is\s+(yes|no)\b/i)
+  if (m3) return { parentLabel: trimParent(m3[1]), triggerValue: normTrigger(m3[2]) }
+
+  const m4 = text.match(/select\s*['"]?\s*(yes|no)\s*['"]?\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*$)/i)
+  if (m4) return { parentLabel: trimParent(m4[2]), triggerValue: normTrigger(m4[1]) }
+
+  const m5 = text.match(/when\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m5) return { parentLabel: trimParent(m5[1]), triggerValue: normTrigger(String(m5[2] || '').trim()) }
+
+  const m6 = text.match(/if\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m6) return { parentLabel: trimParent(m6[1]), triggerValue: normTrigger(String(m6[2] || '').trim()) }
+
+  return { parentLabel: '', triggerValue: '' }
+}
+
+function parentSetupKeyFromTc(tc) {
+  const spec = parseConditionalSpec(tc)
+  const p = sanitizeSearchLabel(String(spec.parentLabel || '').trim().replace(/\?+$/, '').trim())
+  const t = normalizeText(spec.triggerValue)
+  if (!p || !t) return ''
+  return `${p}::${t}`
+}
+
+function _nextCaseContinuesConditionalChain(cur, next) {
   if (!cur || !next) return false
   const curT = String(cur.test_type || '').trim()
   const nextT = String(next.test_type || '').trim()
   if (!isConditionalChainType(curT) || !isConditionalChainType(nextT)) return false
-  const keyFn = globalThis.qaHelperParentSetupKey
-  if (typeof keyFn !== 'function') return false
-  const k1 = String(keyFn(cur) || '')
-  const k2 = String(keyFn(next) || '')
-  if (!k1 || k1 !== k2) return false
-  // Unified conditional tests clear the target and Continue; never chain on the same parent.
-  return false
+  const k1 = parentSetupKeyFromTc(cur)
+  const k2 = parentSetupKeyFromTc(next)
+  if (k1 && k2 && k1 === k2) return true
+  // Keep state across adjacent conditional tests even when cascade parent shifts
+  // (e.g. District -> Sector -> Cell -> Village).
+  return true
 }
 /** Default cap when test_type is unknown (keep full runs roughly 3–5 minutes for typical suites). */
 const PER_TEST_CASE_TIMEOUT_MS = 3 * 60 * 1000
@@ -30,7 +83,7 @@ function perTestCaseTimeoutMs(tc = {}) {
   return PER_TEST_CASE_TIMEOUT_MS
 }
 
-function shouldRetryAfterSectionAdvance(response) {
+function _shouldRetryAfterSectionAdvance(response) {
   if (!response || !response.ok || response.skipped || response.passed) return false
   const msg = String(response?.message || '').toLowerCase()
   return (
@@ -61,7 +114,7 @@ const RUN_STATE = {
   lastRunTabUrl: ''
 }
 
-let activeRunPromise = null
+let _activeRunPromise = null
 
 function getRunSnapshot() {
   return { ...RUN_STATE }
@@ -112,7 +165,7 @@ function isTransientTabMessageError(msg) {
 async function injectContentIntoTab(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ['config.js', 'conditionalParentKey.js', 'content.js']
+    files: ['config.js', 'content.js']
   })
 }
 
@@ -173,7 +226,7 @@ function sendTabMessageWithTimeout(tabId, payload, timeoutMs = PER_TEST_CASE_TIM
   })
 }
 
-async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId, reusableIdValue }) {
+async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId, reusableIdValue, skipTestTypes = [] }) {
   let startUrl = ''
   try {
     const t = await chrome.tabs.get(tabId)
@@ -200,7 +253,8 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     lastRunTabUrl: startUrl
   })
 
-  const tcRes = await fetch(`${apiBase}/api/projects/${projectId}/extension-test-cases`, {
+  const skipQuery = skipTestTypes.length ? `?skipTypes=${encodeURIComponent(skipTestTypes.join(','))}` : ''
+  const tcRes = await fetch(`${apiBase}/api/projects/${projectId}/extension-test-cases${skipQuery}`, {
     headers: authHeaders(token)
   })
   const tcData = await tcRes.json().catch(() => ({}))
@@ -216,18 +270,61 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   let failed = 0
   let skipped = 0
   let lastConditionalParentSetupKey = ''
+  let activeIndex = 0
 
-  for (let i = 0; i < testCases.length; i += 1) {
-    if (RUN_STATE.cancellationRequested) {
-      break
+  // Multi-section bucketer.
+  // remaining  = tests still waiting to be probed/run on the current section
+  // deferred   = tests whose target/parent field is not on the current section;
+  //              tried again after each Continue-advance to the next section
+  // deferCount = how many sections a given test has been deferred from; capped
+  //              so a hallucinated field doesn't stall the whole run forever
+  const MAX_SECTION_ADVANCES = 8
+  const MAX_DEFERS_PER_TEST = 3
+  let remaining = testCases.slice()
+  let deferred = []
+  const deferCount = new Map()
+  let sectionsAdvanced = 0
+
+  function tcDeferKey(tc) {
+    return String(tc?.id || `${tc?.name || ''}::${tc?.test_type || ''}::${tc?.what_to_test || ''}`)
+  }
+
+  async function probeReachable(tc) {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        { type: 'QA_HELPER_PROBE_FIELD_VISIBLE', testCase: tc },
+        8000
+      )
+      if (!response) return true
+      if (response.ok === false) return true // fail-open on probe error
+      if (response.visible) return true
+      return false
+    } catch {
+      return true // fail-open so probe failures don't strand tests
     }
-    const tc = testCases[i]
-    const current = i + 1
+  }
+
+  async function attemptSectionAdvance() {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        { type: 'QA_HELPER_ADVANCE_AND_PROBE' },
+        90000
+      )
+      return Boolean(response?.ok && response?.sectionChanged)
+    } catch {
+      return false
+    }
+  }
+
+  async function runOneTest(tc) {
+    activeIndex += 1
     const fieldLabel = pickCaseFieldLabel(tc)
     const typeLabel = String(tc?.test_type || 'required_field').trim()
     setRunState({
-      current,
-      message: `Checking field: ${fieldLabel} | Type: ${typeLabel} (${current}/${testCases.length})`
+      current: activeIndex,
+      message: `Checking field: ${fieldLabel} | Type: ${typeLabel} (${activeIndex}/${testCases.length})`
     })
     let runResult
     let tabResponse = null
@@ -237,34 +334,22 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
         setRunState({ contentNeedsReprime: false })
         lastConditionalParentSetupKey = ''
       }
-      const skipFormResetAfter = nextCaseContinuesConditionalChain(tc, testCases[i + 1])
-      let response = null
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        response = await sendTabMessageWithTimeout(
-          tabId,
-          {
-            type: 'QA_HELPER_RUN_TEST_CASE',
-            testCase: tc,
-            isRunStart: i === 0,
-            primeAfterNavigation: prime,
-            previousParentSetupKey: lastConditionalParentSetupKey || undefined,
+      // Keep filled state across in-section tests so cascade values persist.
+      const skipFormResetAfter = true
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        {
+          type: 'QA_HELPER_RUN_TEST_CASE',
+          testCase: tc,
+          isRunStart: results.length === 0,
+          primeAfterNavigation: prime,
+          previousParentSetupKey: lastConditionalParentSetupKey || undefined,
           skipFormResetAfter,
           reusableIdValue: String(reusableIdValue || '')
-          },
-          perTestCaseTimeoutMs(tc)
-        )
-        tabResponse = response
-        if (!shouldRetryAfterSectionAdvance(response)) break
-        if (attempt > 0) break
-        const advanced = await sendTabMessageWithTimeout(
-          tabId,
-          { type: 'QA_HELPER_ADVANCE_SECTION' },
-          20000
-        ).catch(() => ({ ok: false }))
-        if (!advanced?.ok || !advanced?.advanced) break
-        prime = true
-        lastConditionalParentSetupKey = ''
-      }
+        },
+        perTestCaseTimeoutMs(tc)
+      )
+      tabResponse = response
       if (!response?.ok) {
         failed += 1
         runResult = {
@@ -318,35 +403,80 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       lastConditionalParentSetupKey = ''
     }
     results.push(runResult)
-    setRunState({ passed, failed, skipped, message: `Completed ${current}/${testCases.length}` })
-    if (RUN_STATE.cancellationRequested) {
+    setRunState({ passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
+  }
+
+  function failUnreachable(tc, reason) {
+    failed += 1
+    results.push({
+      id: tc.id,
+      name: tc.name,
+      passed: false,
+      notes: `Failed: ${reason}`,
+      screenshotDataUrl: ''
+    })
+    setRunState({ passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
+  }
+
+  while ((remaining.length > 0 || deferred.length > 0) && !RUN_STATE.cancellationRequested) {
+    // 1) Drain everything that's reachable on the current section.
+    while (remaining.length > 0 && !RUN_STATE.cancellationRequested) {
+      const tc = remaining.shift()
+      const reachable = await probeReachable(tc)
+      if (reachable) {
+        await runOneTest(tc)
+      } else {
+        const key = tcDeferKey(tc)
+        const count = (deferCount.get(key) || 0) + 1
+        deferCount.set(key, count)
+        if (count > MAX_DEFERS_PER_TEST) {
+          failUnreachable(
+            tc,
+            `Field never became reachable after ${MAX_DEFERS_PER_TEST} section advances — possibly a stale or hallucinated field name`
+          )
+        } else {
+          deferred.push(tc)
+          setRunState({
+            message: `Deferred ${pickCaseFieldLabel(tc)} — not on current section (${deferred.length} deferred)`
+          })
+        }
+      }
+    }
+
+    if (deferred.length === 0) break
+    if (RUN_STATE.cancellationRequested) break
+    if (sectionsAdvanced >= MAX_SECTION_ADVANCES) {
+      for (const tc of deferred) {
+        failUnreachable(
+          tc,
+          `Field never became reachable — section-advance cap (${MAX_SECTION_ADVANCES}) reached`
+        )
+      }
+      deferred = []
       break
     }
-    const stopAfterSubmit =
-      String(tc?.test_type || '').trim() === 'successful_submit' &&
-      !runResult.skipped &&
-      Boolean(runResult.passed)
-    if (stopAfterSubmit) {
-      const skipNote =
-        'Skipped: successful submit completed earlier in this run — case not executed (results page may differ from the form).'
-      for (let j = i + 1; j < testCases.length; j += 1) {
-        const rest = testCases[j]
-        skipped += 1
-        results.push({
-          id: rest.id,
-          name: rest.name,
-          passed: false,
-          skipped: true,
-          notes: skipNote,
-          screenshotDataUrl: ''
-        })
+
+    // 2) Try to advance to the next section. ADVANCE_AND_PROBE fills any
+    //    remaining visible fields, clicks Continue, and reports whether the
+    //    section signature changed.
+    setRunState({
+      message: `Advancing to next section (${deferred.length} test${deferred.length === 1 ? '' : 's'} deferred)...`
+    })
+    const advanced = await attemptSectionAdvance()
+    if (advanced) {
+      sectionsAdvanced += 1
+      remaining = deferred
+      deferred = []
+      lastConditionalParentSetupKey = ''
+      setRunState({ contentNeedsReprime: true })
+    } else {
+      for (const tc of deferred) {
+        failUnreachable(
+          tc,
+          'Field never became reachable — Continue did not advance the form (likely validation block or last section)'
+        )
       }
-      setRunState({
-        passed,
-        failed,
-        skipped,
-        message: `Submission succeeded — skipped ${testCases.length - current} remaining test(s).`
-      })
+      deferred = []
       break
     }
   }
@@ -392,13 +522,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       apiBase: String(message.apiBase || ''),
       token: String(message.token || ''),
       tabId: Number(message.tabId || 0),
-      reusableIdValue: String(message.reusableIdValue || '').trim()
+      reusableIdValue: String(message.reusableIdValue || '').trim(),
+      skipTestTypes: Array.isArray(message.skipTestTypes) ? message.skipTestTypes : []
     }
     if (!payload.projectId || !payload.apiBase || !payload.token || !payload.tabId || !payload.reusableIdValue) {
       sendResponse({ ok: false, error: 'Missing run configuration (reusable ID is required)' })
       return true
     }
-    activeRunPromise = runExtensionTestsInBackground(payload)
+    _activeRunPromise = runExtensionTestsInBackground(payload)
       .catch(err => {
         setRunState({
           status: 'error',
@@ -408,7 +539,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         })
       })
       .finally(() => {
-        activeRunPromise = null
+        _activeRunPromise = null
       })
     sendResponse({ ok: true, started: true, state: getRunSnapshot() })
     return true
