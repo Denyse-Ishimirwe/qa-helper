@@ -24,6 +24,7 @@ function Dashboard({ email, token, onLogout }) {
   const [openMenu, setOpenMenu] = useState(null)
   const menuRef = useRef(null)
   const [projectsLoadError, setProjectsLoadError] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
 
   const fetchProjects = useCallback(async () => {
     try {
@@ -228,9 +229,30 @@ function Dashboard({ email, token, onLogout }) {
 
   const filters = ['All Projects', 'Not Tested', 'In Progress', 'Passed', 'Failed']
 
-  const filteredProjects = activeFilter === 'All Projects'
+  const statusFilteredProjects = activeFilter === 'All Projects'
     ? projects
     : projects.filter(p => p.status === activeFilter)
+
+  const normalizedSearch = searchQuery.trim().toLowerCase()
+  const filteredProjects = normalizedSearch === ''
+    ? statusFilteredProjects
+    : statusFilteredProjects.filter((project) => {
+        const haystack = [
+          project.name,
+          project.form_url,
+          project.status,
+          project.last_tested,
+          project.srd_import_status === 'pending'
+            ? 'Importing SRD'
+            : project.srd_import_status === 'failed'
+              ? 'SRD import failed'
+              : ''
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase()
+        return haystack.includes(normalizedSearch)
+      })
 
   return (
     <div className="page">
@@ -246,7 +268,29 @@ function Dashboard({ email, token, onLogout }) {
       <div className="content">
 
         <div className="content-top">
-          <h2>Projects</h2>
+          <div className="content-top-left">
+            <h2>Projects</h2>
+            <div className="project-search">
+              <input
+                type="search"
+                className="project-search-input"
+                placeholder="Search projects…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                aria-label="Search projects"
+              />
+              {searchQuery.trim() !== '' && (
+                <button
+                  type="button"
+                  className="project-search-clear"
+                  onClick={() => setSearchQuery('')}
+                  aria-label="Clear search"
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          </div>
           <button className="new-project-btn" onClick={() => setShowModal(true)}>
             + New Project
           </button>
@@ -280,9 +324,11 @@ function Dashboard({ email, token, onLogout }) {
         {filteredProjects.length === 0 ? (
           <div className="empty-state">
             <p>
-              {activeFilter === 'All Projects'
-                ? 'No projects yet. Click New Project to get started.'
-                : `No projects with status "${activeFilter}".`}
+              {normalizedSearch !== ''
+                ? `No projects match "${searchQuery.trim()}".`
+                : activeFilter === 'All Projects'
+                  ? 'No projects yet. Click New Project to get started.'
+                  : `No projects with status "${activeFilter}".`}
             </p>
           </div>
         ) : (
