@@ -1,5 +1,5 @@
 import './Dashboard.css'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import TestPanel from './TestPanel'
 
 function Dashboard({ email, token, onLogout }) {
@@ -25,10 +25,48 @@ function Dashboard({ email, token, onLogout }) {
   const menuRef = useRef(null)
   const [projectsLoadError, setProjectsLoadError] = useState('')
 
+  const fetchProjects = useCallback(async () => {
+    try {
+      setProjectsLoadError('')
+
+      const res = await fetch('/api/projects', {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+
+      if (!res.ok) {
+        throw new Error(`Unable to load projects (HTTP ${res.status})`)
+      }
+
+      const data = await res.json()
+      if (!Array.isArray(data)) {
+        throw new Error('Unexpected response while loading projects')
+      }
+
+      setProjects(data)
+      setSelectedProject(prev => {
+        if (!prev) return null
+        const next = data.find(p => Number(p.id) === Number(prev.id))
+        return next || prev
+      })
+    } catch (err) {
+      setProjects([])
+      setProjectsLoadError("We couldn't load your projects at the moment. Please refresh and try again.")
+      console.error('Failed to load projects:', err)
+    }
+  }, [token])
+
   useEffect(() => {
-    fetchProjects()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only load; fetchProjects is stable for this effect
-  }, [])
+    void fetchProjects()
+  }, [fetchProjects])
+
+  useEffect(() => {
+    const hasPending = projects.some(p => p.srd_import_status === 'pending')
+    if (!hasPending) return undefined
+    const id = setInterval(() => {
+      void fetchProjects()
+    }, 2500)
+    return () => clearInterval(id)
+  }, [projects, fetchProjects])
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -47,36 +85,6 @@ function Dashboard({ email, token, onLogout }) {
     document.addEventListener('mousedown', handleClickOutside)
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [])
-
-  async function fetchProjects() {
-    try {
-      setProjectsLoadError('')
-  
-      const res = await fetch('/api/projects', {
-        headers: { Authorization: `Bearer ${token}` }
-      })
-  
-      if (!res.ok) {
-        throw new Error(`Unable to load projects (HTTP ${res.status})`)
-      }
-  
-      const data = await res.json()
-      if (!Array.isArray(data)) {
-        throw new Error('Unexpected response while loading projects')
-      }
-
-      setProjects(data)
-      setSelectedProject(prev => {
-        if (!prev) return null
-        const next = data.find(p => Number(p.id) === Number(prev.id))
-        return next || prev
-      })
-    } catch (err) {
-      setProjects([])
-      setProjectsLoadError("We couldn't load your projects at the moment. Please refresh and try again.")
-      console.error('Failed to load projects:', err)
-    }
-  }
 
   async function handleCreateProject() {
     if (projectName === '') {
@@ -111,13 +119,29 @@ function Dashboard({ email, token, onLogout }) {
         return
       }
 
-      await fetchProjects()
+      const newId = Number(data.id)
+      if (Number.isFinite(newId) && newId > 0) {
+        const row = {
+          id: newId,
+          name: projectName.trim(),
+          form_url: formUrl.trim(),
+          form_structure: null,
+          status: 'Not Tested',
+          last_tested: 'Never',
+          created_at: new Date().toISOString(),
+          srd_import_status: data.srd_import_status || 'pending',
+          srd_import_error: null
+        }
+        setProjects(prev => [row, ...prev.filter(p => Number(p.id) !== newId)])
+      }
+
       setProjectName('')
       setFormUrl('')
       setNotionUrl('')
       setSrdFile(null)
       setShowModal(false)
 
+      void fetchProjects()
     } catch {
       setError('Failed to create project')
     } finally {
@@ -175,6 +199,15 @@ function Dashboard({ email, token, onLogout }) {
   }
 
   async function handleDelete(id) {
+    const idNum = Number(id)
+    const snapshot = projects
+    const removed = projects.find(p => Number(p.id) === idNum)
+    setProjects(prev => prev.filter(p => Number(p.id) !== idNum))
+    setConfirmDelete(null)
+    if (selectedProject && Number(selectedProject.id) === idNum) {
+      setSelectedProject(null)
+    }
+
     try {
       const res = await fetch(`/api/projects/${id}`, {
         method: 'DELETE',
@@ -184,10 +217,11 @@ function Dashboard({ email, token, onLogout }) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || 'Failed to delete project')
       }
-      await fetchProjects()
-      setConfirmDelete(null)
+      void fetchProjects()
     } catch (err) {
       console.error('Failed to delete project:', err)
+      setProjects(snapshot)
+      if (removed) setConfirmDelete(removed)
       alert(err.message || 'Failed to delete project')
     }
   }
@@ -257,8 +291,25 @@ function Dashboard({ email, token, onLogout }) {
               <span>{project.name}</span>
               <span className="url-cell">{project.form_url || 'Portal / no direct URL'}</span>
               <span>{project.last_tested}</span>
-              <span className={`status-badge ${project.status.toLowerCase().replace(' ', '-')}`}>
-                {project.status}
+              <span
+                className={
+                  project.srd_import_status === 'pending'
+                    ? 'status-badge importing-srd'
+                    : project.srd_import_status === 'failed'
+                      ? 'status-badge import-failed'
+                      : `status-badge ${String(project.status || '').toLowerCase().replace(' ', '-')}`
+                }
+                title={
+                  project.srd_import_status === 'failed'
+                    ? String(project.srd_import_error || '').trim() || 'SRD import failed'
+                    : undefined
+                }
+              >
+                {project.srd_import_status === 'pending'
+                  ? 'Importing SRD…'
+                  : project.srd_import_status === 'failed'
+                    ? 'SRD import failed'
+                    : project.status}
               </span>
               <div className="action-buttons">
                 <button

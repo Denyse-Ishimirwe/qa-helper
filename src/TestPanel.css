@@ -67,6 +67,23 @@
   background: rgba(255, 255, 255, 0.25);
 }
 
+.panel-srd-notice {
+  margin: 0;
+  padding: 12px 24px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #0d3d6b;
+  background: #e8f2fc;
+  border-bottom: 1px solid #c5d9f0;
+  font-family: Arial, sans-serif;
+}
+
+.panel-srd-notice.panel-srd-notice-failed {
+  color: #6b1111;
+  background: #fce8e8;
+  border-bottom-color: #e8b4b4;
+}
+
 .panel-actions {
   display: flex;
   gap: 10px;

@@ -109,6 +109,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
       })
       const data = await res.json()
       if (!res.ok) {
+        if (res.status === 409 && onProjectsNeedRefresh) await onProjectsNeedRefresh()
         alert(data.error || 'Failed to generate test cases')
         return
       }
@@ -173,17 +174,30 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   }
 
   async function handleDelete(id) {
+    const idNum = Number(id)
+    const snapshot = testCases
+    const removed = testCases.find(tc => Number(tc.id) === idNum)
+    setTestCases(prev => prev.filter(tc => Number(tc.id) !== idNum))
+    setConfirmDelete(null)
+
     try {
-      const res = await fetch(`/api/test_cases/${id}`, {
+      const res = await fetch(`/api/test_cases/${idNum}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` }
       })
-      if (!res.ok) return
-      setConfirmDelete(null)
-      await fetchTestCases()
-      await onProjectsNeedRefresh?.()
+      if (!res.ok) {
+        setTestCases(snapshot)
+        if (removed) setConfirmDelete(removed)
+        alert('Could not delete that test case. Please try again.')
+        return
+      }
+      void fetchTestCases()
+      void onProjectsNeedRefresh?.()
     } catch (err) {
       console.error('Failed to delete:', err)
+      setTestCases(snapshot)
+      if (removed) setConfirmDelete(removed)
+      alert('Could not delete that test case. Please try again.')
     }
   }
 
@@ -218,6 +232,11 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const skipped = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Skipped').length
   const notRun = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Not Run').length
   const hasPreviousRun = Boolean(comparison?.previous_run)
+
+  const srdImportStatus = String(project.srd_import_status || 'ready')
+  const srdImportPending = srdImportStatus === 'pending'
+  const srdImportFailed = srdImportStatus === 'failed'
+  const srdBlocksGenerate = srdImportPending || srdImportFailed
 
   async function downloadTestCasesReport() {
     try {
@@ -273,10 +292,25 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
           <button className="panel-close-btn" onClick={onClose}>✕</button>
         </div>
 
+        {srdBlocksGenerate && (
+          <div
+            className={`panel-srd-notice ${srdImportFailed ? 'panel-srd-notice-failed' : ''}`}
+            role="status"
+          >
+            {srdImportPending
+              ? 'Requirements document is importing in the background. Generate unlocks when it finishes (a few seconds for most files).'
+              : `Import failed: ${String(project.srd_import_error || '').trim() || 'Edit the project to upload the SRD again or fix the Notion URL.'}`}
+          </div>
+        )}
+
         <div className="panel-actions">
           {testCases.length === 0 ? (
             <>
-              <button className="panel-generate-btn" onClick={handleGenerate} disabled={loading}>
+              <button
+                className="panel-generate-btn"
+                onClick={handleGenerate}
+                disabled={loading || srdBlocksGenerate}
+              >
                 {loading ? <><span className="btn-spinner" /> Generating...</> : '✦ Generate'}
               </button>
               <button className="panel-add-btn" type="button" onClick={() => setShowAddForm(true)} disabled={loading}>
@@ -288,7 +322,11 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               <button className="panel-run-btn" onClick={handleRun} disabled={running || loading}>
                 {running ? <><span className="btn-spinner" /> Running...</> : '▶ Run Tests'}
               </button>
-              <button className="panel-regenerate-btn" onClick={handleGenerate} disabled={loading || running}>
+              <button
+                className="panel-regenerate-btn"
+                onClick={handleGenerate}
+                disabled={loading || running || srdBlocksGenerate}
+              >
                 {loading ? <><span className="btn-spinner" /> Generating...</> : '↺ Regenerate'}
               </button>
               <button className="panel-add-btn" onClick={() => setShowAddForm(true)} disabled={running}>
@@ -428,7 +466,13 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
 
         <div className="panel-list">
           {testCases.length === 0 && !loading ? (
-            <p className="panel-empty">No test cases yet. Click Generate to get started.</p>
+            <p className="panel-empty">
+              {srdImportPending
+                ? 'No test cases yet. Wait for the requirements document to finish importing, then click Generate.'
+                : srdImportFailed
+                  ? 'No test cases yet. Fix the SRD import (Edit project), then click Generate.'
+                  : 'No test cases yet. Click Generate to get started.'}
+            </p>
           ) : (
             testCases.map((tc, index) => {
               const st = normalizeTestStatus(tc.status)

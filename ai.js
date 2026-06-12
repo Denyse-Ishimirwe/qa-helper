@@ -1,10 +1,21 @@
+import Groq from 'groq-sdk'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import 'dotenv/config'
 
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY)
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+const genAI = process.env.GOOGLE_API_KEY ? new GoogleGenerativeAI(process.env.GOOGLE_API_KEY) : null
 
-/** Gemini model. Override with GEMINI_MODEL. Exported as GROQ_PRIMARY_MODEL for back-compat. */
-const GROQ_PRIMARY_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.0-flash').trim()
+/** Gemini PRIMARY model. Override with GEMINI_MODEL. (2.5-flash is a thinking model — needs a large token budget.) */
+const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim()
+/** Minimum output budget for Gemini so the thinking model does not starve the JSON output. */
+const GEMINI_MIN_OUTPUT_TOKENS = 8192
+/** Groq fallback #1 when Gemini is unavailable. Override with GROQ_MODEL. */
+const GROQ_PRIMARY_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim()
+/**
+ * Groq fallback #2 when llama-3.3-70b is also rate-limited.
+ * Override with GROQ_FALLBACK_MODEL or set to '' to disable.
+ */
+const GROQ_FALLBACK_MODEL = String(process.env.GROQ_FALLBACK_MODEL ?? 'llama-3.1-8b-instant').trim()
 
 /** Generic head+tail truncation (form JSON, etc.). */
 function trimWithHeadTail(text, maxChars) {
@@ -90,11 +101,24 @@ REQUIRED PRODUCT STYLE (follow this layout so tests match the QA template — SR
 Use concise English. Field labels in names and sentences must match the SRD / form (same spelling and capitalization as the form).
 
 name (title pattern):
+— Label check (every labeled field): "{FieldLabel} Label Check Test"
 — Mandatory field empty test: "{FieldLabel} Required Field Test" (use the real label text from the SRD/form JSON, not examples from this prompt)
 — SRD-optional field empty test: "{FieldLabel} Optional Field Test"
 — Single format rule: "{FieldLabel} {RuleShortName} Test"
 — Visibility-only check: "{FieldLabel} Conditional Display Test"
 — Submit: "Successful Submit Test"
+
+LABEL CHECK (generate these FIRST, grouped by section):
+— For EVERY field in the SRD table emit exactly ONE label_check case (test_type: "label_check"), capturing: exact field label, exact placeholder if the SRD specifies one, and the section name from the Block column.
+— expected_result encoding (verbatim spelling/capitalization; segments separated by "; "):
+  • Label only:        "<Label>; section: <Section>"
+  • With placeholder:  "<Label>; placeholder: <Placeholder>; section: <Section>"
+  • Conditional field: "<Label>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>"  (omit "placeholder:" if none)
+— RADIO buttons: capture label and section ONLY — never a placeholder.
+— CONDITIONAL fields: generate ONE case per trigger option (one row per trigger), each with its own "parent: <ParentLabel>=<TriggerValue>".
+— what_to_test MUST be specific, naming section + label (+ placeholder), e.g.:
+  "Checking that the First Name field in the Personal Information section has the label 'First Name' and placeholder 'Enter your first name'".
+— ORDER: group output by section in SRD order; within each section emit that section's label_check cases FIRST, then that section's other test types (Section 1 block, then Section 2 block, …).
 
 CONDITIONAL FIELDS (visibility / required-if / display-if — test_type MUST be conditional_field, never required_field):
 — Whenever the SRD says a field appears, becomes required, or stays hidden based on another field’s value, use conditional_field.
@@ -131,7 +155,7 @@ what_to_test — other cases (keep concise when no cascade):
 expected_result (non-conditional):
 — Prefer exact SRD strings. Optional-field negative test: "No error message". Submit: success wording from SRD.
 
-widget_auto_fill / attachment / label_check: use same concise style; rules still come only from the SRD.
+widget_auto_fill / attachment: use same concise style; rules still come only from the SRD.
 
 General:
 — Never placeholders only ("Required error", "See SRD").
@@ -143,6 +167,9 @@ Output schema per element:
 
 STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>","test_type":"label_check"},
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>","test_type":"label_check"},
+  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check"},
   {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field"},
   {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field"},
   {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation"},
@@ -205,12 +232,12 @@ function humanizeGroqRateLimit(apiMessage) {
   if (m) {
     const mins = parseInt(m[1], 10)
     const secs = Math.min(59, Math.ceil(parseFloat(m[2], 10)))
-    return `Gemini rate limit or quota exceeded. Try again in about ${mins}m ${secs}s, or switch model via GEMINI_MODEL. Check quota: https://aistudio.google.com/`
+    return `Groq rate limit (daily tokens for this model). Try again in about ${mins}m ${secs}s, or retry now using a smaller model: set GROQ_FALLBACK_MODEL (default: llama-3.1-8b-instant). Upgrade: https://console.groq.com/settings/billing`
   }
   if (/try again in/i.test(msg)) {
-    return `Gemini rate limit. ${msg.slice(0, 280)}`
+    return `Groq rate limit. ${msg.slice(0, 280)}`
   }
-  return `Gemini rate limit or quota issue. ${msg.slice(0, 280)}`
+  return `Groq rate limit or quota issue. ${msg.slice(0, 280)}`
 }
 
 function isGroqRequestTooLargeError(err) {
@@ -288,7 +315,7 @@ async function repairResponseToJsonArray(rawText) {
   const completion = await groqChatCompletionsCreate({
     model: GROQ_PRIMARY_MODEL,
     temperature: 0,
-    max_tokens: 4000,
+    max_tokens: 8192,
     messages: [
       {
         role: 'system',
@@ -306,45 +333,76 @@ Keep what_to_test as numbered steps when present. Output ONLY JSON, no markdown.
   return parseJsonArrayOrThrow(repaired)
 }
 
-/**
- * Gemini-backed chat shim. Takes the OpenAI-style payload the rest of this file
- * builds ({ model?, temperature?, max_tokens?, messages:[{role,content}] }) and
- * returns the same { choices:[{ message:{ content } }] } shape callers expect.
- * Kept named groqChatCompletionsCreate for back-compat with existing imports.
- * @param {Record<string, unknown>} payload
- */
-async function groqChatCompletionsCreate(payload) {
+/** Run an OpenAI-style payload through Gemini; returns the same { choices:[{message:{content}}] } shape. */
+async function geminiGenerate(payload) {
+  if (!genAI) throw new Error('Gemini disabled (no GOOGLE_API_KEY)')
   const messages = Array.isArray(payload.messages) ? payload.messages : []
   const systemInstruction =
     messages.filter(m => m.role === 'system').map(m => String(m.content || '')).join('\n\n').trim()
   const userText =
     messages.filter(m => m.role !== 'system').map(m => String(m.content || '')).join('\n\n').trim()
-
-  const generationConfig = {}
+  const generationConfig = {
+    // Thinking models (2.5-flash) spend output tokens on reasoning — force a large
+    // floor so the JSON array is never starved.
+    maxOutputTokens: Math.max(Number(payload.max_tokens) || 0, GEMINI_MIN_OUTPUT_TOKENS)
+  }
   if (typeof payload.temperature === 'number') generationConfig.temperature = payload.temperature
-  if (Number(payload.max_tokens) > 0) generationConfig.maxOutputTokens = Number(payload.max_tokens)
-
   const model = genAI.getGenerativeModel({
-    model: (payload.model || GROQ_PRIMARY_MODEL).trim(),
+    model: GEMINI_MODEL,
     ...(systemInstruction ? { systemInstruction } : {}),
-    ...(Object.keys(generationConfig).length ? { generationConfig } : {})
+    generationConfig
   })
+  const result = await model.generateContent(userText)
+  const text = typeof result?.response?.text === 'function' ? result.response.text() : ''
+  if (!String(text || '').trim()) {
+    const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown'
+    throw new Error(`Gemini returned empty text (finishReason=${finishReason})`)
+  }
+  return { choices: [{ message: { content: String(text) } }] }
+}
 
-  try {
-    const result = await model.generateContent(userText)
-    const resp = result?.response
-    const text = typeof resp?.text === 'function' ? resp.text() : ''
-    if (!String(text || '').trim()) {
-      const finishReason = resp?.candidates?.[0]?.finishReason || 'unknown'
-      const usedModel = (payload.model || GROQ_PRIMARY_MODEL).trim()
-      console.error(`[ai] Gemini returned empty text (finishReason=${finishReason}, model=${usedModel})`)
-      throw new Error(`Gemini returned no text (finishReason=${finishReason}). If MAX_TOKENS, the model spent the token budget on internal reasoning — raise max_tokens or use a non-thinking model like gemini-2.0-flash.`)
+/**
+ * Multi-provider cascade (kept named groqChatCompletionsCreate for back-compat with existing imports):
+ *   1) Gemini (gemini-2.5-flash via GOOGLE_API_KEY)
+ *   2) on any failure → Groq llama-3.3-70b-versatile (GROQ_API_KEY)
+ *   3) on 429 → Groq llama-3.1-8b-instant
+ *   4) all unavailable → clear combined error
+ * @param {Record<string, unknown>} payload
+ */
+async function groqChatCompletionsCreate(payload) {
+  const groqPrimary = (payload.model || GROQ_PRIMARY_MODEL).trim()
+  const groqFallback = GROQ_FALLBACK_MODEL && GROQ_FALLBACK_MODEL !== groqPrimary ? GROQ_FALLBACK_MODEL : ''
+
+  // 1) Gemini primary.
+  if (genAI) {
+    try {
+      return await geminiGenerate(payload)
+    } catch (err) {
+      const why = isGroqRateLimitError(err) ? '429 rate limit' : String(err?.message || err).slice(0, 100)
+      console.warn(`[ai] Gemini unavailable (${why}) — falling back to Groq ${groqPrimary}.`)
     }
-    return { choices: [{ message: { content: String(text) } }] }
+  }
+
+  // 2) Groq llama-3.3-70b-versatile.
+  try {
+    return await groq.chat.completions.create({ ...payload, model: groqPrimary })
   } catch (err) {
-    console.error('[ai] Gemini generateContent failed:', String(err?.message || err))
-    if (isGroqRateLimitError(err)) throw new Error(humanizeGroqRateLimit(groqApiMessage(err)))
-    throw err
+    if (!isGroqRateLimitError(err)) throw err
+    if (!groqFallback) {
+      throw new Error(`Gemini and Groq ${groqPrimary} are both rate-limited. ${humanizeGroqRateLimit(groqApiMessage(err))}`)
+    }
+    console.warn(`[ai] Groq ${groqPrimary} rate-limited — falling back to ${groqFallback}.`)
+    // 3) Groq llama-3.1-8b-instant.
+    try {
+      return await groq.chat.completions.create({ ...payload, model: groqFallback })
+    } catch (err2) {
+      if (!isGroqRateLimitError(err2)) throw err2
+      // 4) Everything rate-limited.
+      throw new Error(
+        `All AI providers are rate-limited (Gemini, Groq ${groqPrimary}, and Groq ${groqFallback}). ` +
+        `Please wait about a minute and click Generate again. ${humanizeGroqRateLimit(groqApiMessage(err2))}`
+      )
+    }
   }
 }
 
@@ -547,8 +605,8 @@ async function generateTestCases(srdText, formStructure) {
       Number.isFinite(envMaxSrd) && envMaxSrd >= 4000 ? Math.floor(envMaxSrd) : null
 
     const payloadPlans = [
-      { maxTokens: 4000, srdChars: 32000, structureChars: 8000 },
-      { maxTokens: 4000, srdChars: 26000, structureChars: 6500 },
+      { maxTokens: 4096, srdChars: 32000, structureChars: 8000 },
+      { maxTokens: 4096, srdChars: 26000, structureChars: 6500 },
       { maxTokens: 3072, srdChars: 20000, structureChars: 5500 },
       { maxTokens: 3072, srdChars: 16000, structureChars: 4500 },
       { maxTokens: 2048, srdChars: 12000, structureChars: 4000 },
@@ -600,9 +658,8 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
-        // A 429 must NEVER trigger the payload-size retry loop — firing more
-        // calls while rate-limited only deepens the limit. Bail out so the
-        // outer handler can do its single 60s-backoff retry.
+        // If every provider is rate-limited, don't fire the payload-size retry
+        // loop — that would re-run the whole Gemini→Groq→Groq cascade up to 8x.
         if (isGroqRateLimitError(err)) throw err
         if (isGroqRequestTooLargeError(err)) {
           if (planIdx + 1 < payloadPlans.length) await sleep(2300)
@@ -613,7 +670,7 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
     }
     const detail = groqApiMessage(lastErr) || String(lastErr?.message || 'unknown')
     throw new Error(
-      `Could not complete generation within Gemini limits (payload size or quota). The app already retried with smaller SRD chunks. Options: shorten the SRD text, set GROQ_GENERATE_MAX_SRD_CHARS (e.g. 20000), switch model via GEMINI_MODEL, wait a moment and retry, or check your Gemini quota at https://aistudio.google.com/. Last error: ${detail.slice(
+      `Could not complete generation within Groq limits (payload size or tokens-per-minute). The app already retried with smaller SRD chunks. Options: shorten the SRD text, set GROQ_GENERATE_MAX_SRD_CHARS (e.g. 20000), use a smaller model via GROQ_MODEL / GROQ_FALLBACK_MODEL, wait one minute and retry, or upgrade your Groq tier. Last error: ${detail.slice(
         0,
         420
       )}`
@@ -624,22 +681,6 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
     const firstPass = await requestOnce()
     return finalizeCases(firstPass)
   } catch (err) {
-    // 429 rate limit: wait 60s and try exactly once more. No tight loop —
-    // hammering a rate-limited endpoint only deepens the limit.
-    if (isGroqRateLimitError(err)) {
-      console.error('[ai] Gemini 429 rate limit — waiting 60s before a single retry.')
-      await sleep(60000)
-      try {
-        const retried = await requestOnce()
-        return finalizeCases(retried)
-      } catch (err2) {
-        if (isGroqRateLimitError(err2)) {
-          throw new Error('Gemini is still rate-limited after waiting 60 seconds. Please wait a minute and click Generate again. (Free-tier limit reached.)')
-        }
-        throw err2
-      }
-    }
-
     // Retry once for transient network/API failures.
     const msg = String(err?.message || '')
     const code = String(err?.cause?.code || '')
@@ -747,7 +788,9 @@ async function analyzeFormStructure(fields) {
             ${JSON.stringify(fields)}
 
             Analyse these fields and return a JSON object describing the form structure:
-            { "fields": [{ "id": "", "name": "", "label": "", "type": "", "required": false, "selector": "" }], "submitButton": { "id": "", "selector": "" } }.
+            { "fields": [{ "id": "", "name": "", "label": "", "type": "", "required": false, "selector": "", "errorSelector": "", "formatErrorSelector": "", "optional": false }], "submitButton": { "id": "", "selector": "" }, "successSelector": "" }.
+            successSelector: optional single CSS selector for a visible success confirmation after submit (toast, alert, banner). Omit or use "" if unknown.
+            errorSelector / formatErrorSelector: optional per-field CSS selectors for validation messages when inferable from the field list; otherwise omit or "".
             Use this to help generate intelligent test cases.
             Return JSON only.
           `
@@ -760,22 +803,31 @@ async function analyzeFormStructure(fields) {
     const parsed = JSON.parse(cleaned)
 
     const fieldsArray = Array.isArray(parsed?.fields) ? parsed.fields : []
-    const safeFields = fieldsArray.map((f, idx) => ({
-      id: String(f?.id || '').trim(),
-      name: String(f?.name || '').trim(),
-      label: String(f?.label || '').trim(),
-      type: String(f?.type || 'text').trim().toLowerCase() || 'text',
-      required: Boolean(f?.required),
-      selector: String(
-        f?.selector || (f?.id ? `#${String(f.id || '').trim()}` : '')
-      ).trim() || `field_${idx}`
-    }))
+    const safeFields = fieldsArray.map((f, idx) => {
+      const row = {
+        id: String(f?.id || '').trim(),
+        name: String(f?.name || '').trim(),
+        label: String(f?.label || '').trim(),
+        type: String(f?.type || 'text').trim().toLowerCase() || 'text',
+        required: Boolean(f?.required),
+        selector: String(
+          f?.selector || (f?.id ? `#${String(f.id || '').trim()}` : '')
+        ).trim() || `field_${idx}`
+      }
+      const err = String(f?.errorSelector || '').trim()
+      const fmt = String(f?.formatErrorSelector || '').trim()
+      if (err) row.errorSelector = err
+      if (fmt) row.formatErrorSelector = fmt
+      if (f?.optional === true) row.optional = true
+      return row
+    })
     const submitButton = {
       id: String(parsed?.submitButton?.id || '').trim(),
       selector: String(parsed?.submitButton?.selector || '').trim()
     }
+    const successSelector = String(parsed?.successSelector || '').trim()
 
-    return { fields: safeFields, submitButton }
+    return { fields: safeFields, submitButton, ...(successSelector ? { successSelector } : {}) }
   }
 
   try {

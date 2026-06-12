@@ -1,8 +1,8 @@
 /* global chrome */
 /**
- * In-page test runner — works across Irembo / ngx-formly style apps, not one static form.
- * Strategy: (1) resolve by Formly id model key when `field_name` matches; (2) label + optional
- * test-name context, with generic synonyms (cascades, nationality); (3) DOM-kind detection
+ * In-page test runner — ngx-formly / complex portals first-class; also falls back to generic
+ * label + selector resolution. Strategy: (1) resolve by Formly id model key when `field_name` matches;
+ * (2) label + optional test-name context, with generic synonyms (cascades, nationality); (3) DOM-kind detection
  * (radio, ng-select, date hosts); (4) conditional triggers from natural-language when/if/select
  * (parsed parent + value — not hardcoded to one country or contract label).
  */
@@ -91,6 +91,28 @@ function getLabelText(el) {
   const aria = el.getAttribute('aria-label')
   if (aria?.trim()) return aria.trim()
   return ''
+}
+
+/** Field's QUESTION label (for label_check). For radios this is the GROUP
+ *  question, not the selected option. Reads the Irembo formly wrapper label,
+ *  then label[for]/aria-label. Generic — DOM structure only, no field names. */
+function getFieldQuestionLabel(el) {
+  if (!el) return ''
+  const wrapper = el.closest?.('formly-field, formly-wrapper-form-field')
+  const wrapLabel = wrapper?.querySelector('label.form-label, .field-label, legend')
+  if (wrapLabel?.textContent?.trim()) return wrapLabel.textContent.trim()
+  const type = String(el.getAttribute?.('type') || el.type || '').toLowerCase()
+  if (type !== 'radio') {                       // radios never fall back to a per-option <label>
+    const id = el.id
+    if (id) {
+      const byFor = document.querySelector(`label[for="${id}"]`)
+      if (byFor?.textContent?.trim()) return byFor.textContent.trim()
+    }
+    const wrapped = el.closest('label')
+    if (wrapped?.textContent?.trim()) return wrapped.textContent.trim()
+  }
+  const aria = el.getAttribute?.('aria-label')
+  return aria?.trim() || ''
 }
 
 function hasRequiredAsterisk(el, labelText) {
@@ -1846,22 +1868,44 @@ async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targ
 
 function getInvalidValueForFormat(tc) {
   const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
-  if (text.includes('16 digits') || text.includes('national id')) return '12345'
-  if (text.includes('10 digits') || text.includes('nin')) return '123'
-  if (text.includes('8 digits') || text.includes('application number')) return '12'
-  if (text.includes('email')) return 'notanemail'
-  if (text.includes('phone')) return 'abc'
-  if (text.includes('under 18') || text.includes('below 18') || text.includes('age')) {
+
+  // Age / DOB minimum (e.g. "minimum 18 years", "must be 18 or older") → too-young date (10 years ago).
+  const isAgeRule =
+    /\bdate of birth\b|\bdob\b|\bage\b/.test(text) ||
+    /\d{1,3}\s*(?:years?|yrs?)\s*(?:or older|and above|old|of age)/.test(text) ||
+    /(?:older than|at least|minimum|min\.?|over)\s*\d{1,3}\s*(?:years?|yrs?)/.test(text) ||
+    /\b\d{1,3}\s*(?:or older|and above|or above)\b/.test(text)
+  if (isAgeRule) {
     const d = new Date()
-    d.setFullYear(d.getFullYear() - 17)
+    d.setFullYear(d.getFullYear() - 10)
     return d.toISOString().slice(0, 10)
   }
-  if (text.includes('150') || text.includes('greater than') || text.includes('too old')) {
-    const d = new Date()
-    d.setFullYear(d.getFullYear() - 151)
-    return d.toISOString().slice(0, 10)
+
+  // "maximum N characters" → a string longer than N.
+  const maxChars = text.match(/(?:max(?:imum)?|no more than|at most|up to|not exceed(?:ing)?)\s*(\d+)\s*(?:characters?|chars?|letters?|digits?)/)
+  if (maxChars) return 'A'.repeat(Number(maxChars[1]) + 5)
+
+  // "letters only" / "no numbers" → enter digits.
+  if (/letters?\s*only|alphabetic|alphabetical|only\s*letters?|no\s*(?:numbers?|digits?)/.test(text)) return '12345'
+
+  // "numbers only" / "no letters" → enter letters.
+  if (/numbers?\s*only|numeric\s*only|digits?\s*only|only\s*(?:numbers?|digits?)|no\s*letters?/.test(text)) return 'abcdef'
+
+  // "N digits" (e.g. "must be 10 digits") → too short.
+  const digitCount = text.match(/(\d+)\s*digits?/)
+  if (digitCount) {
+    const n = Number(digitCount[1])
+    return '1'.repeat(Math.max(1, Math.min(3, n - 1)))
   }
-  return '!!!invalid!!!'
+
+  // Email.
+  if (/valid\s*email|email\s*format|e-?mail/.test(text)) return 'notanemail'
+
+  // Phone.
+  if (/phone|mobile|tel(?:ephone)?/.test(text)) return 'abcdef'
+
+  // Fallback — letters + numbers + symbols to break most rules.
+  return 'INVALID123!@#'
 }
 
 function detectAttachmentCaseKind(tc) {
@@ -3487,6 +3531,38 @@ function isParentRadioAlreadySet(parentField, triggerValue) {
   return Boolean(match?.checked)
 }
 
+// [Phase 2] Tracks the parent a conditional label_check set, so it can be reset
+// to empty once the label_check batch for that parent ends.
+let pendingConditionalLabelParent = null
+
+/** Reset a conditional parent field (radio / ng-select / input) back to empty. */
+async function clearConditionalParent(p) {
+  if (!p?.label) return
+  const field = resolveConditionalParentField({ parentLabel: p.label, triggerValue: '' })
+  if (!field) return
+  if (String(field.type || '').toLowerCase() === 'radio') {
+    forceClearRadioGroupSelection(field)
+  } else {
+    const root = field.closest?.('ng-select, .ng-select, [role="combobox"]')
+    if (root) await clearNgSelectValue(root)
+    else clearFieldValue(field)
+  }
+}
+
+/** Section/block name = text of the nearest visible <h1 class="section-title"> that precedes this field. */
+function getFieldSectionName(el) {
+  if (!el) return ''
+  const titles = Array.from(document.querySelectorAll('h1.section-title')).filter(isVisible)
+  let best = ''
+  for (const t of titles) {
+    // keep the last title that appears BEFORE el in document order
+    if (t.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      best = String(t.textContent || '').trim()
+    }
+  }
+  return best
+}
+
 async function executeTestCase(tc, runContext = {}) {
   throwIfCancelled()
   updateLiveRunIndicator(tc, null, 'Preparing')
@@ -3501,6 +3577,81 @@ async function executeTestCase(tc, runContext = {}) {
   let conditionalSetupKey = ''
 
   await expandCollapsedSectionsOnce()
+
+  // [Phase 2] Once we leave the conditional label_check batch (the next test is
+  // no longer a label_check), reset the parent that label_check left set.
+  if (pendingConditionalLabelParent && testType !== 'label_check') {
+    await clearConditionalParent(pendingConditionalLabelParent)
+    pendingConditionalLabelParent = null
+  }
+
+  // label_check is read-only EXCEPT conditional fields, where it sets the parent
+  // to the trigger to reveal the child (and resets the parent after the last
+  // option). No preflight, no fill, no Continue.
+  if (testType === 'label_check') {
+    const exp = String(tc?.expected_result || '')
+    const norm = v => String(v || '').replace(/\*/g, '').replace(/\s+/g, ' ').trim()
+    const expectedLabel = norm(tc?.field_label)
+    const expectedPlaceholder = norm((exp.match(/;\s*placeholder\s*:\s*([^;]+)/i) || [])[1] || '')
+    const expectedSection = norm((exp.match(/;\s*section\s*:\s*([^;]+)/i) || [])[1] || '')
+    const parentM = exp.match(/;\s*parent\s*:\s*([^;=]+?)\s*=\s*([^;]+?)\s*$/i)
+    const parentLabel = parentM ? norm(parentM[1]) : ''
+    const parentTrigger = parentM ? String(parentM[2]).trim() : ''
+
+    // Conditional: set the parent to this trigger so the child becomes visible.
+    if (parentLabel && parentTrigger) {
+      if (pendingConditionalLabelParent && pendingConditionalLabelParent.label !== parentLabel) {
+        await clearConditionalParent(pendingConditionalLabelParent)
+        pendingConditionalLabelParent = null
+      }
+      const parentField = resolveConditionalParentField({ parentLabel, triggerValue: parentTrigger })
+      if (!parentField || !isVisible(parentField)) {
+        return { passed: false, message: `Field ${expectedLabel || fieldLabel || tc?.name || 'field'} not found on page` }
+      }
+      if (!isParentRadioAlreadySet(parentField, parentTrigger)) {
+        if (!setParentConditionalValue(parentField, parentTrigger)) applyConditionalDomFallback(parentLabel, parentTrigger)
+      }
+      await wait(400)
+      pendingConditionalLabelParent = { label: parentLabel }
+    }
+
+    const lcTarget = resolveFieldTarget(fieldLabel, fieldName)
+    const lcField = lcTarget?.element
+    if (!lcField || !isVisible(lcField)) {
+      return { passed: false, message: `Field ${expectedLabel || fieldLabel || tc?.name || 'field'} not found on page` }
+    }
+    scrollTestTargetIntoView(lcField)
+    updateLiveRunIndicator(tc, lcField, 'Reading label')
+    if (!expectedLabel) {
+      return { skipped: true, reason: 'no expected label in SRD' }
+    }
+
+    // 1) Label — exact, case-sensitive. Uses the field QUESTION label (group
+    //    label for radios; formly wrapper label for ng-select/date/plain inputs).
+    const actualLabel = norm(getFieldQuestionLabel(lcField))
+    if (actualLabel !== expectedLabel) {
+      return { passed: false, message: `Expected label ${expectedLabel} got label ${actualLabel}` }
+    }
+    // 2) Placeholder — exact; skipped for radio buttons.
+    if (expectedPlaceholder && lcTarget.kind !== 'radio') {
+      const actualPlaceholder = norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
+      if (actualPlaceholder !== expectedPlaceholder) {
+        return { passed: false, message: `Expected placeholder ${expectedPlaceholder} got placeholder ${actualPlaceholder}` }
+      }
+    }
+    // 3) Section — field must sit under the correct visible section heading.
+    if (expectedSection) {
+      const actualSection = norm(getFieldSectionName(lcField))
+      if (actualSection !== expectedSection) {
+        return { passed: false, message: `Expected section ${expectedSection} found in section ${actualSection || '(none)'}` }
+      }
+    }
+    return {
+      passed: true,
+      message: `Label "${actualLabel}"${expectedPlaceholder ? `, placeholder "${expectedPlaceholder}"` : ''}${expectedSection ? `, section "${expectedSection}"` : ''} all match`
+    }
+  }
+
   const deferWhatToTestSteps = isConditionalFieldTestType(testType)
   if (!deferWhatToTestSteps) {
     await parseAndExecuteSteps(tc?.what_to_test)
@@ -3525,8 +3676,7 @@ async function executeTestCase(tc, runContext = {}) {
     'conditional_field',
     'conditional_required',
     'conditional_display',
-    'successful_submit',
-    'label_check'
+    'successful_submit'
   ])
   await maybePrepareIdTypeFromWhatToTest(tc)
   const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
@@ -3746,24 +3896,37 @@ async function executeTestCase(tc, runContext = {}) {
     if (field.disabled || field.readOnly) {
       return { skipped: true, reason: 'field is disabled — auto-filled by widget' }
     }
-    if (target.kind === 'ng-select') {
-      const ng = findNgSelectForLabel(fieldLabel) || field
-      await clearNgSelectValue(ng)
-    } else if (target.kind === 'date') {
+    // Fix 4: format validation is not meaningful for dropdowns — there is no free text to make "invalid".
+    if (target.kind === 'ng-select' || target.kind === 'select') {
+      return { skipped: true, reason: 'format validation not applicable to dropdown fields' }
+    }
+
+    const invalid = getInvalidValueForFormat(tc)
+    let valueHost = field
+    if (target.kind === 'date') {
       const dateInput = findDateInputForLabel(fieldLabel) || field
-      const invalid = getInvalidValueForFormat(tc)
+      valueHost = dateInput
       if (isCustomDatePickerInput(dateInput)) {
         await setCustomDatePickerValue(dateInput, invalid)
       } else {
-        dateInput.value = invalid
+        setInputValueNative(dateInput, invalid)
         dispatchInputEvents(dateInput)
         dispatchBlurEvent(dateInput)
       }
     } else {
-      field.value = getInvalidValueForFormat(tc)
+      setInputValueNative(field, invalid)
       dispatchInputEvents(field)
       dispatchBlurEvent(field)
     }
+
+    // Fix 2: read the value back; if Angular silently rejected it, skip instead of giving a misleading result.
+    await wait(60)
+    const afterVal = String(valueHost?.value || '').trim()
+    if (!afterVal) {
+      console.warn('[QA-format] invalid value not accepted by field:', fieldLabel, '| tried:', invalid)
+      return { skipped: true, reason: 'invalid value was not accepted by field — Angular may have rejected it' }
+    }
+
     const clicked = await clickContinueAndReadErrors(
       tc?.expected_result,
       fieldLabel,
@@ -3789,31 +3952,6 @@ async function executeTestCase(tc, runContext = {}) {
       passed: Boolean(clicked.matched),
       message: clicked.matched || '',
       skipFullResetAfter: true
-    }
-  }
-
-  if (testType === 'label_check') {
-    // Field must be present and visible on the page.
-    if (!field || !isVisible(field)) {
-      return { skipped: true, reason: 'field not present' }
-    }
-    // Strip ONLY asterisks and collapse whitespace — applied identically to both sides.
-    const normalizeLabelForCompare = v =>
-      String(v || '').replace(/\*/g, '').replace(/\s+/g, ' ').trim()
-    // Expected label comes from the SRD field label.
-    const expectedLabel = normalizeLabelForCompare(tc?.field_label)
-    if (!expectedLabel) {
-      return { skipped: true, reason: 'no expected label in SRD' }
-    }
-    // Actual visible label (getLabelText falls back to aria-label).
-    const actualLabel = normalizeLabelForCompare(getLabelText(field))
-    // Exact, case-sensitive match. Placeholder is never checked.
-    const passed = actualLabel === expectedLabel
-    return {
-      passed,
-      message: passed
-        ? `Label matches: "${actualLabel}"`
-        : `Expected label "${expectedLabel}", got label "${actualLabel}"`
     }
   }
 
@@ -4120,6 +4258,16 @@ function probeFieldVisibility(tc) {
   const testType = String(tc?.test_type || '').trim()
   if (testType === 'successful_submit') return true
 
+  // Conditional label_check is reachable when its PARENT is visible (the child
+  // stays hidden until we set the parent at runtime).
+  if (testType === 'label_check') {
+    const pm = String(tc?.expected_result || '').match(/;\s*parent\s*:\s*([^;=]+?)\s*=/i)
+    if (pm) {
+      const parent = resolveConditionalParentField({ parentLabel: pm[1].trim(), triggerValue: '' })
+      return Boolean(parent && isVisible(parent))
+    }
+  }
+
   if (isConditionalFieldTestType(testType)) {
     try {
       const spec = parseConditionalSpec(tc)
@@ -4213,6 +4361,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     ;(async () => {
       try {
         cancelCurrentTestRequested = false
+        if (pendingConditionalLabelParent) {
+          await clearConditionalParent(pendingConditionalLabelParent)
+          pendingConditionalLabelParent = null
+        }
         const signatureBefore = getSectionSignature()
         const fillOpts = {
           manualLike: true,

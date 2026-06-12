@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "QA Helper",
   "version": "1.0",
-  "description": "Tests Irembo forms automatically",
+  "description": "Runs QA Helper test cases in the browser against your form",
   "permissions": ["activeTab", "scripting", "tabs", "storage", "cookies"],
   "host_permissions": [
     "http://localhost:3000/*",

@@ -66,6 +66,8 @@ const SCHEMA_SQL = `
   login_password TEXT,
   form_structure TEXT,
   srd_text TEXT,
+  srd_import_status TEXT DEFAULT 'ready',
+  srd_import_error TEXT,
   status TEXT DEFAULT 'Not Tested',
   last_tested TEXT DEFAULT 'Never',
   created_at TEXT DEFAULT (datetime('now')),
@@ -212,6 +214,8 @@ async function initTurso(url, authToken) {
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_url TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_username TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
+  await tryExecTurso(`ALTER TABLE projects ADD COLUMN srd_import_status TEXT DEFAULT 'ready'`)
+  await tryExecTurso(`ALTER TABLE projects ADD COLUMN srd_import_error TEXT`)
   await tryExecTurso(
     `ALTER TABLE test_run_results ADD COLUMN snapshot_expected_outcome TEXT DEFAULT 'should_pass'`
   )
@@ -303,6 +307,18 @@ async function initSqlite() {
 
   try {
     _sqlite.exec(`ALTER TABLE projects ADD COLUMN login_password TEXT`)
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE projects ADD COLUMN srd_import_status TEXT DEFAULT 'ready'`)
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE projects ADD COLUMN srd_import_error TEXT`)
   } catch {
     // Column already exists.
   }
