@@ -146,6 +146,18 @@
   white-space: nowrap;
 }
 
+.status-badge.importing-srd {
+  background: #e8f1ff;
+  color: #00448e;
+  cursor: default;
+}
+
+.status-badge.import-failed {
+  background: #ffe8e8;
+  color: #b00020;
+  cursor: help;
+}
+
 .empty-state {
   background: white;
   padding: 60px 20px;

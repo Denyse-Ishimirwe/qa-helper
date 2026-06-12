@@ -97,62 +97,6 @@ Rules:
   }
 }
 
-// ─── Known form fields ────────────────────────────────────────────────────────
-
-const KNOWN_FIELDS = [
-  {
-    selector: '#firstName',
-    optional: true,
-    type: 'text',
-    label: 'First Name',
-    keywords: ['first name', 'firstname'],
-    validValue: 'John'
-  },
-  {
-    selector: '#lastName',
-    errorSelector: '#lastNameError',
-    type: 'text',
-    label: 'Last Name',
-    keywords: ['last name', 'lastname'],
-    validValue: 'Doe'
-  },
-  {
-    selector: '#dob',
-    errorSelector: '#dobError',
-    formatErrorSelector: '#dobAgeError',
-    type: 'date',
-    label: 'Date of Birth',
-    keywords: ['date of birth', 'dob', 'birth date', 'birth'],
-    validValue: '1990-01-01'
-  },
-  {
-    selector: '#gender',
-    errorSelector: '#genderError',
-    type: 'select',
-    label: 'Gender',
-    keywords: ['gender'],
-    validValue: 'male'
-  },
-  {
-    selector: '#nationality',
-    errorSelector: '#nationalityError',
-    type: 'text',
-    label: 'Nationality',
-    keywords: ['nationality'],
-    validValue: 'Rwandan'
-  },
-  {
-    selector: '#idNumber',
-    errorSelector: '#idNumberError',
-    formatErrorSelector: '#idNumberFormatError',
-    type: 'text',
-    label: 'ID Number',
-    keywords: ['id number', 'national id', 'id no', 'id'],
-    validValue: '1199880012345678',
-    invalidValue: '9999999999999999'
-  }
-]
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function normalizeType(rawType) {
@@ -225,7 +169,7 @@ function deriveInvalidValueForTestCase(tc, field, fallbackValue) {
   return fallbackValue
 }
 
-async function fillAllFields(page, fields = KNOWN_FIELDS, options = {}) {
+async function fillAllFields(page, fields = [], options = {}) {
   const exclude = new Set(Array.isArray(options?.excludeSelectors) ? options.excludeSelectors : [])
   const excludeNames = new Set(
     Array.isArray(options?.excludeNames)
@@ -419,8 +363,117 @@ function mergeFields(known, live) {
   return Array.from(map.values())
 }
 
+/**
+ * Fields from Analyse (stored JSON on the project). No per-form hardcoding — structure comes from the live page scan + AI.
+ */
+function formStructureToRuntimeFields(raw) {
+  let parsed = raw
+  if (raw == null || raw === '') return []
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return []
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return []
+  const list = Array.isArray(parsed.fields) ? parsed.fields : Array.isArray(parsed) ? parsed : []
+  return list
+    .map((f, idx) => {
+      const element = String(f?.element || 'input').toLowerCase()
+      const typeRaw = String(f?.type || '').trim().toLowerCase()
+      if (typeRaw === 'submit' || (element === 'button' && typeRaw === 'submit')) return null
+
+      const type = normalizeType(
+        typeRaw || (element === 'select' || typeRaw === 'select-one' ? 'select' : element === 'textarea' ? 'textarea' : 'text')
+      )
+      const id = String(f?.id || '').trim().replace(/^#/, '')
+      const name = String(f?.name || '').trim()
+      const label = String(f?.label || f?.name || id || `field-${idx + 1}`).trim()
+      const placeholder = String(f?.placeholder || '').trim()
+
+      let selector = String(f?.selector || '').trim()
+      if (!selector) {
+        if (id) {
+          selector = `#${id.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}`
+        } else if (name) {
+          const tag =
+            element === 'textarea'
+              ? 'textarea'
+              : type === 'select' || element === 'select' || typeRaw === 'select-one'
+                ? 'select'
+                : 'input'
+          selector = `${tag}[name="${name.replace(/"/g, '\\"')}"]`
+        }
+      }
+      if (!selector) return null
+
+      const errorSelector = String(f?.errorSelector || '').trim()
+      const formatErrorSelector = String(f?.formatErrorSelector || '').trim()
+      const required = Boolean(f?.required)
+      const keywords = [label, name, id, placeholder].flatMap((v) => toTokenSet(String(v || '')))
+
+      const row = {
+        selector,
+        type,
+        label,
+        name,
+        optional: !required,
+        keywords
+      }
+      if (errorSelector) row.errorSelector = errorSelector
+      if (formatErrorSelector) row.formatErrorSelector = formatErrorSelector
+      if (f?.validValue != null && String(f.validValue).trim()) row.validValue = String(f.validValue).trim()
+      if (f?.invalidValue != null && String(f.invalidValue).trim()) row.invalidValue = String(f.invalidValue).trim()
+      return row
+    })
+    .filter(Boolean)
+}
+
+/** Success indicators: optional custom selector from form_structure, then common patterns (not tied to one product form). */
+function buildSuccessSelectors(project) {
+  const out = []
+  try {
+    const raw = project?.form_structure
+    if (raw) {
+      const p = typeof raw === 'string' ? JSON.parse(raw) : raw
+      const custom = String(p?.successSelector || p?.successMessageSelector || '').trim()
+      if (custom) out.push(custom)
+    }
+  } catch {
+    /* ignore */
+  }
+  out.push(
+    '#successMsg',
+    '[data-testid="success"]',
+    '[data-testid="success-message"]',
+    '.alert-success',
+    '.notification--success',
+    '.toast-success',
+    '.toast.toast-success',
+    '.swal2-success',
+    '[class*="success-message"]'
+  )
+  return [...new Set(out.map((s) => String(s).trim()).filter(Boolean))]
+}
+
+function withPostSubmitSelectors(project, extras = []) {
+  return [...buildSuccessSelectors(project), ...(Array.isArray(extras) ? extras : []).filter(Boolean)]
+}
+
+async function isSubmitSuccessVisible(page, project) {
+  for (const sel of buildSuccessSelectors(project)) {
+    try {
+      if (await isVisible(page, sel)) return true
+    } catch {
+      /* ignore */
+    }
+  }
+  return false
+}
+
 /** `<input type="date">` only accepts yyyy-mm-dd; "invalid" strings become empty → wrong errors. */
-function resolveDobFormatValidation(tc) {
+function resolveDobFormatValidation(tc, targetField) {
   const text = `${tc.name || ''} ${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase()
   const mentionsUnderage =
     /under\s*18|under eighteen|minor|less than 18|below 18|too young|younger than 18|person is under/i.test(
@@ -429,7 +482,12 @@ function resolveDobFormatValidation(tc) {
   if (!mentionsUnderage) return null
   const d = new Date()
   d.setFullYear(d.getFullYear() - 10)
-  return { invalidVal: d.toISOString().slice(0, 10), formatErrorSelector: '#dobAgeError' }
+  const formatErrorSelector =
+    String(targetField?.formatErrorSelector || '').trim() ||
+    String(targetField?.errorSelector || '').trim() ||
+    null
+  if (!formatErrorSelector) return null
+  return { invalidVal: d.toISOString().slice(0, 10), formatErrorSelector }
 }
 
 async function isVisible(page, selector) {
@@ -942,8 +1000,9 @@ async function runTests(projectId, options = {}) {
       }
 
       const scannedRuntimeFields = mapScannedFieldsToRuntime(options.scannedFields || [])
+      const structFromProject = formStructureToRuntimeFields(project.form_structure)
       const liveFields = scannedRuntimeFields.length > 0 ? [] : await discoverLiveFields(page)
-      const runtimeFields = mergeFields(KNOWN_FIELDS, [...liveFields, ...scannedRuntimeFields])
+      const runtimeFields = mergeFields([], [...structFromProject, ...liveFields, ...scannedRuntimeFields])
       const expectedOutcome = String(tc.expected_outcome || 'should_pass')
       const shouldFailExpected = expectedOutcome === 'should_fail'
 
@@ -1027,7 +1086,7 @@ async function runTests(projectId, options = {}) {
           await fillAllFields(page, runtimeFields)
           await clickSubmit(page).catch(() => {})
           await page.waitForTimeout(300)
-          const success = await isVisible(page, '#successMsg')
+          const success = await isSubmitSuccessVisible(page, project)
           const note =
             `Failed: the field named in this test could not be found on the live form, so this check could not be executed reliably. Form submission success was: ${success}.`
           testLog('RESULT: ✗ Failed — field not found on form')
@@ -1064,12 +1123,12 @@ async function runTests(projectId, options = {}) {
 
         testLog('Step: clicking submit')
         await clickSubmit(page)
-        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1500)
+        await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector]), 1500)
 
         testLog('Step: checking results')
           const [fieldError, success] = await Promise.all([
           targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-          isVisible(page, '#successMsg')
+          isSubmitSuccessVisible(page, project)
         ])
         const visibleMessages = await collectVisibleValidationMessages(page)
         const invalidState = await detectFieldInvalidState(page, targetField)
@@ -1099,7 +1158,7 @@ async function runTests(projectId, options = {}) {
         } else if (success === true) {
           notes = `Failed: "${targetField.label}" was left empty, but the form still submitted. This means required validation did not block submission as expected.`
           testLog(`RESULT: ✗ Failed — form submitted with empty "${targetField.label}"`)
-          failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+          failureWaitSelectors = withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector])
         } else {
           notes = `Failed: "${targetField.label}" was left empty and the form did not submit, but no clear validation message could be matched to the expected result.`
           if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
@@ -1124,7 +1183,7 @@ async function runTests(projectId, options = {}) {
           await fillAllFields(page, runtimeFields)
           await clickSubmit(page).catch(() => {})
           await page.waitForTimeout(300)
-          const success = await isVisible(page, '#successMsg')
+          const success = await isSubmitSuccessVisible(page, project)
           const note =
             `Failed: the field named in this test could not be found on the live form, so this format check could not be executed reliably. Form submission success was: ${success}.`
           testLog('RESULT: ✗ Failed — field not found on form')
@@ -1146,7 +1205,7 @@ async function runTests(projectId, options = {}) {
         let formatErrorSelector = targetField.formatErrorSelector || targetField.errorSelector
 
         if (targetField.type === 'date') {
-          const dobPlan = resolveDobFormatValidation(tc)
+          const dobPlan = resolveDobFormatValidation(tc, targetField)
           if (dobPlan) {
             invalidVal = dobPlan.invalidVal
             formatErrorSelector = dobPlan.formatErrorSelector
@@ -1171,10 +1230,10 @@ async function runTests(projectId, options = {}) {
           if (expectsNoError) {
             testLog(`Step: option-field validation for "${targetField.label}" (expecting no error)`)
             await clickSubmit(page).catch(() => {})
-            await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector], 1200)
+            await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [targetField.errorSelector]), 1200)
             const [fieldError, success] = await Promise.all([
               targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-              isVisible(page, '#successMsg')
+              isSubmitSuccessVisible(page, project)
             ])
             passed = fieldError === false
             if (passed) {
@@ -1183,7 +1242,7 @@ async function runTests(projectId, options = {}) {
             } else {
               notes = `Failed: "${targetField.label}" used a valid option, but a validation message still appeared.`
               testLog('RESULT: ✗ Failed — unexpected validation error for valid option')
-              failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+              failureWaitSelectors = withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector])
             }
             // Keep success signal in notes for troubleshooting without forcing it.
             notes += success ? '\nSubmission signal: success message visible.' : '\nSubmission signal: success message not visible.'
@@ -1207,12 +1266,12 @@ async function runTests(projectId, options = {}) {
 
           testLog('Step: clicking submit')
           await clickSubmit(page)
-          await waitForPostSubmitSignals(page, ['#successMsg', formatErrorSelector, targetField.errorSelector], 1200)
+          await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector]), 1200)
 
           testLog('Step: checking results')
           const [formatError, success] = await Promise.all([
             formatErrorSelector ? isVisible(page, formatErrorSelector) : Promise.resolve(false),
-            isVisible(page, '#successMsg')
+            isSubmitSuccessVisible(page, project)
           ])
           const visibleMessages = await collectVisibleValidationMessages(page)
           const invalidState = await detectFieldInvalidState(page, targetField)
@@ -1232,7 +1291,7 @@ async function runTests(projectId, options = {}) {
 
           if (passed) {
             notes =
-              targetField.type === 'date' && formatErrorSelector === '#dobAgeError'
+              targetField.type === 'date' && formatErrorSelector
                 ? `Passed: Date of Birth rejected the minor date "${invalidVal}" and showed the age restriction message.`
                 : `Passed: "${targetField.label}" rejected invalid input "${invalidVal}" and prevented successful submission.`
             if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
@@ -1240,7 +1299,7 @@ async function runTests(projectId, options = {}) {
           } else if (success === true) {
             notes = `Failed: "${targetField.label}" accepted invalid input "${invalidVal}" and the form submitted successfully.`
             testLog(`RESULT: ✗ Failed — form accepted invalid value for "${targetField.label}"`)
-            failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector, '#successMsg']
+            failureWaitSelectors = withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector, targetField.selector])
           } else {
             notes = `Failed: "${targetField.label}" used invalid input "${invalidVal}", but no clear validation message appeared for that field.`
             if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
@@ -1263,11 +1322,11 @@ async function runTests(projectId, options = {}) {
 
         testLog('Step: clicking submit')
         await clickSubmit(page)
-        const checkSelectors = ['#successMsg', ...runtimeFields.map(f => f?.errorSelector).filter(Boolean)]
+        const checkSelectors = withPostSubmitSelectors(project, runtimeFields.map(f => f?.errorSelector).filter(Boolean))
         await waitForPostSubmitSignals(page, checkSelectors, 1400)
 
         testLog('Step: checking results')
-        const success = await isVisible(page, '#successMsg')
+        const success = await isSubmitSuccessVisible(page, project)
 
         // Check if any field errors appeared
         let anyError = false
@@ -1349,11 +1408,11 @@ async function runTests(projectId, options = {}) {
           } else {
             await clearField(page, targetField)
             await clickSubmit(page).catch(() => {})
-            await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
+            await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector]), 1400)
 
             const [fieldError, success] = await Promise.all([
               targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-              isVisible(page, '#successMsg')
+              isSubmitSuccessVisible(page, project)
             ])
             const visibleMessages = await collectVisibleValidationMessages(page)
             const invalidState = await detectFieldInvalidState(page, targetField)
@@ -1372,7 +1431,7 @@ async function runTests(projectId, options = {}) {
             } else {
               notes = `Failed: conditional field "${targetField.label}" was visible but required validation was not enforced as expected.`
               if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
-              failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+              failureWaitSelectors = withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector])
             }
           }
         }
@@ -1494,9 +1553,9 @@ async function runTests(projectId, options = {}) {
         }
 
         await clickSubmit(page).catch(() => {})
-        await waitForPostSubmitSignals(page, ['#successMsg', targetField.errorSelector, targetField.selector], 1400)
+        await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector]), 1400)
 
-        const success = await isVisible(page, '#successMsg')
+        const success = await isSubmitSuccessVisible(page, project)
         const fieldError = targetField.errorSelector ? await isVisible(page, targetField.errorSelector) : false
         passed = success === false || fieldError === true
         if (passed) {
@@ -1515,7 +1574,7 @@ async function runTests(projectId, options = {}) {
           } else {
             notes = `Failed: form accepted an oversized file for "${targetField.label}".`
           }
-          failureWaitSelectors = [targetField.errorSelector, targetField.selector, '#successMsg']
+          failureWaitSelectors = withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector])
         }
       }
 

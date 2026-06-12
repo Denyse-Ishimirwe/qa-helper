@@ -80,6 +80,7 @@ function perTestCaseTimeoutMs(tc = {}) {
   if (t === 'successful_submit') return 5 * 60 * 1000
   if (t === 'conditional_display' || t === 'conditional_required' || t === 'conditional_field') return 4 * 60 * 1000
   if (t === 'required_field' || t === 'format_validation') return 3 * 60 * 1000
+  if (t === 'label_check') return 15 * 1000
   return PER_TEST_CASE_TIMEOUT_MS
 }
 
@@ -420,8 +421,10 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
   while ((remaining.length > 0 || deferred.length > 0) && !RUN_STATE.cancellationRequested) {
     // 1) Drain everything that's reachable on the current section.
+    //    label_check cases for this section run BEFORE its other test types.
     while (remaining.length > 0 && !RUN_STATE.cancellationRequested) {
-      const tc = remaining.shift()
+      const lcIdx = remaining.findIndex(t => String(t?.test_type) === 'label_check')
+      const tc = lcIdx >= 0 ? remaining.splice(lcIdx, 1)[0] : remaining.shift()
       const reachable = await probeReachable(tc)
       if (reachable) {
         await runOneTest(tc)
@@ -482,11 +485,28 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   }
 
   if (RUN_STATE.cancellationRequested) {
+    // Persist whatever completed before Stop so the dashboard shows it.
+    let stoppedRunId = ''
+    if (results.length > 0) {
+      try {
+        setRunState({ message: 'Saving completed results...' })
+        const uploadRes = await fetch(`${apiBase}/api/projects/${projectId}/extension-run`, {
+          method: 'POST',
+          headers: authHeaders(token),
+          body: JSON.stringify({ results })
+        })
+        const uploadData = await uploadRes.json().catch(() => ({}))
+        if (uploadRes.ok) stoppedRunId = String(uploadData.runId || '')
+      } catch {
+        // Best-effort save on stop — never lose the stopped state if upload fails.
+      }
+    }
     const summary = `Stopped — ${passed} passed, ${failed} failed, ${skipped} skipped`
     setRunState({
       status: 'stopped',
       summary,
       message: summary,
+      runId: stoppedRunId,
       finishedAt: Date.now()
     })
     return

@@ -109,6 +109,12 @@ async function resumeBackgroundRunIfAny() {
         const summary = String(rs.summary || rs.message || 'Stopped')
         setStatus(summary, false)
         els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        if (rs.runId && projectId) {
+          els.viewBtn.style.display = 'block'
+          els.viewBtn.onclick = () => {
+            chrome.tabs.create({ url: `${APP_BASE}/?project=${projectId}&run=${rs.runId}` })
+          }
+        }
         setRunControls(false)
         return
       }
@@ -566,6 +572,12 @@ async function runExtensionTests() {
         const summary = String(st.summary || st.message || 'Stopped')
         setStatus(summary, false)
         els.results.innerHTML = `<div class="check"><strong>${summary}</strong></div>`
+        if (st.runId) {
+          els.viewBtn.style.display = 'block'
+          els.viewBtn.onclick = () => {
+            chrome.tabs.create({ url: `${APP_BASE}/?project=${projectId}&run=${st.runId}` })
+          }
+        }
         setRunControls(false)
         return
       }

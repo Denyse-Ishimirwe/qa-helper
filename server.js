@@ -266,6 +266,50 @@ async function fetchNotionSrdText(notionUrl) {
   return text
 }
 
+/**
+ * After a project row is inserted, extract PDF or fetch Notion in the background
+ * and update srd_text + srd_import_status. Removes the uploaded temp file when done.
+ */
+async function runProjectSrdImportJob(projectId, { filePath, notionUrl }) {
+  await dbReady
+  try {
+    let text = ''
+    if (filePath) {
+      text = await extractText(filePath)
+    } else if (String(notionUrl || '').trim()) {
+      text = await fetchNotionSrdText(String(notionUrl).trim())
+    } else {
+      throw new Error('No SRD source provided')
+    }
+    await db.run(
+      `UPDATE projects SET srd_text = ?, srd_import_status = 'ready', srd_import_error = NULL WHERE id = ?`,
+      text,
+      projectId
+    )
+    console.log(`[srd-import] project ${projectId} ready (${String(text).length} chars)`)
+  } catch (err) {
+    const msg = String(err?.message || err)
+    console.error(`[srd-import] project ${projectId} failed:`, msg)
+    try {
+      await db.run(
+        `UPDATE projects SET srd_import_status = 'failed', srd_import_error = ? WHERE id = ?`,
+        msg.slice(0, 2000),
+        projectId
+      )
+    } catch (dbErr) {
+      console.error('[srd-import] could not persist failure state:', dbErr)
+    }
+  } finally {
+    if (filePath) {
+      try {
+        fs.unlinkSync(filePath)
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
 function isSkippedRunResultRow(r) {
   return Boolean(r?.skipped) || /^skipped:/i.test(String(r?.notes || '').trim())
 }
@@ -799,9 +843,12 @@ app.post('/api/runs/:runId/extension-screenshots', requireAuth, async (req, res)
 })
 
 app.get('/api/projects', requireAuth, async (req, res) => {
+  // Omit srd_text — it can be very large; full SRD is loaded on the server for generate/analyse routes.
   const projects = await db.all(
     `
-    SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
+    SELECT id, user_id, name, form_url, form_structure, status, last_tested, created_at,
+           COALESCE(srd_import_status, 'ready') AS srd_import_status,
+           srd_import_error
     FROM projects
     WHERE user_id = ?
     ORDER BY id DESC
@@ -826,29 +873,33 @@ app.post('/api/projects', requireAuth, upload.single('srd'), async (req, res) =>
       return res.status(400).json({ error: 'Upload an SRD file or provide a Notion URL' })
     }
 
-    let srdText = ''
-    if (srdFile) {
-      srdText = await extractText(srdFile.path)
-    } else {
-      srdText = await fetchNotionSrdText(notion_url)
-    }
-
     const result = await db.run(
-      'INSERT INTO projects (user_id, name, form_url, srd_text) VALUES (?, ?, ?, ?)',
+      `INSERT INTO projects (user_id, name, form_url, srd_text, srd_import_status, srd_import_error)
+       VALUES (?, ?, ?, '', 'pending', NULL)`,
       req.user.id,
       name,
-      form_url || '',
-      srdText
+      form_url || ''
     )
 
-    res.json({ success: true, id: result.lastInsertRowid })
+    const projectId = result.lastInsertRowid
+    const filePath = srdFile?.path || null
+    const notionForJob = filePath ? '' : notion_url
 
+    res.json({ success: true, id: projectId, srd_import_status: 'pending' })
+
+    setImmediate(() => {
+      void runProjectSrdImportJob(projectId, { filePath, notionUrl: notionForJob })
+    })
   } catch (err) {
     const msg = String(err?.message || 'Failed to create project')
     console.error('Create project error:', msg)
-    // Notion errors are usually user-actionable (wrong URL / not shared / permissions).
-    if (msg.startsWith('Notion API error (') || msg.toLowerCase().includes('notion')) {
-      return res.status(400).json({ error: msg })
+    const uploadedPath = req.file?.path
+    if (uploadedPath) {
+      try {
+        fs.unlinkSync(uploadedPath)
+      } catch {
+        // ignore
+      }
     }
     res.status(500).json({ error: msg })
   }
@@ -933,7 +984,9 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
 
     const project = await db.get(
       `
-      SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at
+      SELECT id, user_id, name, form_url, form_structure, srd_text, status, last_tested, created_at,
+             COALESCE(srd_import_status, 'ready') AS srd_import_status,
+             srd_import_error
       FROM projects
       WHERE id = ?
     `,
@@ -943,7 +996,22 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
     if (!project) {
       return res.status(404).json({ error: 'Project not found' })
     }
-    if (!project.srd_text) {
+
+    const importStatus = String(project.srd_import_status || 'ready')
+    if (importStatus === 'pending') {
+      return res.status(409).json({
+        error:
+          'Requirements document is still importing in the background. Wait a few seconds and try again.'
+      })
+    }
+    if (importStatus === 'failed') {
+      return res.status(400).json({
+        error:
+          String(project.srd_import_error || '').trim() ||
+          'Requirements import failed. Edit the project to upload the SRD again or fix the Notion URL.'
+      })
+    }
+    if (!String(project.srd_text || '').trim()) {
       return res.status(400).json({ error: 'No SRD text found for this project' })
     }
 
@@ -1247,6 +1315,21 @@ function inferFieldLabelAndName(testCase) {
   const what = String(testCase?.what_to_test || '')
   const name = String(testCase?.name || '')
   const expected = String(testCase?.expected_result || '')
+
+  // label_check stores the EXACT visible label verbatim in expected_result, so use
+  // it directly. Name inference would leave "Label Check" stuck on the label and
+  // break the exact === comparison in content.js.
+  if (String(testCase?.test_type || '').toLowerCase() === 'label_check') {
+    // expected_result may carry "; placeholder: …; section: …; parent: …" — keep only the label (before the first ";").
+    const label = expected.split(';')[0].trim()
+    if (label) {
+      return {
+        field_label: label,
+        field_name: label.replace(/\s+/g, '').replace(/[^a-zA-Z0-9_]/g, '')
+      }
+    }
+  }
+
   const joined = `${name} ${what} ${expected}`
 
   const quoted = joined.match(/"([^"]+)"/)
