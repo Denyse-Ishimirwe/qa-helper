@@ -3670,14 +3670,6 @@ async function executeTestCase(tc, runContext = {}) {
     requiredFieldRunPreflightDone = true
   }
 
-  const executableTypes = new Set([
-    'required_field',
-    'format_validation',
-    'conditional_field',
-    'conditional_required',
-    'conditional_display',
-    'successful_submit'
-  ])
   await maybePrepareIdTypeFromWhatToTest(tc)
   const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
     .filter(Boolean)
@@ -3822,11 +3814,7 @@ async function executeTestCase(tc, runContext = {}) {
     }
     conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
     // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
-  } else if (
-    executableTypes.has(testType) &&
-    !isConditionalFieldTestType(testType) &&
-    !(testType === 'required_field' && requiredFieldRunPreflightDone)
-  ) {
+  } else if (testType === 'successful_submit') {
     await fillAllFieldsWithValidValues(target, {
       manualLike: true,
       deferCascadeChains: locCascadeHint
@@ -3907,7 +3895,10 @@ async function executeTestCase(tc, runContext = {}) {
       const dateInput = findDateInputForLabel(fieldLabel) || field
       valueHost = dateInput
       if (isCustomDatePickerInput(dateInput)) {
-        await setCustomDatePickerValue(dateInput, invalid)
+        // Irembo custom pickers expect DMY (DD/MM/YYYY); getInvalidValueForFormat
+        // returns ISO. Convert when the invalid value is a real date.
+        const parsed = parseDateAny(invalid)
+        await setCustomDatePickerValue(dateInput, parsed ? formatDateDmy(parsed) : invalid)
       } else {
         setInputValueNative(dateInput, invalid)
         dispatchInputEvents(dateInput)
