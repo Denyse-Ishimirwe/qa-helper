@@ -281,7 +281,11 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   //              so a hallucinated field doesn't stall the whole run forever
   const MAX_SECTION_ADVANCES = 8
   const MAX_DEFERS_PER_TEST = 3
-  let remaining = testCases.slice()
+  // successful_submit fills + submits the WHOLE form, so it must run absolutely
+  // last — after every other test on every section. Hold those cases aside and
+  // run them once the section bucketer has drained everything else.
+  const submitCases = testCases.filter(t => String(t?.test_type) === 'successful_submit')
+  let remaining = testCases.filter(t => String(t?.test_type) !== 'successful_submit')
   let deferred = []
   const deferCount = new Map()
   let sectionsAdvanced = 0
@@ -481,6 +485,15 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       }
       deferred = []
       break
+    }
+  }
+
+  // Run successful_submit LAST — only after the bucketer has tested everything
+  // else (it advances/submits the form, so it must not run before other tests).
+  if (!RUN_STATE.cancellationRequested) {
+    for (const tc of submitCases) {
+      if (RUN_STATE.cancellationRequested) break
+      await runOneTest(tc)
     }
   }
 
