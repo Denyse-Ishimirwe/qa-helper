@@ -3895,7 +3895,10 @@ async function executeTestCase(tc, runContext = {}) {
       const dateInput = findDateInputForLabel(fieldLabel) || field
       valueHost = dateInput
       if (isCustomDatePickerInput(dateInput)) {
-        await setCustomDatePickerValue(dateInput, invalid)
+        // Irembo custom pickers expect DMY (DD/MM/YYYY); getInvalidValueForFormat
+        // returns ISO. Convert when the invalid value is a real date.
+        const parsed = parseDateAny(invalid)
+        await setCustomDatePickerValue(dateInput, parsed ? formatDateDmy(parsed) : invalid)
       } else {
         setInputValueNative(dateInput, invalid)
         dispatchInputEvents(dateInput)
