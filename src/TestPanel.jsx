@@ -81,6 +81,34 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
     fetchComparison()
   }, [fetchComparison])
 
+  // Re-fetch the latest run whenever the user returns to the dashboard tab
+  // (e.g. after running/stopping tests in the extension on another tab).
+  useEffect(() => {
+    const refresh = () => {
+      fetchTestCases()
+      fetchComparison()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refresh()
+    }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [fetchTestCases, fetchComparison])
+
+  // While a run is actively in progress, poll every 5s so results update live.
+  useEffect(() => {
+    if (!running) return undefined
+    const id = setInterval(() => {
+      fetchTestCases()
+      fetchComparison()
+    }, 5000)
+    return () => clearInterval(id)
+  }, [running, fetchTestCases, fetchComparison])
+
   useEffect(() => {
     if (project?.form_structure) {
       try {
