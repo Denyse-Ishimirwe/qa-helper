@@ -4,6 +4,14 @@ import { groqChatCompletionsCreate, GROQ_PRIMARY_MODEL } from './ai.js'
 import db from './db.js'
 import fs from 'node:fs'
 import path from 'node:path'
+import {
+  buildSectionOrder,
+  inferSectionFromTestCase,
+  normalizeSectionName,
+  orderTestCasesBySection,
+  sectionsMatch,
+  SUBMIT_SECTION
+} from './sections.js'
 
 const SUPPORTED_TEST_TYPES = [
   'required_field',
@@ -786,6 +794,48 @@ async function goToForm(page, url) {
   }
 }
 
+async function getPageSectionName(page) {
+  try {
+    return await page.evaluate(() => {
+      const isVisible = (el) => {
+        if (!el) return false
+        const st = window.getComputedStyle(el)
+        return st.display !== 'none' && st.visibility !== 'hidden' && el.offsetParent !== null
+      }
+      for (const sel of ['h1.section-title', 'h1', 'h2', 'h3', '.section-title', '.step-title', '.wizard-title']) {
+        for (const heading of document.querySelectorAll(sel)) {
+          if (!isVisible(heading)) continue
+          const text = String(heading.textContent || '').trim()
+          if (text) return text
+        }
+      }
+      return ''
+    })
+  } catch {
+    return ''
+  }
+}
+
+async function advanceToTargetSection(page, targetSection, runtimeFields, maxAdvances = 8) {
+  const target = normalizeSectionName(targetSection)
+  if (!target || sectionsMatch(target, SUBMIT_SECTION)) return true
+
+  for (let attempt = 0; attempt <= maxAdvances; attempt += 1) {
+    const current = normalizeSectionName(await getPageSectionName(page))
+    if (sectionsMatch(current, target)) return true
+    if (attempt >= maxAdvances) break
+    await fillAllFields(page, runtimeFields).catch(() => {})
+    try {
+      await clickSubmit(page)
+      await page.waitForTimeout(600)
+    } catch {
+      return false
+    }
+  }
+  const finalSection = normalizeSectionName(await getPageSectionName(page))
+  return sectionsMatch(finalSection, target)
+}
+
 async function resetFormPage(page, url, hasLoadedOnce) {
   if (!hasLoadedOnce) {
     return goToForm(page, url)
@@ -858,10 +908,33 @@ async function captureFailureScreenshot(page, projectId, testCaseId) {
 
 async function runTests(projectId, options = {}) {
   const project = await db.get('SELECT * FROM projects WHERE id = ?', projectId)
-  const testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', projectId)
+  let testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', projectId)
 
   if (!project) throw new Error('Project not found')
   if (testCases.length === 0) throw new Error('No test cases found')
+
+  if (Array.isArray(options.sections) && options.sections.length > 0) {
+    testCases = testCases.filter(tc =>
+      options.sections.some(sectionName => sectionsMatch(sectionName, inferSectionFromTestCase(tc)))
+    )
+    if (testCases.length === 0) throw new Error('No test cases found for the selected section(s)')
+  }
+
+  const orderedCases = orderTestCasesBySection(testCases, project.form_structure)
+  const fullSectionOrder = buildSectionOrder(
+    await db.all('SELECT * FROM test_cases WHERE project_id = ?', projectId),
+    project.form_structure
+  )
+  const sectionStarts = new Map()
+  let previousSection = ''
+  for (let i = 0; i < orderedCases.length; i += 1) {
+    const sectionName = inferSectionFromTestCase(orderedCases[i])
+    if (sectionName !== previousSection) {
+      sectionStarts.set(i, sectionName)
+      previousSection = sectionName
+    }
+  }
+  testCases = orderedCases
 
   const browser = await launchChromiumBrowser()
   const page = await browser.newPage()
@@ -984,19 +1057,61 @@ async function runTests(projectId, options = {}) {
         testLog(`Type: ${testType}`)
       }
 
-      // ── Navigate to form ───────────────────────────────────────────────────
-      testLog('Step: navigating to form')
-      const targetUrl = String(options.overrideUrl || project.form_url || '').trim()
-      const loaded = await resetFormPage(page, targetUrl, hasLoadedOnce)
-      if (!loaded) {
-        const note = 'Failed: page did not load'
-        testLog('RESULT: ✗ Failed — page did not load')
-        const screenshotPath = await captureAtFailure(tc.id)
-        await saveCaseResult(false, note, screenshotPath)
-        continue
-      }
-      hasLoadedOnce = true
-      if (index === 0) {
+      // ── Navigate to form (reload only at the start of each section) ───────
+      const isSectionStart = sectionStarts.has(index)
+      if (isSectionStart) {
+        testLog(`Step: starting section "${sectionStarts.get(index)}"`)
+        const targetUrl = String(options.overrideUrl || project.form_url || '').trim()
+        const loaded = await resetFormPage(page, targetUrl, hasLoadedOnce)
+        if (!loaded) {
+          const note = 'Failed: page did not load'
+          testLog('RESULT: ✗ Failed — page did not load')
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+        hasLoadedOnce = true
+
+        const scannedRuntimeFields = mapScannedFieldsToRuntime(options.scannedFields || [])
+        const structFromProject = formStructureToRuntimeFields(project.form_structure)
+        const liveFields = scannedRuntimeFields.length > 0 ? [] : await discoverLiveFields(page)
+        const runtimeFieldsForAdvance = mergeFields([], [...structFromProject, ...liveFields, ...scannedRuntimeFields])
+
+        if (index > 0) {
+          const targetSection = sectionStarts.get(index)
+          const reached = await advanceToTargetSection(page, targetSection, runtimeFieldsForAdvance)
+          if (!reached) {
+            const note = `Failed: could not navigate to section "${targetSection}"`
+            testLog(`RESULT: ✗ Failed — ${note}`)
+            const screenshotPath = await captureAtFailure(tc.id)
+            await saveCaseResult(false, note, screenshotPath)
+            continue
+          }
+        } else {
+          const targetSection = sectionStarts.get(index)
+          const targetIndex = fullSectionOrder.findIndex(name => sectionsMatch(name, targetSection))
+          if (targetIndex > 0) {
+            const reached = await advanceToTargetSection(page, targetSection, runtimeFieldsForAdvance)
+            if (!reached) {
+              const note = `Failed: could not navigate to section "${targetSection}"`
+              testLog(`RESULT: ✗ Failed — ${note}`)
+              const screenshotPath = await captureAtFailure(tc.id)
+              await saveCaseResult(false, note, screenshotPath)
+              continue
+            }
+          }
+        }
+      } else if (!hasLoadedOnce) {
+        const targetUrl = String(options.overrideUrl || project.form_url || '').trim()
+        const loaded = await resetFormPage(page, targetUrl, false)
+        if (!loaded) {
+          const note = 'Failed: page did not load'
+          testLog('RESULT: ✗ Failed — page did not load')
+          const screenshotPath = await captureAtFailure(tc.id)
+          await saveCaseResult(false, note, screenshotPath)
+          continue
+        }
+        hasLoadedOnce = true
       }
 
       const scannedRuntimeFields = mapScannedFieldsToRuntime(options.scannedFields || [])

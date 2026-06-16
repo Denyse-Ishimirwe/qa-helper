@@ -1,5 +1,12 @@
 import './TestPanel.css'
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import {
+  buildSectionOrder,
+  groupTestCasesBySection,
+  inferSectionFromTestCase,
+  isUnsetSection,
+  GENERAL_SECTION
+} from '../sections.js'
 
 /** Normalize API/DB status so UI counts match each card. */
 function normalizeTestStatus(status) {
@@ -22,14 +29,16 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const [loading, setLoading] = useState(false)
   const [running, setRunning] = useState(false)
   const [editingId, setEditingId] = useState(null)
-  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
   const [showAddForm, setShowAddForm] = useState(false)
-  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
   const [addError, setAddError] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [comparison, setComparison] = useState(null)
   const [downloading, setDownloading] = useState(false)
   const [formStructureHint, setFormStructureHint] = useState('')
+  const [collapsedSections, setCollapsedSections] = useState({})
+  const [runningSection, setRunningSection] = useState('')
   const testCasesRequestRef = useRef(0)
   const comparisonRequestRef = useRef(0)
 
@@ -81,42 +90,19 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
     fetchComparison()
   }, [fetchComparison])
 
-  // Re-fetch the latest run whenever the user returns to the dashboard tab
-  // (e.g. after running/stopping tests in the extension on another tab).
-  useEffect(() => {
-    const refresh = () => {
-      fetchTestCases()
-      fetchComparison()
-    }
-    const onVisibility = () => {
-      if (document.visibilityState === 'visible') refresh()
-    }
-    window.addEventListener('focus', refresh)
-    document.addEventListener('visibilitychange', onVisibility)
-    return () => {
-      window.removeEventListener('focus', refresh)
-      document.removeEventListener('visibilitychange', onVisibility)
-    }
-  }, [fetchTestCases, fetchComparison])
-
-  // While a run is actively in progress, poll every 5s so results update live.
-  useEffect(() => {
-    if (!running) return undefined
-    const id = setInterval(() => {
-      fetchTestCases()
-      fetchComparison()
-    }, 5000)
-    return () => clearInterval(id)
-  }, [running, fetchTestCases, fetchComparison])
-
   useEffect(() => {
     if (project?.form_structure) {
       try {
         const parsed = JSON.parse(project.form_structure)
         const fieldCount = Array.isArray(parsed?.fields) ? parsed.fields.length : 0
+        const sectionCount = Array.isArray(parsed?.sections)
+          ? parsed.sections.length
+          : new Set((parsed?.fields || []).map(f => String(f?.section || '').trim()).filter(Boolean)).size
         const hasSubmit = Boolean(parsed?.submitButton)
         if (fieldCount > 0) {
-          setFormStructureHint(`Found ${fieldCount} fields${hasSubmit ? ' and a submit button' : ''}`)
+          setFormStructureHint(
+            `Found ${fieldCount} fields${sectionCount > 0 ? ` in ${sectionCount} section${sectionCount !== 1 ? 's' : ''}` : ''}${hasSubmit ? ' and a submit button' : ''}`
+          )
         } else {
           setFormStructureHint('')
         }
@@ -150,12 +136,18 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
     }
   }
 
-  async function handleRun() {
+  async function handleRun(sections = null) {
     setRunning(true)
+    setRunningSection(Array.isArray(sections) && sections.length === 1 ? sections[0] : '')
     try {
+      const body = Array.isArray(sections) && sections.length > 0 ? { sections } : undefined
       const res = await fetch(`/api/projects/${project.id}/run`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` }
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(body ? { 'Content-Type': 'application/json' } : {})
+        },
+        ...(body ? { body: JSON.stringify(body) } : {})
       })
       const data = await res.json()
       if (!res.ok) {
@@ -169,6 +161,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
       alert('Failed to run tests')
     } finally {
       setRunning(false)
+      setRunningSection('')
     }
   }
 
@@ -178,7 +171,8 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
       name: tc.name,
       what_to_test: tc.what_to_test,
       expected_result: tc.expected_result,
-      test_type: normalizeTestTypeUi(tc.test_type)
+      test_type: normalizeTestTypeUi(tc.test_type),
+      section: displaySection(tc)
     })
   }
 
@@ -244,7 +238,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
         body: JSON.stringify(newCase)
       })
       if (res.ok) {
-        setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+        setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
         setShowAddForm(false)
         setAddError('')
         await fetchTestCases()
@@ -260,6 +254,161 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const skipped = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Skipped').length
   const notRun = testCases.filter(tc => normalizeTestStatus(tc.status) === 'Not Run').length
   const hasPreviousRun = Boolean(comparison?.previous_run)
+  const hasAnyRun = testCases.some(tc => normalizeTestStatus(tc.status) !== 'Not Run')
+
+  function displaySection(tc) {
+    const resolved = String(tc?.section || '').trim() || inferSectionFromTestCase(tc)
+    return isUnsetSection(resolved) ? GENERAL_SECTION : resolved
+  }
+
+  const sectionGroups = useMemo(() => {
+    const order = buildSectionOrder(testCases, project?.form_structure)
+    const groups = groupTestCasesBySection(testCases, order)
+    return groups.filter(group => group.cases.length > 0)
+  }, [testCases, project?.form_structure])
+
+  function sectionCounts(cases) {
+    const passed = cases.filter(tc => normalizeTestStatus(tc.status) === 'Passed').length
+    const failed = cases.filter(tc => normalizeTestStatus(tc.status) === 'Failed').length
+    const skipped = cases.filter(tc => normalizeTestStatus(tc.status) === 'Skipped').length
+    const pending = cases.filter(tc => normalizeTestStatus(tc.status) === 'Not Run').length
+    return { passed, failed, skipped, pending, total: cases.length }
+  }
+
+  function toggleSection(sectionName) {
+    setCollapsedSections(prev => ({
+      ...prev,
+      [sectionName]: !prev[sectionName]
+    }))
+  }
+
+  function renderTestCard(tc, index) {
+    const st = normalizeTestStatus(tc.status)
+    return (
+      <div
+        className={`panel-card ${
+          st === 'Passed' ? 'card-passed' : st === 'Failed' ? 'card-failed' : st === 'Skipped' ? 'card-skipped' : ''
+        }`}
+        key={tc.id}
+      >
+        {editingId === tc.id ? (
+          <div className="panel-edit-form">
+            <input
+              className="panel-input"
+              value={editForm.name}
+              onChange={e => setEditForm({ ...editForm, name: e.target.value })}
+              placeholder="Test case name"
+            />
+            <input
+              className="panel-input"
+              value={editForm.section}
+              onChange={e => setEditForm({ ...editForm, section: e.target.value })}
+              placeholder="Section name"
+            />
+            <input
+              className="panel-input"
+              value={editForm.what_to_test}
+              onChange={e => setEditForm({ ...editForm, what_to_test: e.target.value })}
+              placeholder="What to test"
+            />
+            <input
+              className="panel-input"
+              value={editForm.expected_result}
+              onChange={e => setEditForm({ ...editForm, expected_result: e.target.value })}
+              placeholder="Expected result"
+            />
+            <select
+              className="panel-input"
+              value={editForm.test_type}
+              onChange={e => setEditForm({ ...editForm, test_type: e.target.value })}
+            >
+              <option value="required_field">required_field</option>
+              <option value="format_validation">format_validation</option>
+              <option value="successful_submit">successful_submit</option>
+              <option value="conditional_field">conditional_field</option>
+              <option value="widget_auto_fill">widget_auto_fill</option>
+              <option value="attachment">attachment</option>
+              <option value="label_check">label_check</option>
+            </select>
+            <div className="card-btns">
+              <button className="btn-save" onClick={() => handleSaveEdit(tc.id)}>Save</button>
+              <button className="btn-cancel" onClick={() => setEditingId(null)}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="card-top">
+              <span className="card-num">{index + 1}</span>
+              <span className="card-name">{tc.name}</span>
+              <span
+                className={`tc-status ${
+                  st === 'Passed'
+                    ? 'tc-passed'
+                    : st === 'Failed'
+                      ? 'tc-failed'
+                      : st === 'Skipped'
+                        ? 'tc-skipped'
+                        : 'tc-notrun'
+                }`}
+              >
+                {st === 'Passed'
+                  ? '✓ Passed'
+                  : st === 'Failed'
+                    ? '✗ Failed'
+                    : st === 'Skipped'
+                      ? '⊘ Skipped'
+                      : 'Not Run'}
+              </span>
+              <div className="card-btns">
+                <button className="btn-edit" onClick={() => startEdit(tc)}>Edit</button>
+                <button className="btn-delete" onClick={() => setConfirmDelete(tc)}>Delete</button>
+              </div>
+            </div>
+            <div className="card-body">
+              <div className="card-field">
+                <span className="field-label">Section</span>
+                <span className="field-value">{displaySection(tc)}</span>
+              </div>
+              <div className="card-field">
+                <span className="field-label">Test type</span>
+                <span className="field-value">{normalizeTestTypeUi(tc.test_type)}</span>
+              </div>
+              <div className="card-field">
+                <span className="field-label">What to test</span>
+                <span className="field-value">{tc.what_to_test}</span>
+              </div>
+              <div className="card-field">
+                <span className="field-label">Expected result</span>
+                <span className="field-value">{tc.expected_result}</span>
+              </div>
+              {tc.generation_reason && (
+                <div className="card-field">
+                  <span className="field-label">Why this test was generated</span>
+                  <span className="field-value">{tc.generation_reason}</span>
+                </div>
+              )}
+              {tc.notes && (
+                <div className="card-field">
+                  <span className="field-label">Run notes</span>
+                  <span className="field-value">
+                    {tc.notes}
+                    {String(tc.notes).includes('/uploads/') && (
+                      <>
+                        <br />
+                        <a href={String(tc.notes).match(/\/uploads\/[^\s]+/)?.[0] || '#'} target="_blank" rel="noreferrer">
+                          View screenshot
+                        </a>
+                      </>
+                    )}
+                  </span>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    )
+  }
 
   const srdImportStatus = String(project.srd_import_status || 'ready')
   const srdImportPending = srdImportStatus === 'pending'
@@ -347,8 +496,8 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
             </>
           ) : (
             <>
-              <button className="panel-run-btn" onClick={handleRun} disabled={running || loading}>
-                {running ? <><span className="btn-spinner" /> Running...</> : '▶ Run Tests'}
+              <button className="panel-run-btn" onClick={() => handleRun()} disabled={running || loading}>
+                {running && !runningSection ? <><span className="btn-spinner" /> Running all sections...</> : runningSection ? <><span className="btn-spinner" /> Running {runningSection}...</> : '▶ Run All Sections'}
               </button>
               <button
                 className="panel-regenerate-btn"
@@ -389,6 +538,14 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               value={newCase.name}
               onChange={e => setNewCase({ ...newCase, name: e.target.value })}
             />
+            <label>Section</label>
+            <input
+              className="panel-input"
+              type="text"
+              placeholder="e.g. Applicant Details"
+              value={newCase.section}
+              onChange={e => setNewCase({ ...newCase, section: e.target.value })}
+            />
             <label>What to Test</label>
             <input
               className="panel-input"
@@ -424,7 +581,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               <button className="btn-cancel" onClick={() => {
                 setShowAddForm(false)
                 setAddError('')
-                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field' })
+                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
               }}
               >
                 Cancel
@@ -502,122 +659,47 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
                   : 'No test cases yet. Click Generate to get started.'}
             </p>
           ) : (
-            testCases.map((tc, index) => {
-              const st = normalizeTestStatus(tc.status)
+            sectionGroups.map(group => {
+              const counts = sectionCounts(group.cases)
+              const collapsed = Boolean(collapsedSections[group.section])
+              let cardIndex = 0
               return (
-              <div
-                className={`panel-card ${
-                  st === 'Passed' ? 'card-passed' : st === 'Failed' ? 'card-failed' : st === 'Skipped' ? 'card-skipped' : ''
-                }`}
-                key={tc.id}
-              >
-                {editingId === tc.id ? (
-                  <div className="panel-edit-form">
-                    <input
-                      className="panel-input"
-                      value={editForm.name}
-                      onChange={e => setEditForm({ ...editForm, name: e.target.value })}
-                      placeholder="Test case name"
-                    />
-                    <input
-                      className="panel-input"
-                      value={editForm.what_to_test}
-                      onChange={e => setEditForm({ ...editForm, what_to_test: e.target.value })}
-                      placeholder="What to test"
-                    />
-                    <input
-                      className="panel-input"
-                      value={editForm.expected_result}
-                      onChange={e => setEditForm({ ...editForm, expected_result: e.target.value })}
-                      placeholder="Expected result"
-                    />
-                    <select
-                      className="panel-input"
-                      value={editForm.test_type}
-                      onChange={e => setEditForm({ ...editForm, test_type: e.target.value })}
+                <div className="panel-section-group" key={group.section}>
+                  <div className="panel-section-header">
+                    <button
+                      type="button"
+                      className="panel-section-toggle"
+                      onClick={() => toggleSection(group.section)}
+                      aria-expanded={!collapsed}
                     >
-                      <option value="required_field">required_field</option>
-                      <option value="format_validation">format_validation</option>
-                      <option value="successful_submit">successful_submit</option>
-                      <option value="conditional_field">conditional_field</option>
-                      <option value="widget_auto_fill">widget_auto_fill</option>
-                      <option value="attachment">attachment</option>
-                      <option value="label_check">label_check</option>
-                    </select>
-                    <div className="card-btns">
-                      <button className="btn-save" onClick={() => handleSaveEdit(tc.id)}>Save</button>
-                      <button className="btn-cancel" onClick={() => setEditingId(null)}>Cancel</button>
-                    </div>
-                  </div>
-                ) : (
-                  <>
-                    <div className="card-top">
-                      <span className="card-num">{index + 1}</span>
-                      <span className="card-name">{tc.name}</span>
-                      <span
-                        className={`tc-status ${
-                          st === 'Passed'
-                            ? 'tc-passed'
-                            : st === 'Failed'
-                              ? 'tc-failed'
-                              : st === 'Skipped'
-                                ? 'tc-skipped'
-                                : 'tc-notrun'
-                        }`}
-                      >
-                        {st === 'Passed'
-                          ? '✓ Passed'
-                          : st === 'Failed'
-                            ? '✗ Failed'
-                            : st === 'Skipped'
-                              ? '⊘ Skipped'
-                              : 'Not Run'}
+                      <span className="panel-section-chevron">{collapsed ? '▸' : '▾'}</span>
+                      <span className="panel-section-title">{group.section}</span>
+                      <span className="panel-section-counts">
+                        {counts.total} test{counts.total !== 1 ? 's' : ''}
+                        {counts.passed > 0 && <span className="summary-passed"> · ✓ {counts.passed}</span>}
+                        {counts.failed > 0 && <span className="summary-failed"> · ✗ {counts.failed}</span>}
+                        {counts.skipped > 0 && <span className="summary-skipped"> · ⊘ {counts.skipped}</span>}
+                        {counts.pending > 0 && <span className="summary-notrun"> · ○ {counts.pending}</span>}
                       </span>
-                      <div className="card-btns">
-                        <button className="btn-edit" onClick={() => startEdit(tc)}>Edit</button>
-                        <button className="btn-delete" onClick={() => setConfirmDelete(tc)}>Delete</button>
-                      </div>
-                    </div>
-                    <div className="card-body">
-                      <div className="card-field">
-                        <span className="field-label">Test type</span>
-                        <span className="field-value">{normalizeTestTypeUi(tc.test_type)}</span>
-                      </div>
-                      <div className="card-field">
-                        <span className="field-label">What to test</span>
-                        <span className="field-value">{tc.what_to_test}</span>
-                      </div>
-                      <div className="card-field">
-                        <span className="field-label">Expected result</span>
-                        <span className="field-value">{tc.expected_result}</span>
-                      </div>
-                      {tc.generation_reason && (
-                        <div className="card-field">
-                          <span className="field-label">Why this test was generated</span>
-                          <span className="field-value">{tc.generation_reason}</span>
-                        </div>
-                      )}
-                      {tc.notes && (
-                        <div className="card-field">
-                          <span className="field-label">Run notes</span>
-                          <span className="field-value">
-                            {tc.notes}
-                            {String(tc.notes).includes('/uploads/') && (
-                              <>
-                                <br />
-                                <a href={String(tc.notes).match(/\/uploads\/[^\s]+/)?.[0] || '#'} target="_blank" rel="noreferrer">
-                                  View screenshot
-                                </a>
-                              </>
-                            )}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
-            )
+                    </button>
+                    {hasAnyRun && (
+                      <button
+                        type="button"
+                        className="panel-section-run-btn"
+                        onClick={() => handleRun([group.section])}
+                        disabled={running || loading}
+                        title={`Run only ${group.section}`}
+                      >
+                        {runningSection === group.section ? 'Running…' : 'Run section'}
+                      </button>
+                    )}
+                  </div>
+                  {!collapsed && group.cases.map(tc => {
+                    cardIndex += 1
+                    return renderTestCard(tc, cardIndex - 1)
+                  })}
+                </div>
+              )
             })
           )}
         </div>

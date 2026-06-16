@@ -3670,6 +3670,14 @@ async function executeTestCase(tc, runContext = {}) {
     requiredFieldRunPreflightDone = true
   }
 
+  const executableTypes = new Set([
+    'required_field',
+    'format_validation',
+    'conditional_field',
+    'conditional_required',
+    'conditional_display',
+    'successful_submit'
+  ])
   await maybePrepareIdTypeFromWhatToTest(tc)
   const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
     .filter(Boolean)
@@ -3814,7 +3822,11 @@ async function executeTestCase(tc, runContext = {}) {
     }
     conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
     // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
-  } else if (testType === 'successful_submit') {
+  } else if (
+    executableTypes.has(testType) &&
+    !isConditionalFieldTestType(testType) &&
+    !(testType === 'required_field' && requiredFieldRunPreflightDone)
+  ) {
     await fillAllFieldsWithValidValues(target, {
       manualLike: true,
       deferCascadeChains: locCascadeHint
@@ -3895,10 +3907,7 @@ async function executeTestCase(tc, runContext = {}) {
       const dateInput = findDateInputForLabel(fieldLabel) || field
       valueHost = dateInput
       if (isCustomDatePickerInput(dateInput)) {
-        // Irembo custom pickers expect DMY (DD/MM/YYYY); getInvalidValueForFormat
-        // returns ISO. Convert when the invalid value is a real date.
-        const parsed = parseDateAny(invalid)
-        await setCustomDatePickerValue(dateInput, parsed ? formatDateDmy(parsed) : invalid)
+        await setCustomDatePickerValue(dateInput, invalid)
       } else {
         setInputValueNative(dateInput, invalid)
         dispatchInputEvents(dateInput)
@@ -4193,6 +4202,16 @@ async function resetFormStateAfterTest(targetField) {
   await wait(80)
 }
 
+function getCurrentSectionName() {
+  const headingSel = 'h1.section-title, h1, h2, h3, h4, .section-title, .step-title, .wizard-title'
+  for (const h of document.querySelectorAll(headingSel)) {
+    if (!isVisible(h)) continue
+    const txt = String(h.textContent || '').trim()
+    if (txt) return txt
+  }
+  return ''
+}
+
 /**
  * Section signature — a stable fingerprint of the currently-visible section.
  * Used by the multi-section bucketer in background.js to detect when clicking
@@ -4336,6 +4355,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'QA_HELPER_CANCEL_CURRENT_TEST') {
     cancelCurrentTestRequested = true
     sendResponse({ ok: true })
+    return true
+  }
+  if (message?.type === 'QA_HELPER_GET_CURRENT_SECTION') {
+    try {
+      sendResponse({ ok: true, section: getCurrentSectionName() })
+    } catch (err) {
+      sendResponse({ ok: false, section: '', error: String(err?.message || 'Failed to read section') })
+    }
     return true
   }
   if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {

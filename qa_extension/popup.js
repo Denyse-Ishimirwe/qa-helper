@@ -5,6 +5,7 @@ const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com
 const ACTIVE_JOB_KEY = 'qa_ext_active_job'
 const REUSABLE_ID_KEY = 'qa_ext_reusable_id_value'
 let lastEventSeq = 0
+const projectsById = new Map()
 
 function deriveAppBase(apiBase) {
   const base = String(apiBase || '').trim()
@@ -25,7 +26,10 @@ const els = {
   statusWrap: document.getElementById('statusWrap'),
   results: document.getElementById('results'),
   viewBtn: document.getElementById('viewResultsBtn'),
-  openAppBtn: document.getElementById('openAppBtn')
+  openAppBtn: document.getElementById('openAppBtn'),
+  sectionFilterWrap: document.getElementById('sectionFilterWrap'),
+  sectionSelect: document.getElementById('sectionSelect'),
+  sectionHint: document.getElementById('sectionHint')
 }
 
 function setRunControls(running) {
@@ -297,6 +301,253 @@ function _sendTabMessageWithTimeout(tabId, payload, timeoutMs = 3 * 60 * 1000) {
   })
 }
 
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function setSectionHint(text) {
+  if (!els.sectionHint) return
+  const msg = String(text || '').trim()
+  if (!msg) {
+    els.sectionHint.style.display = 'none'
+    els.sectionHint.textContent = ''
+    return
+  }
+  els.sectionHint.textContent = msg
+  els.sectionHint.style.display = 'block'
+}
+
+function updateRunButtonLabel() {
+  if (!els.runBtn) return
+  const projectId = Number(els.projectSelect?.value || 0)
+  if (!projectId) {
+    els.runBtn.textContent = 'Run tests'
+    return
+  }
+  const sectionValue = String(els.sectionSelect?.value || '').trim()
+  els.runBtn.textContent = sectionValue ? `Run section: ${sectionValue}` : 'Run all sections'
+}
+
+function resetSectionSelect(message = 'Select a project first', disabled = true) {
+  if (!els.sectionSelect) return
+  els.sectionSelect.disabled = disabled
+  els.sectionSelect.innerHTML = `<option value="">${escapeHtml(message)}</option>`
+  setSectionHint('')
+  updateRunButtonLabel()
+}
+
+function buildSectionsFromTestCaseRows(rows) {
+  const list = Array.isArray(rows) ? rows : []
+  if (!list.length) return { sections: [], testCases: [] }
+
+  const buckets = new Map()
+  for (const tc of list) {
+    const section = inferSectionFromTc(tc) || 'General'
+    if (!buckets.has(section)) buckets.set(section, [])
+    buckets.get(section).push(tc)
+  }
+
+  const sections = [...buckets.entries()].map(([name, testCases]) => ({ name, testCases }))
+  return { sections, testCases: list }
+}
+
+function normalizeExtensionTestCasesPayload(data) {
+  const raw = data && typeof data === 'object' ? data : {}
+
+  if (Array.isArray(raw.sections) && raw.sections.length > 0) {
+    const sections = raw.sections.map(group => ({
+      name: String(group?.name || 'General').trim() || 'General',
+      testCases: Array.isArray(group?.testCases) ? group.testCases : []
+    }))
+    const testCases = Array.isArray(raw.testCases) && raw.testCases.length
+      ? raw.testCases
+      : sections.flatMap(group => group.testCases)
+    return { sections, testCases }
+  }
+
+  if (Array.isArray(raw.testCases) && raw.testCases.length > 0) {
+    return buildSectionsFromTestCaseRows(raw.testCases)
+  }
+
+  // Legacy API: endpoint returned a flat array of test cases.
+  if (Array.isArray(data) && data.length > 0) {
+    return buildSectionsFromTestCaseRows(data)
+  }
+
+  return { sections: [], testCases: [] }
+}
+
+function inferSectionFromTc(tc) {
+  const explicit = String(tc?.section || '').trim()
+  if (explicit && explicit.toLowerCase() !== 'general') return explicit
+
+  const fromExp = String(tc?.expected_result || '').match(/;\s*section\s*:\s*([^;]+)/i)
+  if (fromExp?.[1]) return fromExp[1].trim()
+
+  const fromWtt = String(tc?.what_to_test || '').match(/\bin\s+the\s+(.+?)\s+section\b/i)
+  if (fromWtt?.[1]) return fromWtt[1].trim()
+
+  if (String(tc?.test_type || '').trim() === 'successful_submit') return 'Submit'
+  return ''
+}
+
+function sectionsMatchPopup(a, b) {
+  const na = String(a || '').trim().toLowerCase()
+  const nb = String(b || '').trim().toLowerCase()
+  if (!na || !nb) return false
+  return na === nb
+}
+
+function collectAllTestCases(data, groups) {
+  if (Array.isArray(data?.testCases) && data.testCases.length) return data.testCases
+  return groups.flatMap(group => (Array.isArray(group?.testCases) ? group.testCases : []))
+}
+
+function buildDisplaySectionOrder(data, groups, allTestCases) {
+  const ordered = []
+  const seen = new Set()
+
+  const addName = (name) => {
+    const normalized = String(name || '').trim()
+    if (!normalized || normalized.toLowerCase() === 'general') return
+    const key = normalized.toLowerCase()
+    if (seen.has(key)) return
+    seen.add(key)
+    ordered.push(normalized)
+  }
+
+  for (const name of Array.isArray(data?.displaySectionOrder) ? data.displaySectionOrder : []) addName(name)
+  for (const name of Array.isArray(data?.formSectionOrder) ? data.formSectionOrder : []) addName(name)
+  for (const name of Array.isArray(data?.sectionOrder) ? data.sectionOrder : []) addName(name)
+
+  for (const group of groups) {
+    addName(group?.name)
+  }
+
+  for (const tc of allTestCases) {
+    addName(inferSectionFromTc(tc))
+  }
+
+  return ordered
+}
+
+function countTestsForSection(allTestCases, sectionName) {
+  return allTestCases.filter(tc => sectionsMatchPopup(inferSectionFromTc(tc), sectionName)).length
+}
+
+function buildSectionDropdownOptions(data, groups, totalTests) {
+  const allTestCases = collectAllTestCases(data, groups)
+  const displaySections = buildDisplaySectionOrder(data, groups, allTestCases)
+
+  const options = []
+  const allLabel = `All sections (${totalTests} test${totalTests === 1 ? '' : 's'})`
+  options.push(`<option value="">${escapeHtml(allLabel)}</option>`)
+
+  if (displaySections.length > 0) {
+    for (const name of displaySections) {
+      const count = countTestsForSection(allTestCases, name)
+      const label = `${name} (${count} test${count === 1 ? '' : 's'})`
+      options.push(`<option value="${escapeHtml(name)}">${escapeHtml(label)}</option>`)
+    }
+    return { options, displaySections, hint: 'Pick a form section to run only that step, or leave as all sections.' }
+  }
+
+  // No named form sections — show grouped buckets except duplicating "All sections".
+  const fallbackGroups = groups.filter(group => {
+    const name = String(group?.name || '').trim()
+    const count = Array.isArray(group?.testCases) ? group.testCases.length : 0
+    return count > 0 && name.toLowerCase() !== 'general'
+  })
+
+  const useGroups = fallbackGroups.length > 0
+    ? fallbackGroups
+    : groups.filter(group => (group?.testCases || []).length > 0)
+
+  for (const group of useGroups) {
+    const name = String(group?.name || '').trim()
+    if (!name) continue
+    const count = Array.isArray(group?.testCases) ? group.testCases.length : 0
+    if (!count) continue
+    const label = `${name} (${count} test${count === 1 ? '' : 's'})`
+    options.push(`<option value="${escapeHtml(name)}">${escapeHtml(label)}</option>`)
+  }
+
+  return {
+    options,
+    displaySections: useGroups.map(g => g.name),
+    hint: useGroups.length <= 1
+      ? 'This project has one section. All tests will run on that step.'
+      : 'Pick a section to re-run only that part, or leave as all sections.'
+  }
+}
+
+async function loadSectionOptions(projectId) {
+  if (!els.sectionSelect) return
+  const id = Number(projectId || 0)
+  if (!id) {
+    resetSectionSelect('Select a project first', true)
+    return
+  }
+
+  resetSectionSelect('Loading sections...', true)
+
+  try {
+    const token = await ensureExtensionToken()
+    if (!token) {
+      resetSectionSelect('Log in to load sections', true)
+      setSectionHint('Log in here or open the QA Helper app while signed in.')
+      return
+    }
+
+    const res = await fetch(`${API_BASE}/api/projects/${id}/extension-test-cases`, {
+      headers: authHeaders()
+    })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      throw new Error(data.error || `Could not load test cases (HTTP ${res.status})`)
+    }
+
+    let { sections: groups } = normalizeExtensionTestCasesPayload(data)
+    let totalTests = groups.reduce(
+      (sum, group) => sum + (Array.isArray(group?.testCases) ? group.testCases.length : 0),
+      0
+    )
+
+    // Fallback: some backends only expose the plain test_cases list.
+    if (totalTests === 0) {
+      const fallbackRes = await fetch(`${API_BASE}/api/projects/${id}/test_cases`, {
+        headers: authHeaders()
+      })
+      const fallbackData = await fallbackRes.json().catch(() => [])
+      if (fallbackRes.ok && Array.isArray(fallbackData) && fallbackData.length > 0) {
+        const fallback = buildSectionsFromTestCaseRows(fallbackData)
+        groups = fallback.sections
+        totalTests = fallback.testCases.length
+      }
+    }
+
+    if (totalTests === 0) {
+      resetSectionSelect('No test cases yet', true)
+      setSectionHint('Generate test cases for this project in the QA Helper app, then re-select the project.')
+      return
+    }
+
+    const { options, displaySections, hint } = buildSectionDropdownOptions(data, groups, totalTests)
+
+    els.sectionSelect.disabled = false
+    els.sectionSelect.innerHTML = options.join('')
+    setSectionHint(hint)
+    updateRunButtonLabel()
+  } catch (err) {
+    resetSectionSelect('Could not load sections', true)
+    setSectionHint(String(err?.message || 'Failed to load sections for this project.'))
+  }
+}
+
 async function loadProjects() {
   try {
     hideOpenApp()
@@ -318,11 +569,14 @@ async function loadProjects() {
       showOpenApp('No projects found — create one in the app first')
       return
     }
+    projectsById.clear()
+    for (const p of projects) projectsById.set(Number(p.id), p)
     const options = ['<option value="">Select project</option>']
     for (const p of projects) options.push(`<option value="${p.id}">${p.name}</option>`)
     els.projectSelect.innerHTML = options.join('')
     setStatus(`Loaded ${projects.length} projects`)
     hideOpenApp()
+    await loadSectionOptions(Number(els.projectSelect.value || 0))
   } catch (err) {
     setStatus(err.message || 'Failed to load projects')
   }
@@ -518,8 +772,12 @@ async function runExtensionTests() {
     const activeTab = tabs?.[0]
     if (!activeTab?.id) throw new Error('Could not access active tab')
 
-    setStatus('Running tests...', true)
-    renderProgress(0, 1, 'Running tests...')
+    const sectionValue = String(els.sectionSelect?.value || '').trim()
+    const sectionsFilter = sectionValue ? [sectionValue] : []
+    const runLabel = sectionValue ? `Running section: ${sectionValue}...` : 'Running all sections...'
+
+    setStatus(runLabel, true)
+    renderProgress(0, 1, runLabel)
 
     const started = await new Promise((resolve, reject) => {
       chrome.runtime.sendMessage(
@@ -529,7 +787,8 @@ async function runExtensionTests() {
           apiBase: API_BASE,
           token: getStoredToken(),
           tabId: activeTab.id,
-          reusableIdValue
+          reusableIdValue,
+          sectionsFilter
         },
         (resp) => {
           if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message))
@@ -741,6 +1000,14 @@ if (els.stopBtn) {
 }
 if (els.openAppBtn) {
   els.openAppBtn.addEventListener('click', openApp)
+}
+if (els.projectSelect) {
+  els.projectSelect.addEventListener('change', () => {
+    void loadSectionOptions(Number(els.projectSelect.value || 0))
+  })
+}
+if (els.sectionSelect) {
+  els.sectionSelect.addEventListener('change', updateRunButtonLabel)
 }
 
 async function initExtension() {
