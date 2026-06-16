@@ -3611,8 +3611,18 @@ async function executeTestCase(tc, runContext = {}) {
       if (!isParentRadioAlreadySet(parentField, parentTrigger)) {
         if (!setParentConditionalValue(parentField, parentTrigger)) applyConditionalDomFallback(parentLabel, parentTrigger)
       }
-      await wait(400)
       pendingConditionalLabelParent = { label: parentLabel }
+      // Poll for the child to appear — same 5×200ms retry shape the conditional
+      // handlers use — instead of a single fixed wait that fails on slow fields.
+      let childAppeared = false
+      for (let i = 0; i < 5; i += 1) {
+        const probe = resolveFieldTarget(fieldLabel, fieldName)?.element
+        if (probe && isVisible(probe)) { childAppeared = true; break }
+        await wait(200)
+      }
+      if (!childAppeared) {
+        return { passed: false, message: 'conditional field did not appear after setting parent' }
+      }
     }
 
     const lcTarget = resolveFieldTarget(fieldLabel, fieldName)
