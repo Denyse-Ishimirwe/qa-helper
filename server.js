@@ -39,6 +39,7 @@ const ALLOWED_TEST_TYPES = [
   'label_check'
 ]
 const extensionScanJobs = new Map()
+const generatingProjects = new Set()
 
 if (!jwtSecret) {
   throw new Error('JWT_SECRET is required. Add it to your .env file before starting the server.')
@@ -1016,41 +1017,50 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'No SRD text found for this project' })
     }
 
-    // Fix 2: Delete old test cases before inserting new ones
-    await db.run('DELETE FROM test_cases WHERE project_id = ?', req.params.id)
-
-    let formStructure = null
-    if (project.form_structure) {
-      try {
-        formStructure = JSON.parse(project.form_structure)
-      } catch {
-        // Keep null form structure when saved JSON is malformed.
+    // In-flight guard: refuse a second concurrent generate for the same project,
+    // which would otherwise race the delete+insert and double the test cases.
+    const projectKey = String(req.params.id)
+    if (generatingProjects.has(projectKey)) {
+      return res.status(409).json({
+        error: 'Test cases are already being generated for this project. Please wait for the current run to finish.'
+      })
+    }
+    generatingProjects.add(projectKey)
+    try {
+      let formStructure = null
+      if (project.form_structure) {
+        try {
+          formStructure = JSON.parse(project.form_structure)
+        } catch {
+          // Keep null form structure when saved JSON is malformed.
+        }
       }
+
+      // Generate first (no DB writes yet), then clear + insert ATOMICALLY so a
+      // failed or concurrent run can never leave a doubled or empty set.
+      const testCases = await generateTestCases(project.srd_text, formStructure)
+
+      const statements = [
+        { sql: 'DELETE FROM test_cases WHERE project_id = ?', args: [projectKey] }
+      ]
+      for (const tc of testCases) {
+        const testType = ALLOWED_TEST_TYPES.includes(tc.test_type)
+          ? tc.test_type
+          : 'required_field'
+        statements.push({
+          sql: 'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)',
+          args: [projectKey, tc.name, tc.what_to_test, tc.expected_result, testType]
+        })
+      }
+      await db.batch(statements)
+
+      // Align project status with new test_cases (typically all Not Run → In Progress).
+      await recomputeProjectStatusFromTestCases(projectKey)
+
+      res.json({ success: true, testCases })
+    } finally {
+      generatingProjects.delete(projectKey)
     }
-
-    const rawCases = await generateTestCases(project.srd_text, formStructure)
-    const testCases = enrichTestCasesWithSections(rawCases, formStructure)
-
-    for (const tc of testCases) {
-      const testType = ALLOWED_TEST_TYPES.includes(tc.test_type)
-        ? tc.test_type
-        : 'required_field'
-      const section = isUnsetSection(tc.section) ? '' : String(tc.section).trim()
-      await db.run(
-        'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section) VALUES (?, ?, ?, ?, ?, ?)',
-        req.params.id,
-        tc.name,
-        tc.what_to_test,
-        tc.expected_result,
-        testType,
-        section
-      )
-    }
-
-    // Align project status with new test_cases (typically all Not Run → In Progress).
-    await recomputeProjectStatusFromTestCases(req.params.id)
-
-    res.json({ success: true, testCases })
 
   } catch (err) {
     console.error(err)
