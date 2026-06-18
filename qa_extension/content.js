@@ -1846,6 +1846,83 @@ function findContinueButton() {
   return allButtons.find(btn => /continue|next/i.test(String(btn.textContent || '').trim())) || null
 }
 
+/** Format-validation: only messages tied to the target field container (directly below / in same wrapper). */
+function pickMatchedMessageForFormatValidation(entries, expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
+  const expectedNorm = normalizeLabelText(String(expectedResult || ''))
+  const whatToTestNorm = normalizeLabelText(String(whatToTest || ''))
+  const targetNorm = sanitizeSearchLabel(targetLabel)
+  const targetEl = targetField?.element
+
+  const scoped = (entries || []).filter(entry => {
+    if (!entry?.text || !targetEl || !entry?.element) return false
+    return isMessageDomDescendantOfTargetFieldContainer(entry.element, targetEl)
+  })
+
+  if (scoped.length === 0) {
+    return { matched: '', belowField: false }
+  }
+
+  for (const entry of scoped) {
+    const norm = normalizeLabelText(entry.text)
+    if (!norm) continue
+    if (expectedNorm && (norm === expectedNorm || norm.includes(expectedNorm) || expectedNorm.includes(norm))) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, norm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (formatValidationLooseMatch(norm, expectedNorm, whatToTestNorm, targetNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+  }
+
+  return { matched: '', belowField: true }
+}
+
+async function clickContinueAndReadFieldScopedFormatError(
+  expectedResult,
+  targetLabel = '',
+  targetField = null,
+  whatToTest = '',
+  valueHostEl = null
+) {
+  const button = findContinueButton()
+  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  const urlBefore = String(location.href || '')
+  const anchorEl = valueHostEl || targetField?.element || null
+  const sectionEl = anchorEl?.closest?.(
+    'formly-group, formly-field, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field'
+  ) || null
+  scrollTestTargetIntoView(button)
+  await wait(280)
+  button.click()
+  const entries = await getVisibleValidationEntriesWithRetry()
+  const probeField = valueHostEl
+    ? { element: valueHostEl, kind: targetField?.kind }
+    : targetField
+  const { matched, belowField } = pickMatchedMessageForFormatValidation(
+    entries,
+    expectedResult,
+    targetLabel,
+    probeField,
+    whatToTest
+  )
+  const sectionAdvanced = detectFormAdvanced(urlBefore, sectionEl)
+  return {
+    ok: true,
+    matched,
+    belowField,
+    sectionAdvanced,
+    messages: entries.map(e => e.text)
+  }
+}
+
 async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
   const button = findContinueButton()
   if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
@@ -1869,9 +1946,10 @@ async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targ
 function getInvalidValueForFormat(tc) {
   const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
 
-  // Age / DOB minimum (e.g. "minimum 18 years", "must be 18 or older") → too-young date (10 years ago).
+  // Age / DOB minimum (e.g. "must make applicant above 18 years old") → too-young date.
   const isAgeRule =
     /\bdate of birth\b|\bdob\b|\bage\b/.test(text) ||
+    /\babove\s+18\b|18\s*years?\s*old|minimum\s+(?:age\s+)?18|must\s+make\s+applicant\s+above/i.test(text) ||
     /\d{1,3}\s*(?:years?|yrs?)\s*(?:or older|and above|old|of age)/.test(text) ||
     /(?:older than|at least|minimum|min\.?|over)\s*\d{1,3}\s*(?:years?|yrs?)/.test(text) ||
     /\b\d{1,3}\s*(?:or older|and above|or above)\b/.test(text)
@@ -1879,6 +1957,18 @@ function getInvalidValueForFormat(tc) {
     const d = new Date()
     d.setFullYear(d.getFullYear() - 10)
     return d.toISOString().slice(0, 10)
+  }
+
+  // Exact digit length (e.g. "ID Number must be 16 digits") → too few digits.
+  const exactDigits =
+    text.match(/(?:must\s+be|exactly|length\s+of)\s*(\d+)\s*digits?/) ||
+    text.match(/(\d+)\s*digits?\s*(?:long|only|exact|required)/) ||
+    text.match(/\b(\d+)\s*-?\s*digit\b/)
+  if (exactDigits) {
+    const n = Number(exactDigits[1])
+    if (Number.isFinite(n) && n > 1) {
+      return '1'.repeat(Math.max(1, Math.min(5, n - 1)))
+    }
   }
 
   // "maximum N characters" → a string longer than N.
@@ -3927,17 +4017,24 @@ async function executeTestCase(tc, runContext = {}) {
       return { skipped: true, reason: 'invalid value was not accepted by field — Angular may have rejected it' }
     }
 
-    const clicked = await clickContinueAndReadErrors(
+    const clicked = await clickContinueAndReadFieldScopedFormatError(
       tc?.expected_result,
       fieldLabel,
       target,
-      String(tc?.what_to_test || '')
+      String(tc?.what_to_test || ''),
+      valueHost
     )
     if (!clicked.ok) return { passed: false, message: clicked.error }
     if (clicked.sectionAdvanced) {
       return {
         passed: false,
-        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — field did not block submit. Subsequent tests on this section are unreliable.`
+        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — invalid value did not block Continue.`
+      }
+    }
+    if (!clicked.belowField || !clicked.matched) {
+      return {
+        passed: false,
+        message: 'No error appeared below the field'
       }
     }
     // Clean up: restore a valid value so the invalid value used to trigger
@@ -3949,8 +4046,8 @@ async function executeTestCase(tc, runContext = {}) {
       // Refill failure is non-fatal — the test result is already determined.
     }
     return {
-      passed: Boolean(clicked.matched),
-      message: clicked.matched || '',
+      passed: true,
+      message: String(clicked.matched || '').trim(),
       skipFullResetAfter: true
     }
   }
