@@ -89,6 +89,17 @@
         margin-top: 8px;
         background-color: #2E75B6;
       }
+      select:disabled {
+        background: #f3f4f6;
+        color: #888;
+        cursor: not-allowed;
+      }
+      #sectionHint {
+        margin: 4px 0 0;
+        font-size: 11px;
+        line-height: 1.35;
+        color: #888;
+      }
     </style>
   </head>
   <body>
@@ -100,13 +111,20 @@
     </div>
 
     <div id="runSection" class="section">
-      <div class="muted">Select Project</div>
+      <div class="muted">Select project</div>
       <select id="projectSelect">
         <option value="">Loading projects...</option>
       </select>
-      <div class="muted" style="margin-top:8px;"> ID value (required)</div>
+      <div id="sectionFilterWrap">
+        <div class="muted" style="margin-top:8px;">Section to run</div>
+        <select id="sectionSelect" disabled>
+          <option value="">Select a project first</option>
+        </select>
+        <p id="sectionHint" class="muted" style="display:none;"></p>
+      </div>
+      <div class="muted" style="margin-top:8px;">ID value (required)</div>
       <input id="reusableIdValue" type="text" required placeholder="Enter ID" />
-      <button id="runTest">Run Test</button>
+      <button id="runTest">Run tests</button>
       <button id="stopTest" style="display:none; margin-top:8px;">Stop Test</button>
       <button id="viewResultsBtn" style="display:none; margin-top:8px;">View Full Results</button>
     </div>

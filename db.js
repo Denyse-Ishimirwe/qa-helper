@@ -85,6 +85,7 @@ const SCHEMA_SQL = `
     expected_outcome TEXT DEFAULT 'should_pass',
     status TEXT DEFAULT 'Not Run',
     test_type TEXT DEFAULT 'required_field',
+    section TEXT DEFAULT '',
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY (project_id) REFERENCES projects(id)
   );
@@ -209,6 +210,7 @@ async function initTurso(url, authToken) {
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN expected_outcome TEXT DEFAULT 'should_pass'`)
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN generation_reason TEXT DEFAULT ''`)
   await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN notes TEXT DEFAULT ''`)
+  await tryExecTurso(`ALTER TABLE test_cases ADD COLUMN section TEXT DEFAULT ''`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN user_id INTEGER`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN form_structure TEXT`)
   await tryExecTurso(`ALTER TABLE projects ADD COLUMN login_url TEXT`)
@@ -277,6 +279,12 @@ async function initSqlite() {
 
   try {
     _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN notes TEXT DEFAULT ''`)
+  } catch {
+    // Column already exists.
+  }
+
+  try {
+    _sqlite.exec(`ALTER TABLE test_cases ADD COLUMN section TEXT DEFAULT ''`)
   } catch {
     // Column already exists.
   }

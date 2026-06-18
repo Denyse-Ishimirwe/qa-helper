@@ -1,6 +1,7 @@
+import 'dotenv/config'
 import Groq from 'groq-sdk'
 import { GoogleGenerativeAI } from '@google/generative-ai'
-import 'dotenv/config'
+import { assignSectionsFromFormStructure } from './sections.js'
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 const genAI = process.env.GOOGLE_API_KEY ? new GoogleGenerativeAI(process.env.GOOGLE_API_KEY) : null
@@ -118,6 +119,7 @@ LABEL CHECK (generate these FIRST, grouped by section):
 — CONDITIONAL fields: generate ONE case per trigger option (one row per trigger), each with its own "parent: <ParentLabel>=<TriggerValue>".
 — what_to_test MUST be specific, naming section + label (+ placeholder), e.g.:
   "Checking that the First Name field in the Personal Information section has the label 'First Name' and placeholder 'Enter your first name'".
+— Every test case MUST include "section": the SRD Block / section name for that field or rule. Use the exact Block column text from the SRD. For successful_submit use the final section name or "Submit".
 — ORDER: group output by section in SRD order; within each section emit that section's label_check cases FIRST, then that section's other test types (Section 1 block, then Section 2 block, …).
 
 CONDITIONAL FIELDS (visibility / required-if / display-if — test_type MUST be conditional_field, never required_field):
@@ -163,7 +165,7 @@ General:
 — Widget flows (choose widget type before dependent fields when the SRD says so): reflect SRD order inside what_to_test in the same short sentence style.
 
 Output schema per element:
-{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check" }
+{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check", "section": string }
 
 STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
@@ -508,7 +510,8 @@ async function generateTestCases(srdText, formStructure) {
         name: String(tc?.name || '').trim(),
         what_to_test: String(tc?.what_to_test || '').trim(),
         expected_result: String(tc?.expected_result || '').trim(),
-        test_type: normalizeGeneratedType(tc?.test_type)
+        test_type: normalizeGeneratedType(tc?.test_type),
+        section: String(tc?.section || '').trim()
       }))
       .filter(tc => tc.name && tc.what_to_test && tc.expected_result && tc.test_type !== '__drop__')
   }
@@ -596,7 +599,11 @@ async function generateTestCases(srdText, formStructure) {
   function finalizeCases(rawPass) {
     const merged = dedupeCases(buildCoverageCases(rawPass))
     const kept = merged.filter(passesMinimalUsability)
-    return kept.length ? kept : merged
+    const withSections = assignSectionsFromFormStructure(
+      kept.length ? kept : merged,
+      formStructure
+    )
+    return withSections
   }
 
   async function requestOnce(extraRules = '') {
@@ -788,7 +795,8 @@ async function analyzeFormStructure(fields) {
             ${JSON.stringify(fields)}
 
             Analyse these fields and return a JSON object describing the form structure:
-            { "fields": [{ "id": "", "name": "", "label": "", "type": "", "required": false, "selector": "", "errorSelector": "", "formatErrorSelector": "", "optional": false }], "submitButton": { "id": "", "selector": "" }, "successSelector": "" }.
+            { "sections": [{ "name": "", "order": 0 }], "fields": [{ "id": "", "name": "", "label": "", "type": "", "required": false, "selector": "", "section": "", "errorSelector": "", "formatErrorSelector": "", "optional": false }], "submitButton": { "id": "", "selector": "" }, "successSelector": "" }.
+            sections: ordered list of visible form section/step titles discovered on the page (wizard steps, h1.section-title blocks, etc.). Each field must include "section" with the heading/block it belongs to.
             successSelector: optional single CSS selector for a visible success confirmation after submit (toast, alert, banner). Omit or use "" if unknown.
             errorSelector / formatErrorSelector: optional per-field CSS selectors for validation messages when inferable from the field list; otherwise omit or "".
             Use this to help generate intelligent test cases.
@@ -814,6 +822,8 @@ async function analyzeFormStructure(fields) {
           f?.selector || (f?.id ? `#${String(f.id || '').trim()}` : '')
         ).trim() || `field_${idx}`
       }
+      const section = String(f?.section || '').trim()
+      if (section) row.section = section
       const err = String(f?.errorSelector || '').trim()
       const fmt = String(f?.formatErrorSelector || '').trim()
       if (err) row.errorSelector = err
@@ -826,8 +836,21 @@ async function analyzeFormStructure(fields) {
       selector: String(parsed?.submitButton?.selector || '').trim()
     }
     const successSelector = String(parsed?.successSelector || '').trim()
+    const sections = Array.isArray(parsed?.sections)
+      ? parsed.sections
+          .map((row, idx) => ({
+            name: String(row?.name || row?.title || row || '').trim(),
+            order: Number.isFinite(Number(row?.order)) ? Number(row.order) : idx
+          }))
+          .filter(row => row.name)
+      : []
 
-    return { fields: safeFields, submitButton, ...(successSelector ? { successSelector } : {}) }
+    return {
+      ...(sections.length ? { sections } : {}),
+      fields: safeFields,
+      submitButton,
+      ...(successSelector ? { successSelector } : {})
+    }
   }
 
   try {

@@ -227,7 +227,50 @@ function sendTabMessageWithTimeout(tabId, payload, timeoutMs = PER_TEST_CASE_TIM
   })
 }
 
-async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId, reusableIdValue, skipTestTypes = [] }) {
+function normalizeSectionName(name) {
+  return String(name || '').replace(/\s+/g, ' ').trim()
+}
+
+function sectionsMatch(a, b) {
+  const na = normalizeSectionName(a).toLowerCase()
+  const nb = normalizeSectionName(b).toLowerCase()
+  if (!na && !nb) return true
+  return na === nb
+}
+
+function sortCasesWithinSection(cases) {
+  const labelChecks = []
+  const rest = []
+  const submit = []
+  for (const tc of Array.isArray(cases) ? cases : []) {
+    const tt = String(tc?.test_type || '').trim()
+    if (tt === 'label_check') labelChecks.push(tc)
+    else if (tt === 'successful_submit') submit.push(tc)
+    else rest.push(tc)
+  }
+  return [...labelChecks, ...rest, ...submit]
+}
+
+function inferSectionFromTc(tc) {
+  const explicit = normalizeSectionName(tc?.section)
+  if (explicit && explicit.toLowerCase() !== 'general') return explicit
+
+  const fromExp = String(tc?.expected_result || '').match(/;\s*section\s*:\s*([^;]+)/i)
+  if (fromExp?.[1]) return normalizeSectionName(fromExp[1])
+
+  const fromWtt = String(tc?.what_to_test || '').match(/\bin\s+the\s+(.+?)\s+section\b/i)
+  if (fromWtt?.[1]) return normalizeSectionName(fromWtt[1])
+
+  if (String(tc?.test_type || '').trim() === 'successful_submit') return 'Submit'
+  return ''
+}
+
+function collectAllExtensionTestCases(tcData, sectionGroups) {
+  if (Array.isArray(tcData?.testCases) && tcData.testCases.length) return tcData.testCases
+  return sectionGroups.flatMap(group => (Array.isArray(group?.testCases) ? group.testCases : []))
+}
+
+async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId, reusableIdValue, skipTestTypes = [], sectionsFilter = [] }) {
   let startUrl = ''
   try {
     const t = await chrome.tabs.get(tabId)
@@ -261,8 +304,38 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   const tcData = await tcRes.json().catch(() => ({}))
   if (!tcRes.ok) throw new Error(tcData.error || 'Failed to fetch extension test cases')
 
-  const testCases = Array.isArray(tcData) ? tcData : (Array.isArray(tcData?.testCases) ? tcData.testCases : [])
-  if (!testCases.length) throw new Error('No test cases found — generate them in the app first')
+  const sectionGroups = Array.isArray(tcData?.sections) && tcData.sections.length
+    ? tcData.sections
+    : [{
+        name: 'General',
+        testCases: Array.isArray(tcData?.testCases)
+          ? tcData.testCases
+          : (Array.isArray(tcData) ? tcData : [])
+      }]
+
+  const filterList = Array.isArray(sectionsFilter)
+    ? sectionsFilter.map(s => normalizeSectionName(s)).filter(Boolean)
+    : []
+
+  let groupsToRun = sectionGroups
+  if (filterList.length > 0) {
+    const allCases = collectAllExtensionTestCases(tcData, sectionGroups)
+    groupsToRun = filterList.map(sectionName => ({
+      name: sectionName,
+      testCases: sortCasesWithinSection(
+        allCases.filter(tc => sectionsMatch(sectionName, inferSectionFromTc(tc)))
+      )
+    })).filter(group => group.testCases.length > 0)
+  }
+
+  const testCases = groupsToRun.flatMap(group => sortCasesWithinSection(group?.testCases || []))
+  if (!testCases.length) {
+    throw new Error(
+      filterList.length
+        ? `No test cases found for section "${filterList[0]}" — check section names match the SRD or re-generate test cases`
+        : 'No test cases found — generate them in the app first'
+    )
+  }
 
   setRunState({ total: testCases.length, message: `Starting tests (1/${testCases.length})...` })
 
@@ -272,41 +345,14 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   let skipped = 0
   let lastConditionalParentSetupKey = ''
   let activeIndex = 0
-
-  // Multi-section bucketer.
-  // remaining  = tests still waiting to be probed/run on the current section
-  // deferred   = tests whose target/parent field is not on the current section;
-  //              tried again after each Continue-advance to the next section
-  // deferCount = how many sections a given test has been deferred from; capped
-  //              so a hallucinated field doesn't stall the whole run forever
   const MAX_SECTION_ADVANCES = 8
-  const MAX_DEFERS_PER_TEST = 3
-  // successful_submit fills + submits the WHOLE form, so it must run absolutely
-  // last — after every other test on every section. Hold those cases aside and
-  // run them once the section bucketer has drained everything else.
-  const submitCases = testCases.filter(t => String(t?.test_type) === 'successful_submit')
-  let remaining = testCases.filter(t => String(t?.test_type) !== 'successful_submit')
-  let deferred = []
-  const deferCount = new Map()
-  let sectionsAdvanced = 0
 
-  function tcDeferKey(tc) {
-    return String(tc?.id || `${tc?.name || ''}::${tc?.test_type || ''}::${tc?.what_to_test || ''}`)
-  }
-
-  async function probeReachable(tc) {
+  async function getCurrentSectionName() {
     try {
-      const response = await sendTabMessageWithTimeout(
-        tabId,
-        { type: 'QA_HELPER_PROBE_FIELD_VISIBLE', testCase: tc },
-        8000
-      )
-      if (!response) return true
-      if (response.ok === false) return true // fail-open on probe error
-      if (response.visible) return true
-      return false
+      const response = await sendTabMessageWithTimeout(tabId, { type: 'QA_HELPER_GET_CURRENT_SECTION' }, 8000)
+      return normalizeSectionName(response?.section || '')
     } catch {
-      return true // fail-open so probe failures don't strand tests
+      return ''
     }
   }
 
@@ -320,6 +366,39 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       return Boolean(response?.ok && response?.sectionChanged)
     } catch {
       return false
+    }
+  }
+
+  async function navigateToSection(targetSection) {
+    const target = normalizeSectionName(targetSection)
+    if (!target) return true
+
+    for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
+      const current = await getCurrentSectionName()
+      if (sectionsMatch(current, target)) return true
+      if (attempt >= MAX_SECTION_ADVANCES) break
+      const advanced = await attemptSectionAdvance()
+      if (!advanced) return false
+      setRunState({ contentNeedsReprime: true })
+      lastConditionalParentSetupKey = ''
+    }
+    const finalSection = await getCurrentSectionName()
+    return sectionsMatch(finalSection, target)
+  }
+
+  async function probeReachable(tc) {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        { type: 'QA_HELPER_PROBE_FIELD_VISIBLE', testCase: tc },
+        8000
+      )
+      if (!response) return true
+      if (response.ok === false) return true
+      if (response.visible) return true
+      return false
+    } catch {
+      return true
     }
   }
 
@@ -423,76 +502,34 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     setRunState({ passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
   }
 
-  while ((remaining.length > 0 || deferred.length > 0) && !RUN_STATE.cancellationRequested) {
-    // 1) Drain everything that's reachable on the current section.
-    //    label_check cases for this section run BEFORE its other test types.
-    while (remaining.length > 0 && !RUN_STATE.cancellationRequested) {
-      const lcIdx = remaining.findIndex(t => String(t?.test_type) === 'label_check')
-      const tc = lcIdx >= 0 ? remaining.splice(lcIdx, 1)[0] : remaining.shift()
-      const reachable = await probeReachable(tc)
-      if (reachable) {
-        await runOneTest(tc)
-      } else {
-        const key = tcDeferKey(tc)
-        const count = (deferCount.get(key) || 0) + 1
-        deferCount.set(key, count)
-        if (count > MAX_DEFERS_PER_TEST) {
-          failUnreachable(
-            tc,
-            `Field never became reachable after ${MAX_DEFERS_PER_TEST} section advances — possibly a stale or hallucinated field name`
-          )
-        } else {
-          deferred.push(tc)
-          setRunState({
-            message: `Deferred ${pickCaseFieldLabel(tc)} — not on current section (${deferred.length} deferred)`
-          })
-        }
-      }
-    }
+  for (let groupIndex = 0; groupIndex < groupsToRun.length && !RUN_STATE.cancellationRequested; groupIndex += 1) {
+    const group = groupsToRun[groupIndex]
+    const sectionName = normalizeSectionName(group?.name || 'General')
+    const sectionCases = sortCasesWithinSection(group?.testCases || [])
+    if (!sectionCases.length) continue
 
-    if (deferred.length === 0) break
-    if (RUN_STATE.cancellationRequested) break
-    if (sectionsAdvanced >= MAX_SECTION_ADVANCES) {
-      for (const tc of deferred) {
-        failUnreachable(
-          tc,
-          `Field never became reachable — section-advance cap (${MAX_SECTION_ADVANCES}) reached`
-        )
-      }
-      deferred = []
-      break
-    }
-
-    // 2) Try to advance to the next section. ADVANCE_AND_PROBE fills any
-    //    remaining visible fields, clicks Continue, and reports whether the
-    //    section signature changed.
     setRunState({
-      message: `Advancing to next section (${deferred.length} test${deferred.length === 1 ? '' : 's'} deferred)...`
+      message: `Section ${groupIndex + 1}/${groupsToRun.length}: ${sectionName} (${sectionCases.length} test${sectionCases.length === 1 ? '' : 's'})`
     })
-    const advanced = await attemptSectionAdvance()
-    if (advanced) {
-      sectionsAdvanced += 1
-      remaining = deferred
-      deferred = []
-      lastConditionalParentSetupKey = ''
-      setRunState({ contentNeedsReprime: true })
-    } else {
-      for (const tc of deferred) {
+
+      const reached = await navigateToSection(sectionName)
+      if (!reached) {
+        for (const tc of sectionCases) {
+          failUnreachable(tc, `Could not navigate to section "${sectionName}"`)
+        }
+        continue
+      }
+
+      for (const tc of sectionCases) {
+      if (RUN_STATE.cancellationRequested) break
+      const reachable = await probeReachable(tc)
+      if (!reachable) {
         failUnreachable(
           tc,
-          'Field never became reachable — Continue did not advance the form (likely validation block or last section)'
+          `Field not visible on section "${sectionName}" — check section tagging or form state`
         )
+        continue
       }
-      deferred = []
-      break
-    }
-  }
-
-  // Run successful_submit LAST — only after the bucketer has tested everything
-  // else (it advances/submits the form, so it must not run before other tests).
-  if (!RUN_STATE.cancellationRequested) {
-    for (const tc of submitCases) {
-      if (RUN_STATE.cancellationRequested) break
       await runOneTest(tc)
     }
   }
@@ -556,7 +593,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       token: String(message.token || ''),
       tabId: Number(message.tabId || 0),
       reusableIdValue: String(message.reusableIdValue || '').trim(),
-      skipTestTypes: Array.isArray(message.skipTestTypes) ? message.skipTestTypes : []
+      skipTestTypes: Array.isArray(message.skipTestTypes) ? message.skipTestTypes : [],
+      sectionsFilter: Array.isArray(message.sectionsFilter) ? message.sectionsFilter : []
     }
     if (!payload.projectId || !payload.apiBase || !payload.token || !payload.tabId || !payload.reusableIdValue) {
       sendResponse({ ok: false, error: 'Missing run configuration (reusable ID is required)' })

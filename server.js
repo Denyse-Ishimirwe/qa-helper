@@ -9,6 +9,7 @@ import upload from './multer.js'
 import extractText from './upload.js'
 import generateTestCases, { analyzeFormStructure } from './ai.js'
 import runTests from './Runtests.js'
+import { buildExtensionSectionsPayload, enrichTestCasesWithSections, extractSectionsFromFormStructure, inferSectionFromTestCase, isUnsetSection, sectionsMatch } from './sections.js'
 import ExcelJS from 'exceljs'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
@@ -1112,9 +1113,30 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
         return ''
       }
 
+      const isVisible = (el) => {
+        if (!el) return false
+        const st = window.getComputedStyle(el)
+        return st.display !== 'none' && st.visibility !== 'hidden' && el.offsetParent !== null
+      }
+
+      const getSectionTitleForElement = (el) => {
+        if (!el) return ''
+        const titleSelectors = 'h1.section-title, h1, h2, h3, .section-title, .step-title, .wizard-title'
+        const titles = Array.from(document.querySelectorAll(titleSelectors)).filter(isVisible)
+        let best = ''
+        for (const title of titles) {
+          if (title.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) {
+            best = String(title.textContent || '').trim()
+          }
+        }
+        return best
+      }
+
       const elements = Array.from(document.querySelectorAll('input, select, textarea, button'))
       const fields = []
       let submitButton = null
+      const sectionOrder = []
+      const sectionSeen = new Set()
 
       for (const el of elements) {
         const tag = el.tagName.toLowerCase()
@@ -1131,6 +1153,7 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
           : name
             ? `${tag}[name="${name.replace(/"/g, '\\"')}"]`
             : ''
+        const section = getSectionTitleForElement(el)
 
         if (isSubmit && !submitButton) {
           submitButton = { id, selector: selector || `${tag}[type="submit"]` }
@@ -1145,6 +1168,14 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
 
         if (!interactive) continue
 
+        if (section) {
+          const key = section.toLowerCase()
+          if (!sectionSeen.has(key)) {
+            sectionSeen.add(key)
+            sectionOrder.push({ name: section, order: sectionOrder.length })
+          }
+        }
+
         fields.push({
           element: tag,
           type: inputType || (tag === 'select' ? 'select' : tag),
@@ -1153,11 +1184,12 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
           placeholder,
           label,
           required,
-          selector
+          selector,
+          ...(section ? { section } : {})
         })
       }
 
-      return { fields, submitButton }
+      return { fields, submitButton, sections: sectionOrder }
     })
 
     const aiStructure = await analyzeFormStructure([
@@ -1166,6 +1198,11 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
     ])
 
     const formStructure = {
+      ...(Array.isArray(extracted.sections) && extracted.sections.length
+        ? { sections: extracted.sections }
+        : Array.isArray(aiStructure?.sections) && aiStructure.sections.length
+          ? { sections: aiStructure.sections }
+          : {}),
       fields: Array.isArray(aiStructure?.fields) ? aiStructure.fields : extracted.fields,
       submitButton: aiStructure?.submitButton?.selector || aiStructure?.submitButton?.id
         ? aiStructure.submitButton
@@ -1195,8 +1232,10 @@ app.get('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
   const ownedProject = await ensureProjectOwner(req, res)
   if (!ownedProject) return
 
+  const project = await db.get('SELECT form_structure FROM projects WHERE id = ?', req.params.id)
   const testCases = await db.all('SELECT * FROM test_cases WHERE project_id = ?', req.params.id)
-  res.json(testCases)
+  const enriched = enrichTestCasesWithSections(testCases, project?.form_structure || null)
+  res.json(enriched)
 })
 
 /**
@@ -1393,7 +1432,7 @@ app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) 
 
     const rows = await db.all(
       `
-      SELECT id, name, test_type, what_to_test, expected_result
+      SELECT id, name, test_type, what_to_test, expected_result, section
       FROM test_cases
       WHERE project_id = ?
       ORDER BY id ASC
@@ -1405,7 +1444,10 @@ app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) 
       ? rows.filter(tc => !skipTypes.includes(String(tc.test_type || '')))
       : rows
 
-    const formatted = filtered.map(tc => {
+    const project = await db.get('SELECT form_structure FROM projects WHERE id = ?', req.params.id)
+    const enriched = enrichTestCasesWithSections(filtered, project?.form_structure || null)
+
+    const formatted = enriched.map(tc => {
       const inferred = inferFieldLabelAndName(tc)
       return {
         id: tc.id,
@@ -1413,12 +1455,42 @@ app.get('/api/projects/:id/extension-test-cases', requireAuth, async (req, res) 
         test_type: tc.test_type || 'required_field',
         what_to_test: tc.what_to_test || '',
         expected_result: tc.expected_result || '',
+        section: isUnsetSection(tc.section) ? inferSectionFromTestCase(tc) : String(tc.section).trim(),
         field_label: inferred.field_label,
         field_name: inferred.field_name
       }
     })
 
-    return res.json(formatted)
+    const payload = buildExtensionSectionsPayload(formatted, project?.form_structure || null)
+    const formSectionOrder = extractSectionsFromFormStructure(project?.form_structure || null)
+    const displaySectionOrder = []
+    const seenSections = new Set()
+    for (const name of [...formSectionOrder, ...payload.sectionOrder]) {
+      const normalized = String(name || '').trim()
+      if (!normalized || isUnsetSection(normalized)) continue
+      const key = normalized.toLowerCase()
+      if (seenSections.has(key)) continue
+      seenSections.add(key)
+      displaySectionOrder.push(normalized)
+    }
+
+    return res.json({
+      testCases: formatted,
+      sectionOrder: payload.sectionOrder,
+      formSectionOrder,
+      displaySectionOrder,
+      sections: payload.sections.map(group => ({
+        name: group.name,
+        testCases: group.testCases.map(tc => {
+          const inferred = inferFieldLabelAndName(tc)
+          return {
+            ...tc,
+            field_label: inferred.field_label,
+            field_name: inferred.field_name
+          }
+        })
+      }))
+    })
   } catch (err) {
     console.error('extension-test-cases error:', err)
     return res.status(500).json({ error: err.message || 'Failed to fetch extension test cases' })
@@ -1666,7 +1738,7 @@ app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
     const ownedTestCase = await ensureTestCaseOwner(req, res)
     if (!ownedTestCase) return
 
-    const { name, what_to_test, expected_result, test_type } = req.body
+    const { name, what_to_test, expected_result, test_type, section } = req.body
 
     if (!name || !what_to_test || !expected_result) {
       return res.status(400).json({ error: 'All fields are required' })
@@ -1675,12 +1747,16 @@ app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
     const safeTestType = ALLOWED_TEST_TYPES.includes(test_type)
       ? test_type
       : 'required_field'
+    const safeSection = isUnsetSection(section)
+      ? ''
+      : String(section || inferSectionFromTestCase({ name, what_to_test, expected_result, test_type: safeTestType }) || '').trim()
     await db.run(
-      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ? WHERE id = ?',
+      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ?, section = ? WHERE id = ?',
       name,
       what_to_test,
       expected_result,
       safeTestType,
+      safeSection,
       req.params.id
     )
 
@@ -1715,7 +1791,10 @@ app.post('/api/projects/:id/run', requireAuth, async (req, res) => {
     if (!ownedProject) return
 
     const projectId = req.params.id
-    const results = await runTests(projectId)
+    const sectionsFilter = Array.isArray(req.body?.sections)
+      ? req.body.sections.map(s => String(s || '').trim()).filter(Boolean)
+      : null
+    const results = await runTests(projectId, { sections: sectionsFilter })
     const { runId } = await persistRunResults(projectId, results)
     res.json({ success: true, runId, results })
   } catch (err) {
@@ -1942,7 +2021,7 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
     const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
-    const { name, what_to_test, expected_result, test_type } = req.body
+    const { name, what_to_test, expected_result, test_type, section } = req.body
     const project_id = req.params.id
 
     if (!name || !what_to_test || !expected_result) {
@@ -1952,13 +2031,17 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
     const safeTestType = ALLOWED_TEST_TYPES.includes(test_type)
       ? test_type
       : 'required_field'
+    const safeSection = isUnsetSection(section)
+      ? ''
+      : String(section || inferSectionFromTestCase({ name, what_to_test, expected_result, test_type: safeTestType }) || '').trim()
     const result = await db.run(
-      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section) VALUES (?, ?, ?, ?, ?, ?)',
       project_id,
       name,
       what_to_test,
       expected_result,
-      safeTestType
+      safeTestType,
+      safeSection
     )
 
     await recomputeProjectStatusFromTestCases(project_id)
