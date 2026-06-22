@@ -702,6 +702,55 @@
   align-items: center;
   gap: 14px 18px;
   font-weight: bold;
+  margin-bottom: 12px;
+}
+
+.panel-status-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.panel-status-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border: 1.5px solid #0063cf;
+  border-radius: 16px;
+  background: white;
+  color: #0063cf;
+  font-size: 12px;
+  font-weight: bold;
+  cursor: pointer;
+  font-family: Arial, sans-serif;
+}
+
+.panel-status-filter:hover {
+  background: #eef4fc;
+}
+
+.panel-status-filter.active {
+  background: #0063cf;
+  color: white;
+}
+
+.panel-status-filter-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: rgba(0, 99, 207, 0.12);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.panel-status-filter.active .panel-status-filter-count {
+  background: rgba(255, 255, 255, 0.22);
+  color: white;
 }
 
 .summary-passed { color: #155724; }
