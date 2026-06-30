@@ -58,6 +58,48 @@ export function parseFormStructure(raw) {
   }
 }
 
+/** Merge a freshly-captured (per-step) structure into the stored one.
+ *  Sections: union by normalized name, first-seen document order preserved
+ *  (existing first, then any new ones). Fields: union by normalized label, with
+ *  the incoming (freshest, live) section winning. Any other keys already on the
+ *  stored structure (submitButton, AI-analyzed field selectors, …) are kept.
+ *  Both args may be a JSON string, an object, or null. */
+export function mergeFormStructure(existing, incoming) {
+  const base = parseFormStructure(existing) || {}
+  const add = parseFormStructure(incoming) || {}
+
+  // sections — union by lowercase name, first-seen order
+  const sectionByKey = new Map()
+  const pushSection = (raw) => {
+    const name = normalizeSectionName(raw?.name ?? raw)
+    if (!name) return
+    const key = name.toLowerCase()
+    if (!sectionByKey.has(key)) sectionByKey.set(key, name)
+  }
+  for (const s of Array.isArray(base.sections) ? base.sections : []) pushSection(s)
+  for (const s of Array.isArray(add.sections) ? add.sections : []) pushSection(s)
+  const sections = [...sectionByKey.values()].map((name, order) => ({ name, order }))
+
+  // fields — union by lowercase label, incoming section wins, other props kept
+  const fieldByKey = new Map()
+  for (const f of Array.isArray(base.fields) ? base.fields : []) {
+    const label = normalizeSectionName(f?.label)
+    if (!label) continue
+    fieldByKey.set(label.toLowerCase(), { ...f, label })
+  }
+  for (const f of Array.isArray(add.fields) ? add.fields : []) {
+    const label = normalizeSectionName(f?.label)
+    if (!label) continue
+    const key = label.toLowerCase()
+    const prev = fieldByKey.get(key) || { label }
+    const section = normalizeSectionName(f?.section)
+    fieldByKey.set(key, { ...prev, label, section: section || prev.section || '' })
+  }
+  const fields = [...fieldByKey.values()]
+
+  return { ...base, sections, fields }
+}
+
 /** Ordered section names from analyse JSON, else first-seen order on fields. */
 export function extractSectionsFromFormStructure(formStructure) {
   const parsed = parseFormStructure(formStructure)
@@ -90,20 +132,25 @@ export function extractSectionsFromFormStructure(formStructure) {
 }
 
 export function buildSectionOrder(testCases, formStructure) {
-  const fromForm = extractSectionsFromFormStructure(formStructure)
   const seen = new Set()
   const order = []
 
-  for (const name of fromForm) {
+  // PRIMARY: the order sections first appear across the test cases. Cases are
+  // stored/fetched ORDER BY id — i.e. generation/SRD document order — so
+  // first-appearance equals the SRD section sequence. This drives the order, so a
+  // block-level / capture-order form_structure can never reshuffle the real sequence.
+  for (const tc of Array.isArray(testCases) ? testCases : []) {
+    const name = inferSectionFromTestCase(tc)
+    if (isUnsetSection(name)) continue
     const key = name.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
     order.push(name)
   }
 
-  for (const tc of Array.isArray(testCases) ? testCases : []) {
-    const name = inferSectionFromTestCase(tc)
-    if (isUnsetSection(name)) continue
+  // SUPPLEMENT: any form_structure sections not already covered (e.g. a section
+  // that has no cases yet). Appended AFTER — never allowed to reorder the cases.
+  for (const name of extractSectionsFromFormStructure(formStructure)) {
     const key = name.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
@@ -239,9 +286,33 @@ function buildLabelSectionMapFromFormStructure(formStructure) {
   return map
 }
 
-function resolveSectionForTestCase(tc, labelSectionMaps) {
-  let section = inferSectionFromTestCase(tc)
-  if (!isUnsetSection(section)) return section
+/** The captured LIVE form heading for a test case, matched by field-label overlap
+ *  (exact token first, then substring). '' when no captured field matches. */
+function liveSectionForTestCase(tc, formStructureMap) {
+  if (!formStructureMap || formStructureMap.size === 0) return ''
+  const tokens = fieldLabelTokens(tc).map(t => t.toLowerCase())
+  for (const t of tokens) {
+    const hit = formStructureMap.get(t)
+    if (hit) return hit
+  }
+  for (const t of tokens) {
+    for (const [label, sec] of formStructureMap.entries()) {
+      if (label === t || label.includes(t) || t.includes(label)) return sec
+    }
+  }
+  return ''
+}
+
+function resolveSectionForTestCase(tc, labelSectionMaps, formStructureMap) {
+  // The STORED case is the source of truth: honor its own section (tc.section, or
+  // the section encoded in its expected_result / what_to_test) before anything live.
+  const stored = inferSectionFromTestCase(tc)
+  if (!isUnsetSection(stored)) return stored
+
+  // Live capture (block-level h1.section-title via formStructureMap) only FILLS IN
+  // when the case carries no usable stored section — it never overrides a stored one.
+  const live = liveSectionForTestCase(tc, formStructureMap)
+  if (live) return live
 
   for (const token of fieldLabelTokens(tc)) {
     for (const map of labelSectionMaps) {
@@ -257,13 +328,14 @@ function resolveSectionForTestCase(tc, labelSectionMaps) {
 /** Resolve the best section for every test case (label checks, form JSON, field names). */
 export function enrichTestCasesWithSections(testCases, formStructure) {
   const list = Array.isArray(testCases) ? testCases : []
+  const formStructureMap = buildLabelSectionMapFromFormStructure(formStructure)
   const labelSectionMaps = [
     buildLabelSectionMapFromLabelChecks(list),
-    buildLabelSectionMapFromFormStructure(formStructure)
+    formStructureMap
   ]
 
   const enriched = list.map(tc => {
-    const section = resolveSectionForTestCase(tc, labelSectionMaps)
+    const section = resolveSectionForTestCase(tc, labelSectionMaps, formStructureMap)
     return {
       ...tc,
       section: isUnsetSection(section) ? '' : section

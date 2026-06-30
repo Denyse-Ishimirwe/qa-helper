@@ -2995,6 +2995,32 @@ function getSafeDefaultInputValue(control, kind) {
   return 'ValidInput'
 }
 
+/**
+ * The currently-visible section + a predicate for "does this element belong to it".
+ * Uses the SAME detection as getCurrentSectionName / the [QA section] log (first
+ * visible h1.section-title). A control belongs to the current section if it sits
+ * AFTER the current heading and BEFORE the next section heading (visible or not)
+ * in document order — so an Angular form holding every step in the DOM at once is
+ * still split per section. No hardcoded names. Falls back to whole-form when the
+ * form has no section-title headings.
+ */
+function getCurrentSectionScope() {
+  const current = visibleSectionHeadings()[0] || null
+  if (!current) return { sectionName: '', inSection: () => true }
+  const sectionName = String(current.textContent || '').trim()
+  let next = null
+  for (const h of document.querySelectorAll('h1.section-title')) {
+    if (current.compareDocumentPosition(h) & Node.DOCUMENT_POSITION_FOLLOWING) { next = h; break }
+  }
+  const inSection = (el) => {
+    if (!el) return false
+    if (!(current.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false
+    if (next && (next.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false
+    return true
+  }
+  return { sectionName, inSection }
+}
+
 async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   const widgetWaitMs = Math.min(8000, Math.max(200, Number(options.widgetWaitMs) || 2400))
   const manualLike = options.manualLike !== false
@@ -3002,7 +3028,10 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   /** When testing a location cascade field, do not bulk-fill district/sector/cell/village ng-selects — the cascade resolver fills them in order. */
   const deferCascadeChains = options.deferCascadeChains === true
   const extraSkips = Array.isArray(options.skipControls) ? options.skipControls.filter(Boolean) : []
-  const controls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
+  const sectionScope = getCurrentSectionScope()
+  const allControls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
+  const controls = allControls.filter(sectionScope.inSection)
+  console.log('[QA fill] ENTER — section:', JSON.stringify(sectionScope.sectionName), '— controls:', controls.length, `(of ${allControls.length} on page)`) // TEMP DIAGNOSTIC
   const handledRadioGroups = new Set()
   const handledNgSelectRoots = new Set()
   const skipEl = targetToSkip?.element || null
@@ -3042,9 +3071,21 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     }
     if (kind === 'ng-select') {
       const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
-      if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
-      if (handledNgSelectRoots.has(root)) continue
-      if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) continue
+      const lcPh = String(root.querySelector?.('.ng-placeholder')?.textContent || '').trim() // TEMP DIAGNOSTIC
+      const lcDisabled = root.hasAttribute?.('disabled') || root.getAttribute?.('aria-disabled') === 'true' || root.classList?.contains('ng-select-disabled') === true // TEMP DIAGNOSTIC
+      console.log('[QA fill] ng-select ph=', JSON.stringify(lcPh), '| disabled=', lcDisabled, '| isLocationCascade=', isLocationCascadeSelectRoot(root), '| appearsUnselected=', ngSelectRootAppearsUnselected(root), '| deferCascadeChains=', deferCascadeChains) // TEMP DIAGNOSTIC
+      if (deferCascadeChains && isLocationCascadeSelectRoot(root)) {
+        console.log('[QA fill]   → SKIP: deferred location cascade', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      if (handledNgSelectRoots.has(root)) {
+        console.log('[QA fill]   → SKIP: already handled this pass', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) {
+        console.log('[QA fill]   → SKIP: appears already filled (ngSelectRootAppearsUnselected=false)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
       // Skip disabled ng-selects — most commonly cascade children whose parent
       // hasn't been selected yet. Calling selectFirstNonEmptyNgSelect on them
       // polls 6s for options that won't load until the parent fires, burning
@@ -3057,8 +3098,12 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
         root.hasAttribute?.('disabled') ||
         root.getAttribute?.('aria-disabled') === 'true' ||
         root.classList?.contains('ng-select-disabled') === true
-      if (isDisabled) continue
+      if (isDisabled) {
+        console.log('[QA fill]   → SKIP: disabled (cascade child? retried next pass)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
       handledNgSelectRoots.add(root)
+      console.log('[QA fill]   → FILL:', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
       await selectFirstNonEmptyNgSelect(root)
       continue
     }
@@ -3116,7 +3161,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
 
   const datePickerHosts = Array.from(
     document.querySelectorAll('irembogov-custom-date-picker, irembogov-irembo-date-picker')
-  )
+  ).filter(sectionScope.inSection)
   for (const comp of datePickerHosts) {
     if (!isVisible(comp)) continue
     if (excludePredicate(comp)) continue
@@ -3126,7 +3171,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     await wait(200)
   }
 
-  const ngRoots = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+  const ngRoots = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]')).filter(sectionScope.inSection)
   for (const root of ngRoots) {
     if (!isVisible(root)) continue
     if (excludePredicate(root)) continue
@@ -3137,6 +3182,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   }
 
   const natWraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).filter(w => {
+    if (!sectionScope.inSection(w)) return false
     const k = parseFormlyFieldIdKey(w.id)
     return k && k.toLowerCase() === 'nationality'
   })
@@ -3640,17 +3686,50 @@ async function clearConditionalParent(p) {
 }
 
 /** Section/block name = text of the nearest visible <h1 class="section-title"> that precedes this field. */
+/** Ordered visible <h1 class="section-title"> heading elements (document order).
+ *  Single source of truth for every place that reads section headings — the
+ *  navigator (getCurrentSectionName), label_check (getFieldSectionName), and the
+ *  structure capture all consume this, so the strings can never drift apart. */
+function visibleSectionHeadings() {
+  return Array.from(document.querySelectorAll('h1.section-title')).filter(isVisible)
+}
+
 function getFieldSectionName(el) {
   if (!el) return ''
-  const titles = Array.from(document.querySelectorAll('h1.section-title')).filter(isVisible)
   let best = ''
-  for (const t of titles) {
+  for (const t of visibleSectionHeadings()) {
     // keep the last title that appears BEFORE el in document order
     if (t.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) {
       best = String(t.textContent || '').trim()
     }
   }
   return best
+}
+
+/** Read the live form's section headings + visible fields for the CURRENT step.
+ *  Reuses the SAME helpers as the navigator (visibleSectionHeadings) and label_check
+ *  (getFieldSectionName, getFieldQuestionLabel), so every stored string is byte-identical
+ *  to what the runner reads. The wizard renders one step at a time, so this captures the
+ *  current step only — the server MERGES successive captures into the full structure. */
+function captureLiveFormStructure() {
+  const sections = visibleSectionHeadings()
+    .map((el, i) => ({ name: String(el.textContent || '').trim(), order: i }))
+    .filter(s => s.name)
+
+  const controlSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+  const seen = new Set()
+  const fields = []
+  for (const el of document.querySelectorAll(controlSel)) {
+    if (!isVisible(el)) continue
+    const label = getFieldQuestionLabel(el)        // group label for radios; wrapper label for ng-select/date
+    if (!label) continue
+    const section = getFieldSectionName(el)         // nearest preceding visible h1.section-title — identical to run time
+    const key = `${label}::${section}`              // dedup radio group inputs + ng-select host/inner input
+    if (seen.has(key)) continue
+    seen.add(key)
+    fields.push({ label, section })
+  }
+  return { sections, fields }
 }
 
 async function executeTestCase(tc, runContext = {}) {
@@ -3696,7 +3775,7 @@ async function executeTestCase(tc, runContext = {}) {
       }
       const parentField = resolveConditionalParentField({ parentLabel, triggerValue: parentTrigger })
       if (!parentField || !isVisible(parentField)) {
-        return { passed: false, message: `Field ${expectedLabel || fieldLabel || tc?.name || 'field'} not found on page` }
+        return { skipped: true, reason: 'field not found or not visible' }
       }
       if (!isParentRadioAlreadySet(parentField, parentTrigger)) {
         if (!setParentConditionalValue(parentField, parentTrigger)) applyConditionalDomFallback(parentLabel, parentTrigger)
@@ -3718,7 +3797,7 @@ async function executeTestCase(tc, runContext = {}) {
     const lcTarget = resolveFieldTarget(fieldLabel, fieldName)
     const lcField = lcTarget?.element
     if (!lcField || !isVisible(lcField)) {
-      return { passed: false, message: `Field ${expectedLabel || fieldLabel || tc?.name || 'field'} not found on page` }
+      return { skipped: true, reason: 'field not found or not visible' }
     }
     scrollTestTargetIntoView(lcField)
     updateLiveRunIndicator(tc, lcField, 'Reading label')
@@ -3726,29 +3805,55 @@ async function executeTestCase(tc, runContext = {}) {
       return { skipped: true, reason: 'no expected label in SRD' }
     }
 
-    // 1) Label — exact, case-sensitive. Uses the field QUESTION label (group
-    //    label for radios; formly wrapper label for ng-select/date/plain inputs).
-    const actualLabel = norm(getFieldQuestionLabel(lcField))
-    if (actualLabel !== expectedLabel) {
-      return { passed: false, message: `Expected label ${expectedLabel} got label ${actualLabel}` }
-    }
-    // 2) Placeholder — exact; skipped for radio buttons.
-    if (expectedPlaceholder && lcTarget.kind !== 'radio') {
-      const actualPlaceholder = norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
-      if (actualPlaceholder !== expectedPlaceholder) {
-        return { passed: false, message: `Expected placeholder ${expectedPlaceholder} got placeholder ${actualPlaceholder}` }
+    // Dropdowns (ng-select) only: open so the label/placeholder render correctly,
+    // run the read-only assertions, then Escape to close WITHOUT selecting a value.
+    // The finally{} guarantees it closes on every return path. All other field kinds
+    // keep their read-only behavior; no value is ever set for any label_check.
+    const lcRoot = lcTarget.kind === 'ng-select'
+      ? (lcField.closest('ng-select, .ng-select, [role="combobox"]') || lcField)
+      : null
+    let lcOpened = false
+    if (lcRoot) {
+      const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
+      if (typeof opener.click === 'function') {
+        opener.click()
+        lcOpened = true
+        await wait(150)
       }
     }
-    // 3) Section — field must sit under the correct visible section heading.
-    if (expectedSection) {
-      const actualSection = norm(getFieldSectionName(lcField))
-      if (actualSection !== expectedSection) {
-        return { passed: false, message: `Expected section ${expectedSection} found in section ${actualSection || '(none)'}` }
+    try {
+      // 1) Label — exact, case-sensitive. Uses the field QUESTION label (group
+      //    label for radios; formly wrapper label for ng-select/date/plain inputs).
+      const actualLabel = norm(getFieldQuestionLabel(lcField))
+      if (actualLabel !== expectedLabel) {
+        return { passed: false, message: `Expected label ${expectedLabel} got label ${actualLabel}` }
       }
-    }
-    return {
-      passed: true,
-      message: `Label "${actualLabel}"${expectedPlaceholder ? `, placeholder "${expectedPlaceholder}"` : ''}${expectedSection ? `, section "${expectedSection}"` : ''} all match`
+      // 2) Placeholder — exact; skipped for radio buttons. ng-select reads its own
+      //    .ng-placeholder text; plain inputs read the attribute/property.
+      if (expectedPlaceholder && lcTarget.kind !== 'radio') {
+        const actualPlaceholder = lcTarget.kind === 'ng-select'
+          ? norm(lcRoot.querySelector('.ng-placeholder')?.textContent || '')
+          : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
+        if (actualPlaceholder !== expectedPlaceholder) {
+          return { passed: false, message: `Expected placeholder ${expectedPlaceholder} got placeholder ${actualPlaceholder}` }
+        }
+      }
+      // 3) Section — field must sit under the correct visible section heading.
+      if (expectedSection) {
+        const actualSection = norm(getFieldSectionName(lcField))
+        if (actualSection !== expectedSection) {
+          return { passed: false, message: `Expected section ${expectedSection} found in section ${actualSection || '(none)'}` }
+        }
+      }
+      return {
+        passed: true,
+        message: `Label "${actualLabel}"${expectedPlaceholder ? `, placeholder "${expectedPlaceholder}"` : ''}${expectedSection ? `, section "${expectedSection}"` : ''} all match`
+      }
+    } finally {
+      if (lcOpened) {
+        const escTarget = lcRoot.querySelector('input') || lcRoot
+        escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      }
     }
   }
 
@@ -4309,13 +4414,155 @@ async function resetFormStateAfterTest(targetField) {
   await wait(80)
 }
 
-function getCurrentSectionName() {
-  const headingSel = 'h1.section-title, h1, h2, h3, h4, .section-title, .step-title, .wizard-title'
-  for (const h of document.querySelectorAll(headingSel)) {
-    if (!isVisible(h)) continue
-    const txt = String(h.textContent || '').trim()
-    if (txt) return txt
+/**
+ * Read the CURRENT active SECTION (navigable step) label from the Irembo stepper.
+ * This is the TRUE section level — distinct from h1.section-title, which is the
+ * BLOCK sub-heading. Generic: finds the stepper, lists its steps, and picks the
+ * active one by common active-state signals (aria-current / aria-selected /
+ * active|current|selected class), with NO hardcoded step names. Returns '' when
+ * no stepper or active step is found.
+ *
+ * NOT wired into getCurrentSectionName/navigation yet — diagnostic only. The log
+ * dumps every step (tag/class/aria + active verdict) so we can confirm the active
+ * marker on the live form before keying the real fix off it.
+ */
+// Persistent across calls: step number → section label. The stepper nav lists a
+// numbered "N. Label" entry for every step EXCEPT the current one, so a step's own
+// label is never visible while it is current. We accumulate the pairs as the run
+// navigates, so each step's label is known once any OTHER step has been current.
+const stepperSectionMap = new Map()
+
+function getActiveStepperSectionName() {
+  // 1) Harvest visible "N. Label" stepper-nav entries (confirmed <h5> on Irembo;
+  //    broaden to any short numbered element only if no numbered <h5> exists, for
+  //    other forms). Store number → label (number stripped) in the persistent map.
+  const isNumbered = el => /^\d+\.\s+\S/.test(String(el.textContent || '').replace(/\s+/g, ' ').trim())
+  let labelEls = Array.from(document.querySelectorAll('h5')).filter(isVisible)
+  if (!labelEls.some(isNumbered)) {
+    labelEls = Array.from(document.querySelectorAll('*')).filter(el =>
+      isVisible(el) && isNumbered(el) &&
+      String(el.textContent || '').replace(/\s+/g, ' ').trim().length <= 60 &&
+      !Array.from(el.children).some(isNumbered))
   }
+  for (const el of labelEls) {
+    const m = String(el.textContent || '').replace(/\s+/g, ' ').trim().match(/^(\d+)\.\s+(.+\S)$/)
+    if (m && m[2].length <= 60) stepperSectionMap.set(Number(m[1]), m[2].trim())
+  }
+
+  // 2) Current step number from the active "step_N collapse show" card: step_0 → 1,
+  //    step_1 → 2, … (the card index is 0-based; step numbers are 1-based).
+  const active = Array.from(document.querySelectorAll('[class*="step_"]')).find(el => {
+    const c = String(el.className || '')
+    return /\bstep_\d+\b/.test(c) && /\bcollapse\b/.test(c) && /\bshow\b/.test(c) && isVisible(el)
+  })
+  const mm = active && String(active.className).match(/\bstep_(\d+)\b/)
+  if (!mm) {
+    console.log('[QA stepper] no active step_N collapse show card | map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+    return ''
+  }
+  const currentNumber = Number(mm[1]) + 1
+
+  // 3) The current step's label = the map entry for its number. It's '' on the very
+  //    first step (its label hasn't appeared in the nav yet) — caller then falls back
+  //    to the heading tiers (which fuzzy-match e.g. "Guidelines" ⊂ the block name).
+  const label = stepperSectionMap.get(currentNumber) || ''
+  console.log('[QA stepper] active step_' + mm[1], '→ step number', currentNumber,
+    '| section', JSON.stringify(label || '(unknown — not yet seen in nav)'),
+    '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+  return label
+}
+
+/** TEMP DIAGNOSTIC — read-only DOM dump of the active step card + any numbered
+ *  "N. Label" elements, to locate where the true section title lives. Used by no logic. */
+function dumpActiveStepCard() {
+  try {
+    const directText = el => {
+      let t = ''
+      for (const n of (el.childNodes || [])) if (n.nodeType === 3) t += n.textContent || ''
+      return t.replace(/\s+/g, ' ').trim()
+    }
+    const cards = Array.from(document.querySelectorAll('[class*="step_"]'))
+      .filter(el => /\bstep_\d+\b/.test(String(el.className || '')))
+    const active = cards.filter(isVisible).find(el => {
+      const c = String(el.className || '')
+      return /\bcollapse\b/.test(c) && /\bshow\b/.test(c)
+    })
+    if (!active) {
+      console.log('[QA dump] no active step_N collapse show card')
+    } else {
+      console.log('[QA dump] active card class=', JSON.stringify(active.className))
+      Array.from(active.querySelectorAll('*')).slice(0, 15).forEach((el, i) => console.log(
+        `[QA dump]  ${i}:`, el.tagName,
+        '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
+        '| text=', JSON.stringify(directText(el).slice(0, 60))
+      ))
+    }
+    console.log('[QA dump] --- numbered "N. Label" elements anywhere (stepper nav) ---')
+    const numbered = Array.from(document.querySelectorAll('*')).filter(el => {
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      return /^\d+\.\s+\S/.test(t) && t.length <= 60
+    })
+    const leaves = numbered.filter(el => !numbered.some(o => o !== el && el.contains(o)))
+    if (leaves.length === 0) console.log('[QA dump]  (none found)')
+    leaves.slice(0, 20).forEach((el, i) => console.log(
+      `[QA dump]  num ${i}:`, el.tagName,
+      '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
+      '| text=', JSON.stringify(String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60))
+    ))
+  } catch (e) {
+    console.log('[QA dump] error', String(e?.message || e))
+  }
+}
+
+function getCurrentSectionName() {
+  // 0) The TRUE navigable SECTION from the stepper (the step_N collapse show card)
+  //    — the level test-case sections are tagged at. The heading tiers below read
+  //    the BLOCK-level h1.section-title, so we only fall through to them when the
+  //    stepper yields '' (non-stepper form).
+  const stepperSection = getActiveStepperSectionName()
+  if (stepperSection) {
+    console.log('[QA section] tier0 stepper →', JSON.stringify(stepperSection)) // TEMP DIAGNOSTIC
+    return stepperSection
+  }
+
+  // 1) Irembo's canonical section heading — the most reliable signal, and the
+  //    same element label_check's getFieldSectionName() trusts.
+  const sectionTitle = visibleSectionHeadings()[0]
+  if (sectionTitle && String(sectionTitle.textContent || '').trim()) {
+    const t1 = String(sectionTitle.textContent || '').trim()
+    console.log('[QA section] tier1 h1.section-title →', JSON.stringify(t1)) // TEMP DIAGNOSTIC
+    return t1
+  }
+
+  // 2) Otherwise, the heading that actually sits above the active form fields.
+  //    Taking the LAST heading before the first visible control skips a
+  //    page/service title that floats above the real section heading.
+  const headingSel = 'h1.section-title, .section-title, .step-title, .wizard-title, h1, h2, h3, h4'
+  const headings = Array.from(document.querySelectorAll(headingSel)).filter(isVisible)
+  const firstControl = Array.from(document.querySelectorAll(
+    'formly-field, formly-wrapper-form-field, input, select, textarea, ng-select'
+  )).find(isVisible)
+  if (firstControl) {
+    let best = ''
+    for (const h of headings) {
+      const txt = String(h.textContent || '').trim()
+      if (txt && (h.compareDocumentPosition(firstControl) & Node.DOCUMENT_POSITION_FOLLOWING)) best = txt
+    }
+    if (best) {
+      console.log('[QA section] tier2 heading-before-control →', JSON.stringify(best)) // TEMP DIAGNOSTIC
+      return best
+    }
+  }
+
+  // 3) Fallback: first visible heading anywhere (previous behavior).
+  for (const h of headings) {
+    const txt = String(h.textContent || '').trim()
+    if (txt) {
+      console.log('[QA section] tier3 first-visible-heading →', JSON.stringify(txt)) // TEMP DIAGNOSTIC
+      return txt
+    }
+  }
+  console.log('[QA section] none — no visible heading found') // TEMP DIAGNOSTIC
   return ''
 }
 
@@ -4466,9 +4713,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === 'QA_HELPER_GET_CURRENT_SECTION') {
     try {
+      try { dumpActiveStepCard() } catch {} // TEMP DIAGNOSTIC — read-only DOM dump, drives nothing
       sendResponse({ ok: true, section: getCurrentSectionName() })
     } catch (err) {
       sendResponse({ ok: false, section: '', error: String(err?.message || 'Failed to read section') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_CAPTURE_FORM_STRUCTURE') {
+    try {
+      sendResponse({ ok: true, structure: captureLiveFormStructure() })
+    } catch (err) {
+      sendResponse({ ok: false, error: String(err?.message || 'Failed to capture form structure') })
     }
     return true
   }

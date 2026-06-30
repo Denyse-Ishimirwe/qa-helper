@@ -132,6 +132,20 @@ function authHeaders(token) {
   }
 }
 
+// Shared POST so both the popup-driven SAVE message and the in-run auto-capture
+// persist through one path. (A service worker can't message its own onMessage,
+// so auto-capture calls this directly rather than re-sending SAVE.)
+async function postFormStructure({ projectId, apiBase, token, structure }) {
+  const res = await fetch(`${apiBase}/api/projects/${projectId}/form-structure`, {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify(structure || {})
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || 'Failed to save form structure')
+  return data
+}
+
 function pickCaseFieldLabel(tc = {}) {
   const direct = String(tc?.field_label || '').trim()
   if (direct) return direct
@@ -235,7 +249,24 @@ function sectionsMatch(a, b) {
   const na = normalizeSectionName(a).toLowerCase()
   const nb = normalizeSectionName(b).toLowerCase()
   if (!na && !nb) return true
-  return na === nb
+  if (!na || !nb) return false
+  if (na === nb) return true
+
+  // Tokenize to significant words (drop punctuation and 1–2 char noise like
+  // "of", "to", numbering). Generic — no section-name lists.
+  const toks = s => new Set(
+    s.replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(w => w.length > 2)
+  )
+  const ta = toks(na)
+  const tb = toks(nb)
+  if (!ta.size || !tb.size) return na.includes(nb) || nb.includes(na)
+
+  let shared = 0
+  for (const w of ta) if (tb.has(w)) shared += 1
+  const ratio = shared / Math.min(ta.size, tb.size)
+  // Pass if the shorter name is fully contained (ratio===1), or they share
+  // most significant words.
+  return ratio === 1 || shared >= 2 || ratio >= 0.6
 }
 
 function sortCasesWithinSection(cases) {
@@ -299,7 +330,8 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
   const skipQuery = skipTestTypes.length ? `?skipTypes=${encodeURIComponent(skipTestTypes.join(','))}` : ''
   const tcRes = await fetch(`${apiBase}/api/projects/${projectId}/extension-test-cases${skipQuery}`, {
-    headers: authHeaders(token)
+    headers: authHeaders(token),
+    cache: 'no-store' // always pull the CURRENT cases (e.g. just-regenerated), never a stale HTTP-cached copy
   })
   const tcData = await tcRes.json().catch(() => ({}))
   if (!tcRes.ok) throw new Error(tcData.error || 'Failed to fetch extension test cases')
@@ -344,7 +376,6 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   let failed = 0
   let skipped = 0
   let lastConditionalParentSetupKey = ''
-  let activeIndex = 0
   const MAX_SECTION_ADVANCES = 8
 
   async function getCurrentSectionName() {
@@ -375,14 +406,17 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
     for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
       const current = await getCurrentSectionName()
+      console.log('[QA nav] attempt', attempt, '— target:', JSON.stringify(target), '| current:', JSON.stringify(current), '| match:', sectionsMatch(current, target)) // TEMP DIAGNOSTIC
       if (sectionsMatch(current, target)) return true
       if (attempt >= MAX_SECTION_ADVANCES) break
       const advanced = await attemptSectionAdvance()
       if (!advanced) return false
       setRunState({ contentNeedsReprime: true })
       lastConditionalParentSetupKey = ''
+      await captureAndPersistFormStructure()   // silent, best-effort — never blocks the run
     }
     const finalSection = await getCurrentSectionName()
+    console.log('[QA nav] FINAL — target:', JSON.stringify(target), '| current:', JSON.stringify(finalSection), '| match:', sectionsMatch(finalSection, target)) // TEMP DIAGNOSTIC
     return sectionsMatch(finalSection, target)
   }
 
@@ -403,12 +437,10 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   }
 
   async function runOneTest(tc) {
-    activeIndex += 1
     const fieldLabel = pickCaseFieldLabel(tc)
     const typeLabel = String(tc?.test_type || 'required_field').trim()
     setRunState({
-      current: activeIndex,
-      message: `Checking field: ${fieldLabel} | Type: ${typeLabel} (${activeIndex}/${testCases.length})`
+      message: `Checking field: ${fieldLabel} | Type: ${typeLabel} (${results.length + 1}/${testCases.length})`
     })
     let runResult
     let tabResponse = null
@@ -487,7 +519,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       lastConditionalParentSetupKey = ''
     }
     results.push(runResult)
-    setRunState({ passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
+    setRunState({ current: results.length, passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
   }
 
   function failUnreachable(tc, reason) {
@@ -499,9 +531,27 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       notes: `Failed: ${reason}`,
       screenshotDataUrl: ''
     })
-    setRunState({ passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
+    setRunState({ current: results.length, passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
   }
 
+  // Best-effort: grab the now-rendered section's headings+fields and persist them.
+  // Awaits the (fast, synchronous) DOM read so we capture the right step; the POST
+  // is fire-and-forget so the network never delays the run. All errors swallowed.
+  async function captureAndPersistFormStructure() {
+    try {
+      const resp = await sendTabMessageWithTimeout(tabId, { type: 'QA_HELPER_CAPTURE_FORM_STRUCTURE' }, 5000)
+      if (!resp?.ok || !resp.structure) return
+      postFormStructure({ projectId, apiBase, token, structure: resp.structure }).catch(() => {})
+    } catch {
+      // Auto-capture must never disrupt a run.
+    }
+  }
+
+  // Section-1 capture: grab the initial visible section before any advance, since
+  // navigateToSection returns early (no advance) when already on the target section.
+  await captureAndPersistFormStructure()
+
+  console.log('[QA groups]', groupsToRun.length, 'groups:', groupsToRun.map(g => g.name)) // TEMP DIAGNOSTIC
   for (let groupIndex = 0; groupIndex < groupsToRun.length && !RUN_STATE.cancellationRequested; groupIndex += 1) {
     const group = groupsToRun[groupIndex]
     const sectionName = normalizeSectionName(group?.name || 'General')
@@ -583,7 +633,11 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'QA_HELPER_START_EXTENSION_RUN') {
-    if (RUN_STATE.status === 'running') {
+    // Only block a double-start when a run is GENUINELY executing — `_activeRunPromise`
+    // is the truth (set while runExtensionTestsInBackground is in flight, nulled when it
+    // settles). A `status: 'running'` left behind by a run that ended without a clean
+    // terminal state is stale and must NOT strand the user — fall through and start fresh.
+    if (RUN_STATE.status === 'running' && _activeRunPromise) {
       sendResponse({ ok: true, alreadyRunning: true, state: getRunSnapshot() })
       return true
     }
@@ -636,6 +690,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       message: 'Stopping test run after current step...'
     })
     sendResponse({ ok: true, stopping: true, state: getRunSnapshot() })
+    return true
+  }
+
+  if (message?.type === 'QA_HELPER_SAVE_FORM_STRUCTURE') {
+    ;(async () => {
+      try {
+        const projectId = Number(message.projectId || 0)
+        const apiBase = String(message.apiBase || '')
+        const token = String(message.token || '')
+        if (!projectId || !apiBase || !token) {
+          sendResponse({ ok: false, error: 'Missing projectId, apiBase, or token' })
+          return
+        }
+        const data = await postFormStructure({ projectId, apiBase, token, structure: message.structure || {} })
+        sendResponse({ ok: true, summary: String(data.summary || ''), form_structure: data.form_structure || null })
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || 'Failed to save form structure') })
+      }
+    })()
     return true
   }
 

@@ -62,6 +62,10 @@ Also done outside code: removed all debug telemetry (`127.0.0.1:7811`) and TEMP 
 4. **Unverified on a live Irembo form:** `getFieldQuestionLabel` label reading, and Phase 2 conditional label_check (set→check→reset parent).
 5. ~~**format_validation date format.**~~ **DONE.** `getInvalidValueForFormat` still emits ISO (canonical, correct for native `<input type="date">`), but the format_validation handler now converts ISO→DMY (`parseDateAny` + `formatDateDmy`) at the custom-picker boundary, so Irembo's DMY picker accepts the value and the age rule is actually exercised. Non-date invalid values fall through unchanged.
 6. **getLabelText** still returns empty/option label for non-label_check callers (by design — Option A scoped the fix to label_check only).
+7. ~~**Section navigation failed on new forms ("Could not navigate to section").**~~ **DONE (pending live test).** Root cause: `sectionsMatch` used exact string equality, so an AI/SRD-authored section name that didn't match the form heading exactly broke navigation for every section. Two DOM-based fixes:
+   - **`sectionsMatch` (background.js)** — exact equality → **fuzzy**: passes on containment or significant-word overlap (tokenize, drop ≤2-char noise; pass if shorter name fully contained, ≥2 shared words, or ≥0.6 overlap). No section-name hardcodes. Also loosens test-case→section bucketing (same fn).
+   - **`getCurrentSectionName` (content.js)** — first-visible-heading-anywhere → **active-section-aware**: prefer visible `h1.section-title`; else the last heading before the first visible form control (skips a page/service title); else fall back to the old first-visible behavior.
+   - Still open: Continue-button label assumption (`Continue`/`Next` only) and the single-group `'General'` target (no heading reads "General") are separate failure modes not addressed here.
 
 ---
 

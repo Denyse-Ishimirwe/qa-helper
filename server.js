@@ -9,7 +9,7 @@ import upload from './multer.js'
 import extractText from './upload.js'
 import generateTestCases, { analyzeFormStructure } from './ai.js'
 import runTests from './Runtests.js'
-import { buildExtensionSectionsPayload, enrichTestCasesWithSections, extractSectionsFromFormStructure, inferSectionFromTestCase, isUnsetSection, sectionsMatch } from './sections.js'
+import { buildExtensionSectionsPayload, enrichTestCasesWithSections, extractSectionsFromFormStructure, inferSectionFromTestCase, isUnsetSection, mergeFormStructure, sectionsMatch } from './sections.js'
 import ExcelJS from 'exceljs'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
@@ -1048,8 +1048,8 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
           ? tc.test_type
           : 'required_field'
         statements.push({
-          sql: 'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type) VALUES (?, ?, ?, ?, ?)',
-          args: [projectKey, tc.name, tc.what_to_test, tc.expected_result, testType]
+          sql: 'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section) VALUES (?, ?, ?, ?, ?, ?)',
+          args: [projectKey, tc.name, tc.what_to_test, tc.expected_result, testType, tc.section || '']
         })
       }
       await db.batch(statements)
@@ -1225,6 +1225,33 @@ app.post('/api/projects/:id/analyse', requireAuth, async (req, res) => {
     return res.status(500).json({ error: err.message || 'Failed to analyse form' })
   } finally {
     if (browser) await browser.close()
+  }
+})
+
+// Persist an extension-captured (per-step) form structure. The extension only
+// sees the current wizard step, so each call MERGES into the stored structure
+// rather than overwriting — coverage accumulates as the form is walked.
+app.post('/api/projects/:id/form-structure', requireAuth, async (req, res) => {
+  try {
+    const ownedProject = await ensureProjectOwner(req, res)
+    if (!ownedProject) return
+
+    const project = await db.get('SELECT form_structure FROM projects WHERE id = ?', req.params.id)
+    const merged = mergeFormStructure(project?.form_structure || null, req.body || {})
+
+    await db.run(
+      'UPDATE projects SET form_structure = ? WHERE id = ?',
+      JSON.stringify(merged),
+      req.params.id
+    )
+    return res.json({
+      success: true,
+      form_structure: merged,
+      summary: `Captured ${merged.sections.length} section(s), ${merged.fields.length} field(s)`
+    })
+  } catch (err) {
+    console.error(err)
+    return res.status(500).json({ error: 'Failed to save form structure' })
   }
 })
 
