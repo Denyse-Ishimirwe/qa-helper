@@ -132,14 +132,30 @@ name (title pattern):
 — Visibility-only check: "{FieldLabel} Conditional Display Test"
 — Submit: "Successful Submit Test"
 
-SRD TABLE STRUCTURE — SECTION vs BLOCK, and BLANK-CELL INHERITANCE (read carefully):
-— The SRD table columns are: Section | Block | Field name (Label) | … . Section and Block are TWO DIFFERENT hierarchy levels:
-  • Section = the top-level NAVIGABLE STEP (it matches the form's stepper steps).
-  • Block   = a sub-grouping nested INSIDE a section (one section may contain several blocks).
-— CRITICAL: Section and Block cells are filled ONLY on the FIRST row of each group, then left BLANK for the rows beneath that belong to the same section/block. A field with a blank Section cell INHERITS the most recent non-blank Section above it; likewise Block inherits the most recent non-blank Block above it.
-— You MUST FORWARD-FILL: carry the last non-blank Section value DOWN to every following field until a new non-blank Section appears, and do the same for Block independently. Never leave a field's section unresolved and never invent a name like "General" — resolve it from the nearest non-blank Section above it.
-— The "section" field on EVERY test case = the carried-down SECTION column value — NEVER the Block column. Block is a different level; do not put a Block name in "section". (Block is not stored separately; just keep it out of "section".)
-— Effect: every field in the same step shares the SAME section name, so they all group under one navigable section.
+SRD TABLE STRUCTURE — SECTION and BLOCK are two separate levels, BOTH required on every case:
+The SRD table columns are: Section | Block | Field name (Label) | … . Section and Block are two DIFFERENT hierarchy levels, and BOTH must be captured on every test case:
+  • section = the top-level NAVIGABLE STEP (matches the form's stepper steps). Used for grouping and navigation.
+  • block   = a sub-grouping nested INSIDE a section. One section may contain ONE or MANY blocks, and every field belongs to one of them.
+
+Blank-cell inheritance (forward-fill), applied to each column INDEPENDENTLY:
+  • Section and Block cells are filled ONLY on the first row of each group, then left blank for following rows that belong to the same group.
+  • Carry the last non-blank Section value DOWN to every following field until a new non-blank Section appears.
+  • Carry the last non-blank Block value DOWN independently — EXCEPT: when the Section changes, the carried Block is DROPPED. Never carry a block from one section into another; the new Section's first row provides its own first Block.
+  • A section has ONE or MANY blocks, and every field sits inside one of its blocks — so block is never empty.
+
+What to emit on every test case (ALL test types — required_field, format_validation, conditional_field, widget_auto_fill, attachment, successful_submit, AND label_check):
+  • section: the carried-down SECTION column value (the navigable step). NEVER a Block-column value. Never blank, never "General".
+  • block: the carried-down BLOCK column value (dropped/reset on each new Section). Every field has a block, so this is never empty.
+
+Worked example (placeholders — replace with real SRD values, never output literal brackets). Suppose the SRD reads (blanks shown as ·):
+  Section | Block | Field
+  A       | b1    | f1   → section "A", block "b1"
+  ·       | ·     | f2   → section "A", block "b1"   (both carried down)
+  ·       | b2    | f3   → section "A", block "b2"   (new block, section carried)
+  ·       | ·     | f4   → section "A", block "b2"
+  B       | b3    | f5   → section "B", block "b3"   (new SECTION starts with its OWN first block; the previous block "b2" is DROPPED)
+  ·       | ·     | f6   → section "B", block "b3"
+So f5 gets section "B" with its own block "b3" — the previous block "b2" from section A must NOT leak into section B.
 
 LABEL CHECK (generate these FIRST, grouped by section):
 — For EVERY field in the SRD table emit exactly ONE label_check case (test_type: "label_check"), capturing: exact field label, exact placeholder if the SRD specifies one, and the section name = the carried-down SECTION column value (NOT the Block column — see SRD TABLE STRUCTURE above).
@@ -197,21 +213,21 @@ General:
 — Widget flows (choose widget type before dependent fields when the SRD says so): reflect SRD order inside what_to_test in the same short sentence style.
 
 Output schema per element:
-{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check", "section": string }
+{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check", "section": string, "block": string }
 
 STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>","test_type":"label_check"},
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>","test_type":"label_check"},
-  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check"},
-  {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field"},
-  {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field"},
-  {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation"},
-  {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field"},
-  {"name":"<OptionalConditionalFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <OptionalConditionalFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalConditionalFieldLabel> field appears","test_type":"conditional_field"},
-  {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field"},
-  {"name":"<OptionalDeepTargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then select any valid option on <Level2Label> field, and checking if <OptionalDeepTargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalDeepTargetFieldLabel> field appears","test_type":"conditional_field"},
-  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit"}
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation","section":"<Section>","block":"<Block>"},
+  {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalConditionalFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <OptionalConditionalFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalConditionalFieldLabel> field appears","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalDeepTargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then select any valid option on <Level2Label> field, and checking if <OptionalDeepTargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalDeepTargetFieldLabel> field appears","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit","section":"<Section>","block":""}
 ]`
 
 function groqApiMessage(err) {
@@ -654,7 +670,8 @@ async function generateTestCases(srdText, formStructure) {
         what_to_test: String(tc?.what_to_test || '').trim(),
         expected_result: String(tc?.expected_result || '').trim(),
         test_type: normalizeGeneratedType(tc?.test_type),
-        section: String(tc?.section || '').trim()
+        section: String(tc?.section || '').trim(),
+        block: String(tc?.block || '').trim()
       }))
       .filter(tc => tc.name && tc.what_to_test && tc.expected_result && tc.test_type !== '__drop__')
   }
@@ -783,7 +800,7 @@ ${srdForPrompt}
 ${structureSection}
 
 ${extraRules ? `Additional instructions:\n${extraRules}\n` : ''}
-Respond with ONLY one JSON array. Each object must have: name, what_to_test, expected_result, test_type.
+Respond with ONLY one JSON array. Each object must have: name, what_to_test, expected_result, test_type, section (the navigable step, forward-filled, never the Block, never blank/"General"), block (the sub-grouping, reset on each new Section, "" if the field has no block).
 Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_to_test (like the EXEMPLAR), expected_result from SRD or the same concise style as the exemplar.`
 
         const completion = await groqChatCompletionsCreate({

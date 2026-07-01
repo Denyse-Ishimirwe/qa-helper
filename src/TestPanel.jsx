@@ -389,6 +389,12 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
                 <span className="field-label">Section</span>
                 <span className="field-value">{displaySection(tc)}</span>
               </div>
+              {tc.block && (
+                <div className="card-field">
+                  <span className="field-label">Block</span>
+                  <span className="field-value">{tc.block}</span>
+                </div>
+              )}
               <div className="card-field">
                 <span className="field-label">Test type</span>
                 <span className="field-value">{normalizeTestTypeUi(tc.test_type)}</span>

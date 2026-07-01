@@ -1048,8 +1048,8 @@ app.post('/api/projects/:id/generate', requireAuth, async (req, res) => {
           ? tc.test_type
           : 'required_field'
         statements.push({
-          sql: 'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section) VALUES (?, ?, ?, ?, ?, ?)',
-          args: [projectKey, tc.name, tc.what_to_test, tc.expected_result, testType, tc.section || '']
+          sql: 'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section, block) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          args: [projectKey, tc.name, tc.what_to_test, tc.expected_result, testType, tc.section || '', tc.block || '']
         })
       }
       await db.batch(statements)
