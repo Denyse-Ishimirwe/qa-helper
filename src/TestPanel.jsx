@@ -39,6 +39,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const [formStructureHint, setFormStructureHint] = useState('')
   const [collapsedSections, setCollapsedSections] = useState({})
   const [runningSection, setRunningSection] = useState('')
+  const [statusFilter, setStatusFilter] = useState('All')
   const testCasesRequestRef = useRef(0)
   const comparisonRequestRef = useRef(0)
 
@@ -62,6 +63,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
     // Immediately clear previous project's data while new project is loading.
     setTestCases([])
     setComparison(null)
+    setStatusFilter('All')
     fetchTestCases()
   }, [fetchTestCases])
 
@@ -261,11 +263,29 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
     return isUnsetSection(resolved) ? GENERAL_SECTION : resolved
   }
 
+  const filteredTestCases = useMemo(() => {
+    if (statusFilter === 'All') return testCases
+    return testCases.filter(tc => normalizeTestStatus(tc.status) === statusFilter)
+  }, [testCases, statusFilter])
+
   const sectionGroups = useMemo(() => {
     const order = buildSectionOrder(testCases, project?.form_structure)
-    const groups = groupTestCasesBySection(testCases, order)
+    const groups = groupTestCasesBySection(filteredTestCases, order)
     return groups.filter(group => group.cases.length > 0)
-  }, [testCases, project?.form_structure])
+  }, [filteredTestCases, testCases, project?.form_structure])
+
+  const statusFilterOptions = useMemo(() => {
+    const options = [
+      { key: 'All', label: 'All', count: testCases.length },
+      { key: 'Passed', label: 'Passed', count: passed },
+      { key: 'Failed', label: 'Failed', count: failed },
+      { key: 'Not Run', label: 'Not run', count: notRun }
+    ]
+    if (skipped > 0) {
+      options.push({ key: 'Skipped', label: 'Skipped', count: skipped })
+    }
+    return options
+  }, [testCases.length, passed, failed, notRun, skipped])
 
   function sectionCounts(cases) {
     const passed = cases.filter(tc => normalizeTestStatus(tc.status) === 'Passed').length
@@ -462,7 +482,9 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
             <h2>{project.name}</h2>
             <p className="panel-subtitle">
               {testCases.length > 0
-                ? `${testCases.length} test case${testCases.length !== 1 ? 's' : ''}`
+                ? statusFilter === 'All'
+                  ? `${testCases.length} test case${testCases.length !== 1 ? 's' : ''}`
+                  : `${filteredTestCases.length} of ${testCases.length} · ${statusFilter}`
                 : 'No test cases yet'}
             </p>
           </div>
@@ -523,6 +545,20 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               <span className="summary-failed">✗ {failed} failed</span>
               {skipped > 0 && <span className="summary-skipped">⊘ {skipped} skipped</span>}
               <span className="summary-notrun">○ {notRun} not run</span>
+            </div>
+            <div className="panel-status-filters" role="group" aria-label="Filter test cases by status">
+              {statusFilterOptions.map(option => (
+                <button
+                  key={option.key}
+                  type="button"
+                  className={`panel-status-filter ${statusFilter === option.key ? 'active' : ''}`}
+                  onClick={() => setStatusFilter(option.key)}
+                  aria-pressed={statusFilter === option.key}
+                >
+                  {option.label}
+                  <span className="panel-status-filter-count">{option.count}</span>
+                </button>
+              ))}
             </div>
           </div>
         )}
@@ -657,6 +693,10 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
                 : srdImportFailed
                   ? 'No test cases yet. Fix the SRD import (Edit project), then click Generate.'
                   : 'No test cases yet. Click Generate to get started.'}
+            </p>
+          ) : filteredTestCases.length === 0 ? (
+            <p className="panel-empty">
+              No {statusFilter === 'Not Run' ? 'not run' : statusFilter.toLowerCase()} test cases in this project.
             </p>
           ) : (
             sectionGroups.map(group => {

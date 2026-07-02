@@ -158,6 +158,16 @@ function deriveInvalidValueForTestCase(tc, field, fallbackValue) {
   const labelText = `${field?.label || ''} ${field?.name || ''}`.toLowerCase()
   const isIdLike = labelText.includes('id') || labelText.includes('identifier')
 
+  const digitRule =
+    text.match(/(?:must\s+be|exactly|length\s+of)\s*(\d+)\s*digits?/) ||
+    text.match(/(\d+)\s*digits?\s*(?:long|only|exact|required)/)
+  if (digitRule) {
+    const n = Number(digitRule[1])
+    if (Number.isFinite(n) && n > 1) {
+      return '1'.repeat(Math.max(1, Math.min(5, n - 1)))
+    }
+  }
+
   if (text.includes('non-numeric') || text.includes('letters') || text.includes('alphabet')) {
     return 'ABCXYZ'
   }
@@ -486,6 +496,9 @@ function resolveDobFormatValidation(tc, targetField) {
   const mentionsUnderage =
     /under\s*18|under eighteen|minor|less than 18|below 18|too young|younger than 18|person is under/i.test(
       text
+    ) ||
+    /above\s*18|18\s*years?\s*old|minimum\s+(?:age\s+)?18|must\s+make\s+applicant\s+above|older than\s*18/i.test(
+      text
     )
   if (!mentionsUnderage) return null
   const d = new Date()
@@ -530,6 +543,51 @@ function tokenOverlapScore(a, b) {
   let hits = 0
   for (const t of as) if (bs.has(t)) hits += 1
   return hits / Math.max(1, Math.min(as.size, bs.size))
+}
+
+async function collectFieldScopedValidationMessages(page, fieldSelector) {
+  if (!fieldSelector) return []
+  try {
+    const msgs = await page.evaluate((sel) => {
+      const input = document.querySelector(sel)
+      if (!input) return []
+      const visible = (el) => {
+        const style = window.getComputedStyle(el)
+        const rect = el.getBoundingClientRect()
+        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+      }
+      const root =
+        input.closest(
+          'formly-wrapper-form-field, formly-field, mat-form-field, .mat-mdc-form-field, .form-group, .field, .mb-3'
+        ) || input.parentElement
+      if (!root) return []
+      const selectors =
+        '.invalid-feedback, formly-validation-message, mat-error, .mat-mdc-form-field-error, .text-danger, [class*="validation-message"], .field-error'
+      const nodes = Array.from(root.querySelectorAll(selectors))
+      const extras = []
+      let sib = root.nextElementSibling
+      for (let i = 0; i < 4 && sib; i += 1) {
+        extras.push(...Array.from(sib.querySelectorAll?.(selectors) || []))
+        if (visible(sib) && String(sib.textContent || '').trim().length < 220) extras.push(sib)
+        sib = sib.nextElementSibling
+      }
+      const seen = new Set()
+      const out = []
+      for (const el of [...nodes, ...extras]) {
+        if (!visible(el)) continue
+        const txt = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+        if (!txt || txt.length < 3 || txt.length > 220) continue
+        const key = txt.toLowerCase()
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(txt)
+      }
+      return out
+    }, fieldSelector)
+    return Array.isArray(msgs) ? msgs : []
+  } catch {
+    return []
+  }
 }
 
 async function collectVisibleValidationMessages(page) {
@@ -1315,6 +1373,22 @@ async function runTests(projectId, options = {}) {
           continue
         }
 
+        const targetType = normalizeType(targetField.type)
+        if (targetType === 'select' || targetType === 'radio' || targetType === 'checkbox') {
+          const note = 'Skipped: format validation not applicable to dropdown fields'
+          testLog('RESULT: ⊘ Skipped — dropdown field')
+          await db.run('UPDATE test_cases SET status = ?, notes = ? WHERE id = ?', 'Skipped', note, tc.id)
+          results.push({
+            id: tc.id,
+            name: tc.name,
+            passed: false,
+            notes: note,
+            screenshotPath: null,
+            generationReason: tc.generation_reason || ''
+          })
+          continue
+        }
+
         let invalidVal = guessInvalidValue(targetField)
         invalidVal = deriveInvalidValueForTestCase(tc, targetField, invalidVal)
         let formatErrorSelector = targetField.formatErrorSelector || targetField.errorSelector
@@ -1337,90 +1411,54 @@ async function runTests(projectId, options = {}) {
         testLog(`Step: filling all fields, then setting invalid value for "${targetField.label}": "${invalidVal}"`)
         await fillAllFields(page, runtimeFields)
 
-        if (targetField.type === 'select' || targetField.type === 'radio' || targetField.type === 'checkbox') {
-          const combined = `${tc.what_to_test || ''} ${tc.expected_result || ''}`.toLowerCase()
-          const expectsNoError =
-            /no error|without error|should pass|valid|accepted|does not show/i.test(combined)
+        await page.locator(targetField.selector).first().fill(invalidVal, { timeout: 700 }).catch(() => {})
 
-          if (expectsNoError) {
-            testLog(`Step: option-field validation for "${targetField.label}" (expecting no error)`)
-            await clickSubmit(page).catch(() => {})
-            await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [targetField.errorSelector]), 1200)
-            const [fieldError, success] = await Promise.all([
-              targetField.errorSelector ? isVisible(page, targetField.errorSelector) : Promise.resolve(false),
-              isSubmitSuccessVisible(page, project)
-            ])
-            passed = fieldError === false
-            if (passed) {
-              notes = `Passed: "${targetField.label}" used a valid option and no validation message appeared, which matches the expected behavior.`
-              testLog('RESULT: ✓ Passed — valid option accepted without error')
-            } else {
-              notes = `Failed: "${targetField.label}" used a valid option, but a validation message still appeared.`
-              testLog('RESULT: ✗ Failed — unexpected validation error for valid option')
-              failureWaitSelectors = withPostSubmitSelectors(project, [targetField.errorSelector, targetField.selector])
-            }
-            // Keep success signal in notes for troubleshooting without forcing it.
-            notes += success ? '\nSubmission signal: success message visible.' : '\nSubmission signal: success message not visible.'
-            // Skip default text-input format path for option fields.
-            invalidVal = null
-          } else {
-            const note = `Failed: format_validation test type is not executable for option field "${targetField.label}". Use conditional or required behavior wording for this field.`
-            testLog('RESULT: ✗ Failed — format_validation not executable for option field')
-            const screenshotPath = await captureAtFailure(tc.id, [targetField.selector])
-            await saveCaseResult(false, note, screenshotPath)
-            continue
-          }
+        testLog('Step: clicking submit')
+        await clickSubmit(page)
+        await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector]), 1200)
+
+        testLog('Step: checking results')
+        const scopedMessages = await collectFieldScopedValidationMessages(page, targetField.selector)
+        const visibleMessages = scopedMessages.length > 0
+          ? scopedMessages
+          : await collectVisibleValidationMessages(page)
+        const [formatError, success] = await Promise.all([
+          formatErrorSelector ? isVisible(page, formatErrorSelector) : Promise.resolve(false),
+          isSubmitSuccessVisible(page, project)
+        ])
+        const invalidState = await detectFieldInvalidState(page, targetField)
+        const evidence = evaluateValidationEvidence({
+          expectedText: tc.expected_result,
+          field: targetField,
+          visibleMessages,
+          fieldError: formatError,
+          invalidState
+        })
+
+        testLog(`Format error for "${targetField.label}" visible: ${formatError}`)
+        testLog(`Success visible: ${success}`)
+        testLog(`Field-scoped messages: ${scopedMessages.length}`)
+
+        const hasBelowFieldError = scopedMessages.length > 0 || Boolean(formatError) || Boolean(invalidState)
+        passed = success === false && hasBelowFieldError && evidence.hasEvidence
+
+        if (passed) {
+          notes = `Passed: "${targetField.label}" showed the expected validation below the field.`
+          if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
+          testLog('RESULT: ✓ Passed')
+        } else if (success === true) {
+          notes = `Failed: "${targetField.label}" accepted invalid input "${invalidVal}" and the form continued.`
+          testLog(`RESULT: ✗ Failed — form accepted invalid value for "${targetField.label}"`)
+          failureWaitSelectors = withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector, targetField.selector])
+        } else if (!hasBelowFieldError) {
+          notes = 'Failed: No error appeared below the field'
+          testLog(`RESULT: ✗ Failed — no error below "${targetField.label}"`)
+          failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector]
         } else {
-          await page.locator(targetField.selector).first().fill(invalidVal, { timeout: 700 }).catch(() => {})
-        }
-
-        if (invalidVal === null && (targetField.type === 'select' || targetField.type === 'radio' || targetField.type === 'checkbox')) {
-          // Option-field path already evaluated and saved in passed/notes.
-          // Do not run generic format submit assertions below.
-        } else {
-
-          testLog('Step: clicking submit')
-          await clickSubmit(page)
-          await waitForPostSubmitSignals(page, withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector]), 1200)
-
-          testLog('Step: checking results')
-          const [formatError, success] = await Promise.all([
-            formatErrorSelector ? isVisible(page, formatErrorSelector) : Promise.resolve(false),
-            isSubmitSuccessVisible(page, project)
-          ])
-          const visibleMessages = await collectVisibleValidationMessages(page)
-          const invalidState = await detectFieldInvalidState(page, targetField)
-          const evidence = evaluateValidationEvidence({
-            expectedText: tc.expected_result,
-            field: targetField,
-            visibleMessages,
-            fieldError: formatError,
-            invalidState
-          })
-
-          testLog(`Format error for "${targetField.label}" visible: ${formatError}`)
-          testLog(`Success visible: ${success}`)
-
-          // If there is no known format error selector, fallback to "did not submit".
-          passed = success === false && evidence.hasEvidence
-
-          if (passed) {
-            notes =
-              targetField.type === 'date' && formatErrorSelector
-                ? `Passed: Date of Birth rejected the minor date "${invalidVal}" and showed the age restriction message.`
-                : `Passed: "${targetField.label}" rejected invalid input "${invalidVal}" and prevented successful submission.`
-            if (evidence.bestMessage) notes += `\nValidation shown: "${evidence.bestMessage}"`
-            testLog(`RESULT: ✓ Passed`)
-          } else if (success === true) {
-            notes = `Failed: "${targetField.label}" accepted invalid input "${invalidVal}" and the form submitted successfully.`
-            testLog(`RESULT: ✗ Failed — form accepted invalid value for "${targetField.label}"`)
-            failureWaitSelectors = withPostSubmitSelectors(project, [formatErrorSelector, targetField.errorSelector, targetField.selector])
-          } else {
-            notes = `Failed: "${targetField.label}" used invalid input "${invalidVal}", but no clear validation message appeared for that field.`
-            if (visibleMessages.length) notes += `\nVisible validation text: ${visibleMessages.map(m => `"${m}"`).join(' | ')}`
-            testLog(`RESULT: ✗ Failed — no format error for "${targetField.label}"`)
-            failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector]
-          }
+          notes = `Failed: an error appeared below "${targetField.label}" but it did not match the expected message from the SRD.`
+          if (scopedMessages.length) notes += `\nBelow-field text: ${scopedMessages.map(m => `"${m}"`).join(' | ')}`
+          testLog(`RESULT: ✗ Failed — message mismatch for "${targetField.label}"`)
+          failureWaitSelectors = [formatErrorSelector, targetField.errorSelector, targetField.selector]
         }
       }
 
