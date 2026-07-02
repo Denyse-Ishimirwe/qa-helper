@@ -1998,6 +1998,357 @@ function getInvalidValueForFormat(tc) {
   return 'INVALID123!@#'
 }
 
+function findClickToUploadElementNear(root) {
+  if (!root) return null
+  const roots = [root]
+  const parent = root.parentElement
+  if (parent) roots.push(parent)
+  const formly = root.closest?.('formly-field, formly-wrapper-form-field')
+  if (formly) roots.push(formly)
+  for (const r of roots) {
+    const candidates = Array.from(
+      r.querySelectorAll('button, a, div, span, label, p, [role="button"], [class*="upload"]')
+    )
+    for (const el of candidates) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()
+      if (
+        t.includes('click to upload') ||
+        t.includes('click here to upload') ||
+        t.includes('drag and drop') ||
+        t === 'upload' ||
+        /\bupload\b/.test(t) && t.length < 40
+      ) {
+        return el
+      }
+    }
+  }
+  return null
+}
+
+async function openAttachmentUploadModal(attachmentInput) {
+  const container = getAttachmentContainer(attachmentInput)
+  const trigger = findClickToUploadElementNear(container)
+  if (!trigger) return false
+  scrollTestTargetIntoView(trigger)
+  await wait(120)
+  trigger.click()
+  await wait(220)
+  return true
+}
+
+const UPLOAD_SOURCE_MENU_PATTERNS = {
+  previous: [/previous\s+uploaded\s+documents?/i, /previously\s+uploaded/i],
+  certificates: [/my\s+certificates?/i],
+  device: [/upload\s+from\s+device/i, /from\s+(?:your\s+)?device/i]
+}
+
+function findVisibleUploadModals() {
+  const selectors = [
+    'ngb-modal-window',
+    'mat-dialog-container',
+    '.cdk-overlay-pane',
+    '.modal.show',
+    '.modal-dialog',
+    '[role="dialog"]',
+    '.modal',
+    '[class*="modal"]',
+    '[class*="popup"]'
+  ].join(', ')
+  return Array.from(document.querySelectorAll(selectors)).filter(el => {
+    if (!isVisible(el)) return false
+    const rect = el.getBoundingClientRect()
+    return rect.width > 80 && rect.height > 80
+  })
+}
+
+function elementMatchesUploadSource(el, sourceKey) {
+  const patterns = UPLOAD_SOURCE_MENU_PATTERNS[sourceKey]
+  if (!patterns) return false
+  const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+  if (!t || t.length > 140) return false
+  return patterns.some(p => p.test(t))
+}
+
+function findUploadSourceOptionEl(searchRoot, sourceKey) {
+  const root = searchRoot || document.body
+  const candidates = Array.from(
+    root.querySelectorAll(
+      'button, a, div, span, p, li, [role="button"], [role="menuitem"], label, .card, [class*="option"], [class*="choice"]'
+    )
+  )
+  let best = null
+  let bestLen = Infinity
+  for (const el of candidates) {
+    if (!isVisible(el)) continue
+    if (!elementMatchesUploadSource(el, sourceKey)) continue
+    const len = String(el.textContent || '').trim().length
+    if (len < bestLen) {
+      bestLen = len
+      best = el
+    }
+  }
+  return best
+}
+
+function modalHasUploadSourceMenu(modal) {
+  return Object.keys(UPLOAD_SOURCE_MENU_PATTERNS).some(key => Boolean(findUploadSourceOptionEl(modal, key)))
+}
+
+async function waitForUploadSourceModal(timeoutMs = 4500) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    for (const modal of findVisibleUploadModals()) {
+      if (modalHasUploadSourceMenu(modal)) return modal
+    }
+    await wait(120)
+  }
+  return null
+}
+
+async function clickUploadSourceOption(sourceKey, modalHint = null) {
+  const roots = []
+  if (modalHint) roots.push(modalHint)
+  for (const m of findVisibleUploadModals()) roots.push(m)
+  roots.push(document.body)
+  const seen = new Set()
+  for (const root of roots) {
+    if (!root || seen.has(root)) continue
+    seen.add(root)
+    const option = findUploadSourceOptionEl(root, sourceKey)
+    if (!option) continue
+    scrollTestTargetIntoView(option)
+    await wait(80)
+    option.click()
+    await wait(380)
+    return true
+  }
+  return false
+}
+
+function isUploadSourceMenuLabel(text) {
+  const t = String(text || '').toLowerCase()
+  return (
+    t.includes('previous uploaded') ||
+    t.includes('my certificates') ||
+    t.includes('upload from device') ||
+    t.includes('from device')
+  )
+}
+
+async function pickFirstPreviousUploadedDocument() {
+  await wait(280)
+  const modals = findVisibleUploadModals()
+  const roots = modals.length ? modals : [document.body]
+  for (const root of roots) {
+    const candidates = Array.from(
+      root.querySelectorAll(
+        'button, a, [role="button"], li, tr, .list-group-item, [class*="document"], [class*="file-item"], [class*="row"], label, [class*="card"]'
+      )
+    ).filter(el => {
+      if (!isVisible(el)) return false
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      if (!t || t.length < 4 || t.length > 220) return false
+      if (isUploadSourceMenuLabel(t)) return false
+      if (/^(cancel|close|back|ok|done|select|confirm)$/i.test(t)) return false
+      return true
+    })
+    for (const el of candidates) {
+      scrollTestTargetIntoView(el)
+      await wait(80)
+      el.click()
+      await wait(420)
+      return true
+    }
+  }
+  return false
+}
+
+function findActiveFileInput(attachmentInput) {
+  for (const modal of findVisibleUploadModals()) {
+    const inp = modal.querySelector('input[type="file"]')
+    if (inp && !inp.disabled && !inp.readOnly) return inp
+  }
+  const all = Array.from(document.querySelectorAll('input[type="file"]')).filter(el => !el.disabled && !el.readOnly)
+  if (attachmentInput && all.includes(attachmentInput)) return attachmentInput
+  if (all.length === 1) return all[0]
+  return attachmentInput || all[0] || null
+}
+
+function resolveUploadSourcePreference(kind, tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (kind === 'invalid_format' || kind === 'size_limit') return 'device'
+  if (/previous\s+uploaded|existing\s+document|from\s+library|previously\s+uploaded/.test(text)) return 'previous'
+  if (kind === 'required') return 'none'
+  return 'auto'
+}
+
+/**
+ * Irembo upload flow: Click to upload → modal (Previous uploaded documents /
+ * My certificates / Upload from device) → pick source → optional file inject.
+ */
+async function prepareAttachmentUpload(attachmentInput, kind, tc) {
+  const preference = resolveUploadSourcePreference(kind, tc)
+
+  if (preference === 'none') {
+    const fileInput = findActiveFileInput(attachmentInput)
+    if (fileInput) {
+      fileInput.value = ''
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }))
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+    return { ok: true, source: 'none', fileInput }
+  }
+
+  const opened = await openAttachmentUploadModal(attachmentInput)
+  const modal = opened ? await waitForUploadSourceModal() : null
+
+  if (!modal) {
+    return { ok: true, source: 'direct', fileInput: findActiveFileInput(attachmentInput) }
+  }
+
+  if (preference === 'device') {
+    const picked = await clickUploadSourceOption('device', modal)
+    return { ok: picked, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+  }
+
+  if (preference === 'previous') {
+    if (await clickUploadSourceOption('previous', modal)) {
+      const docPicked = await pickFirstPreviousUploadedDocument()
+      if (docPicked) {
+        return { ok: true, source: 'previous', fileInput: findActiveFileInput(attachmentInput) }
+      }
+    }
+    if (await clickUploadSourceOption('certificates', modal)) {
+      const docPicked = await pickFirstPreviousUploadedDocument()
+      if (docPicked) {
+        return { ok: true, source: 'certificates', fileInput: findActiveFileInput(attachmentInput) }
+      }
+    }
+    if (await clickUploadSourceOption('device', modal)) {
+      return { ok: true, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+    }
+    return { ok: false, source: 'previous', fileInput: null }
+  }
+
+  // auto: prefer library documents, then certificates, then device injection
+  if (await clickUploadSourceOption('previous', modal)) {
+    if (await pickFirstPreviousUploadedDocument()) {
+      return { ok: true, source: 'previous', fileInput: findActiveFileInput(attachmentInput) }
+    }
+  }
+  if (await clickUploadSourceOption('certificates', modal)) {
+    if (await pickFirstPreviousUploadedDocument()) {
+      return { ok: true, source: 'certificates', fileInput: findActiveFileInput(attachmentInput) }
+    }
+  }
+  const deviceOk = await clickUploadSourceOption('device', modal)
+  return { ok: deviceOk, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+}
+
+/** @deprecated Use prepareAttachmentUpload */
+async function prepareAttachmentFieldForTest(attachmentInput) {
+  await openAttachmentUploadModal(attachmentInput)
+}
+
+function probeAttachmentFieldVisible(tc) {
+  const testType = String(tc?.test_type || '').trim()
+  const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+  const fieldLabel = sanitizeSearchLabel(
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+  )
+  const fieldName = String(tc?.field_name || '').trim()
+
+  if (testType === 'label_check') {
+    const pm = String(tc?.expected_result || '').match(/;\s*parent\s*:\s*([^;=]+?)\s*=/i)
+    if (pm) {
+      const parent = resolveConditionalParentField({ parentLabel: pm[1].trim(), triggerValue: '' })
+      if (!parent || !isVisible(parent)) return false
+    }
+  } else if (isConditionalFieldTestType(testType)) {
+    try {
+      const spec = parseConditionalSpec(tc)
+      if (spec?.parentLabel) {
+        const parent = resolveConditionalParentField(spec)
+        if (!parent || !isVisible(parent)) return false
+      }
+    } catch {
+      return false
+    }
+  }
+
+  const attachmentInput = findAttachmentFieldElementByLabel(fieldLabel, fieldName)
+  if (!attachmentInput) return false
+  const container = getAttachmentContainer(attachmentInput)
+  if (container && isVisible(container)) return true
+  return Boolean(findClickToUploadElementNear(container || attachmentInput))
+}
+
+/** Block names (e.g. "Attachments") may appear as h2/h3 inside a wizard step, not as the step title. */
+function isSectionNamePresentOnPage(sectionName) {
+  const target = sanitizeSearchLabel(sectionName)
+  if (!target) return false
+
+  const headingSel =
+    'h1.section-title, h1, h2, h3, h4, .section-title, .step-title, .wizard-title, [class*="block-title"], [class*="group-title"]'
+  for (const h of document.querySelectorAll(headingSel)) {
+    if (!isVisible(h)) continue
+    const txt = sanitizeSearchLabel(String(h.textContent || ''))
+    if (!txt) continue
+    if (txt === target || txt.includes(target) || target.includes(txt)) return true
+  }
+
+  if (/attachment|upload|document/i.test(target)) {
+    for (const el of document.querySelectorAll('formly-field, formly-wrapper-form-field, [class*="upload"], [class*="attachment"]')) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').toLowerCase()
+      if (t.includes('click to upload') || t.includes('click here to upload')) return true
+    }
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]')).filter(
+      el => !el.disabled && !el.readOnly
+    )
+    if (fileInputs.length > 0) return true
+  }
+
+  return false
+}
+
+function isAttachmentSectionReachableByParents(testCases = []) {
+  for (const tc of Array.isArray(testCases) ? testCases : []) {
+    const wtt = String(tc?.what_to_test || '')
+    const parentMatch =
+      wtt.match(/(?:selecting|select)\s+['"][^'"]+['"]\s+on\s+(.+?)\s+field/i) ||
+      wtt.match(/on\s+(.+?)\s+field\s+and\s+(?:leaving|checking)/i)
+    if (!parentMatch) continue
+    const parentLabel = sanitizeSearchLabel(parentMatch[1])
+    if (!parentLabel) continue
+    const ng = findNgSelectForLabel(parentLabel)
+    if (ng && isVisible(ng)) return true
+    const radios = findRadiosForLabel(parentLabel)
+    if (radios.length > 0 && isVisible(radios[0])) return true
+    const needle = parentLabel.toLowerCase()
+    for (const input of document.querySelectorAll('input, select, textarea, ng-select')) {
+      if (!isVisible(input)) continue
+      const wrap = input.closest('formly-field, formly-wrapper-form-field')
+      const labelEl = wrap?.querySelector('label, .form-label, formly-label, mat-label')
+      const text = normalizeLabelText(`${getLabelText(input)} ${labelEl?.textContent || ''}`)
+      if (text === needle || text.includes(needle)) return true
+    }
+  }
+  return false
+}
+
+function isSectionReachableOnPage(sectionName, testCases = []) {
+  if (isSectionNamePresentOnPage(sectionName)) return true
+  if (/attachment|upload/i.test(String(sectionName || '')) && isAttachmentSectionReachableByParents(testCases)) {
+    return true
+  }
+  for (const tc of Array.isArray(testCases) ? testCases : []) {
+    if (probeFieldVisibility(tc)) return true
+  }
+  return false
+}
+
 function detectAttachmentCaseKind(tc) {
   const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
   if (text.includes('larger than') || text.includes('500kb') || text.includes('size') || text.includes('oversize')) return 'size_limit'
@@ -2005,21 +2356,40 @@ function detectAttachmentCaseKind(tc) {
   return 'required'
 }
 
+const ATTACHMENT_CONTAINER_SELECTOR =
+  'formly-field, formly-wrapper-form-field, mat-form-field, .mat-mdc-form-field, .form-group, .field, .upload, [class*="upload"], [class*="attachment"], [class*="file"], .mb-3'
+
+/** Nearest wrapper around a (usually hidden) file input that carries the visible label/dropzone. */
+function getAttachmentContainer(el) {
+  return el?.closest?.(ATTACHMENT_CONTAINER_SELECTOR) || el?.parentElement || el
+}
+
 function findAttachmentFieldElementByLabel(fieldLabel, fieldName) {
   const normLabel = sanitizeSearchLabel(fieldLabel)
   const normName = String(fieldName || '').trim().toLowerCase()
+  // Irembo/Angular file inputs are almost always visually hidden (display:none / opacity:0 /
+  // zero-size) behind a styled dropzone or button, so we must NOT require the input itself to
+  // be visible — that previously filtered out every candidate and made attachments "not found".
+  // We instead keep every functional file input and prefer the one whose container is visible
+  // and whose surrounding text matches the field label.
   const all = Array.from(document.querySelectorAll('input[type="file"]'))
-    .filter(el => isVisible(el) && !el.disabled && !el.readOnly)
+    .filter(el => !el.disabled && !el.readOnly)
   if (all.length === 0) return null
   if (all.length === 1) return all[0]
   let best = null
   let bestScore = -1e9
   for (const el of all) {
-    const blob = normalizeLabelText(`${getLabelText(el)} ${el.id || ''} ${el.getAttribute('name') || ''} ${getLocalFieldTextBlobForScoring(el)}`)
+    const container = getAttachmentContainer(el)
+    const blob = normalizeLabelText(
+      `${getLabelText(el)} ${el.id || ''} ${el.getAttribute('name') || ''} ${el.getAttribute('formcontrolname') || ''} ${getLocalFieldTextBlobForScoring(el)} ${String(container?.textContent || '').slice(0, 240)}`
+    )
     let score = 0
+    // Prefer the input the user can actually see (its wrapper is on screen).
+    if (container && isVisible(container)) score += 25
     if (normName) {
       if (String(el.getAttribute('name') || '').toLowerCase().includes(normName)) score += 90
       if (String(el.id || '').toLowerCase().includes(normName)) score += 70
+      if (String(el.getAttribute('formcontrolname') || '').toLowerCase().includes(normName)) score += 60
       if (blob.includes(normName)) score += 30
     }
     if (normLabel) {
@@ -2027,12 +2397,18 @@ function findAttachmentFieldElementByLabel(fieldLabel, fieldName) {
       const words = significantLabelWords(normLabel)
       for (const w of words) if (blob.includes(w)) score += 16
     }
+    if (container && findClickToUploadElementNear(container)) score += 40
     if (score > bestScore) {
       bestScore = score
       best = el
     }
   }
   return best
+}
+
+function makeValidAttachmentTestFile() {
+  const pdfBlob = new Blob(['%PDF-1.4\n% QA Helper valid attachment fixture'], { type: 'application/pdf' })
+  return new File([pdfBlob], 'valid-test.pdf', { type: 'application/pdf' })
 }
 
 function makeAttachmentTestFile(kind) {
@@ -4218,32 +4594,50 @@ async function executeTestCase(tc, runContext = {}) {
     if (!attachmentInput) {
       return {
         passed: false,
-        message: `Attachment input ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page`
+        message: `Attachment input for "${fieldLabel || fieldName || tc?.name || 'unknown'}" not found on page. If this form uploads via a button that opens the OS file dialog (no <input type="file"> in the DOM), it cannot be automated by the extension.`
       }
     }
 
-    scrollTestTargetIntoView(attachmentInput)
+    // The file input is usually hidden — scroll/annotate its visible wrapper (dropzone/button) instead.
+    const uploadAnchor = getAttachmentContainer(attachmentInput)
+    const visibleAnchor = uploadAnchor && isVisible(uploadAnchor) ? uploadAnchor : attachmentInput
+    scrollTestTargetIntoView(visibleAnchor)
     await wait(260)
-    updateLiveRunIndicator(tc, attachmentInput, 'Testing field')
+    updateLiveRunIndicator(tc, visibleAnchor, 'Testing field')
 
     const kind = detectAttachmentCaseKind(tc)
     await fillAllFieldsWithValidValues({ element: attachmentInput, kind: 'input' })
     await wait(180)
-    attachmentInput.value = ''
-    attachmentInput.dispatchEvent(new Event('input', { bubbles: true }))
-    attachmentInput.dispatchEvent(new Event('change', { bubbles: true }))
 
-    if (kind !== 'required') {
+    const uploadPrep = await prepareAttachmentUpload(attachmentInput, kind, tc)
+    const fileInput = uploadPrep.fileInput || attachmentInput
+
+    if (!uploadPrep.ok && kind !== 'required') {
+      return {
+        passed: false,
+        message:
+          uploadPrep.source === 'previous' || uploadPrep.source === 'certificates'
+            ? 'Could not select a document from the upload library (Previous uploaded documents / My certificates)'
+            : 'Could not complete attachment upload flow — upload source modal did not respond'
+      }
+    }
+
+    if (kind === 'invalid_format' || kind === 'size_limit') {
       const fixture = makeAttachmentTestFile(kind)
-      const setOk = setFileInputValue(attachmentInput, fixture)
+      const setOk = setFileInputValue(fileInput, fixture)
       if (!setOk) {
         return {
           passed: false,
-          message: 'Could not set test file on attachment input'
+          message: 'Could not set test file on attachment input after choosing Upload from device'
         }
       }
-      await wait(140)
+      await wait(200)
+    } else if (uploadPrep.source === 'device' || uploadPrep.source === 'direct') {
+      const fixture = makeValidAttachmentTestFile()
+      setFileInputValue(fileInput, fixture)
+      await wait(180)
     }
+    // previous / certificates: document picked from library — no file injection needed
 
     const clicked = await clickContinueAndReadErrors(
       tc?.expected_result,
@@ -4310,11 +4704,15 @@ async function resetFormStateAfterTest(targetField) {
 }
 
 function getCurrentSectionName() {
-  const headingSel = 'h1.section-title, h1, h2, h3, h4, .section-title, .step-title, .wizard-title'
-  for (const h of document.querySelectorAll(headingSel)) {
-    if (!isVisible(h)) continue
-    const txt = String(h.textContent || '').trim()
-    if (txt) return txt
+  // Prefer top-level wizard step titles; block sub-headings (h2/h3) come second.
+  const sectionSelectors = '.wizard-title, .step-title, .section-title, h1.section-title, h1'
+  const blockSelectors = 'h2, h3, h4, [class*="block-title"], [class*="group-title"]'
+  for (const sel of [sectionSelectors, blockSelectors]) {
+    for (const h of document.querySelectorAll(sel)) {
+      if (!isVisible(h)) continue
+      const txt = String(h.textContent || '').trim()
+      if (txt) return txt
+    }
   }
   return ''
 }
@@ -4374,6 +4772,18 @@ function getSectionSignature() {
 function probeFieldVisibility(tc) {
   const testType = String(tc?.test_type || '').trim()
   if (testType === 'successful_submit') return true
+
+  if (testType === 'attachment') {
+    return probeAttachmentFieldVisible(tc)
+  }
+
+  const wttLower = String(tc?.what_to_test || '').toLowerCase()
+  if (
+    testType === 'label_check' &&
+    (/\battachment\b/.test(wttLower) || wttLower.includes('click to upload') || /upload|file/.test(wttLower))
+  ) {
+    if (probeAttachmentFieldVisible(tc)) return true
+  }
 
   // Conditional label_check is reachable when its PARENT is visible (the child
   // stays hidden until we set the parent at runtime).
@@ -4479,6 +4889,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     } catch (err) {
       // Fail-open so a probe error doesn't strand a test in the deferred pile.
       sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_IS_SECTION_REACHABLE') {
+    try {
+      const sectionName = String(message?.sectionName || '').trim()
+      const testCases = Array.isArray(message?.testCases) ? message.testCases : []
+      sendResponse({
+        ok: true,
+        reachable: isSectionReachableOnPage(sectionName, testCases)
+      })
+    } catch (err) {
+      sendResponse({ ok: false, reachable: false, error: String(err?.message || 'Section reachability check failed') })
     }
     return true
   }

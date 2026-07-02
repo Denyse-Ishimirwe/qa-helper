@@ -369,21 +369,44 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     }
   }
 
-  async function navigateToSection(targetSection) {
+  async function isSectionReachable(targetSection, sectionCases = []) {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        {
+          type: 'QA_HELPER_IS_SECTION_REACHABLE',
+          sectionName: targetSection,
+          testCases: Array.isArray(sectionCases) ? sectionCases.slice(0, 8) : []
+        },
+        8000
+      )
+      return Boolean(response?.reachable)
+    } catch {
+      return false
+    }
+  }
+
+  async function navigateToSection(targetSection, sectionCases = []) {
     const target = normalizeSectionName(targetSection)
     if (!target) return true
 
-    for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
+    async function atTarget() {
       const current = await getCurrentSectionName()
       if (sectionsMatch(current, target)) return true
+      // Block names (e.g. "Attachments") often differ from the wizard step title
+      // (e.g. "Additional Information") — also accept heading/file-upload presence.
+      return await isSectionReachable(target, sectionCases)
+    }
+
+    for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
+      if (await atTarget()) return true
       if (attempt >= MAX_SECTION_ADVANCES) break
       const advanced = await attemptSectionAdvance()
-      if (!advanced) return false
+      if (!advanced) return await atTarget()
       setRunState({ contentNeedsReprime: true })
       lastConditionalParentSetupKey = ''
     }
-    const finalSection = await getCurrentSectionName()
-    return sectionsMatch(finalSection, target)
+    return await atTarget()
   }
 
   async function probeReachable(tc) {
@@ -512,7 +535,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       message: `Section ${groupIndex + 1}/${groupsToRun.length}: ${sectionName} (${sectionCases.length} test${sectionCases.length === 1 ? '' : 's'})`
     })
 
-      const reached = await navigateToSection(sectionName)
+      const reached = await navigateToSection(sectionName, sectionCases)
       if (!reached) {
         for (const tc of sectionCases) {
           failUnreachable(tc, `Could not navigate to section "${sectionName}"`)
