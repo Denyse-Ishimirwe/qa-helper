@@ -439,13 +439,38 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // section-name matching. Retained only for reference and the [QA nav] diagnostics;
   // sectionsMatch is intentionally NOT the gate for running a test.
   async function navigateToSection(targetSection) {
+  async function isSectionReachable(targetSection, sectionCases = []) {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        {
+          type: 'QA_HELPER_IS_SECTION_REACHABLE',
+          sectionName: targetSection,
+          testCases: Array.isArray(sectionCases) ? sectionCases.slice(0, 8) : []
+        },
+        8000
+      )
+      return Boolean(response?.reachable)
+    } catch {
+      return false
+    }
+  }
+
+  async function navigateToSection(targetSection, sectionCases = []) {
     const target = normalizeSectionName(targetSection)
     if (!target) return true
 
-    for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
+    async function atTarget() {
       const current = await getCurrentSectionName()
       console.log('[QA nav] attempt', attempt, '— target:', JSON.stringify(target), '| current:', JSON.stringify(current), '| match:', sectionsMatch(current, target)) // TEMP DIAGNOSTIC
       if (sectionsMatch(current, target)) return true
+      // Block names (e.g. "Attachments") often differ from the wizard step title
+      // (e.g. "Additional Information") — also accept heading/file-upload presence.
+      return await isSectionReachable(target, sectionCases)
+    }
+
+    for (let attempt = 0; attempt <= MAX_SECTION_ADVANCES; attempt += 1) {
+      if (await atTarget()) return true
       if (attempt >= MAX_SECTION_ADVANCES) break
       const advanced = await attemptSectionAdvance()
       console.log('[QA nav]   advance attempt', attempt, '→ advanced?', advanced) // TEMP DIAGNOSTIC
@@ -453,6 +478,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
         console.log('[QA nav] GAVE UP after', attempt + 1, 'attempt(s) — could not advance further; target', JSON.stringify(target), 'never matched → failUnreachable') // TEMP DIAGNOSTIC
         return false
       }
+      if (!advanced) return await atTarget()
       setRunState({ contentNeedsReprime: true })
       lastConditionalParentSetupKey = ''
       await captureAndPersistFormStructure()   // silent, best-effort — never blocks the run
@@ -462,6 +488,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     console.log('[QA nav] FINAL — target:', JSON.stringify(target), '| current:', JSON.stringify(finalSection), '| match:', finalMatch) // TEMP DIAGNOSTIC
     if (!finalMatch) console.log('[QA nav] GAVE UP after exhausting', MAX_SECTION_ADVANCES + 1, 'attempts; target', JSON.stringify(target), 'never matched → failUnreachable') // TEMP DIAGNOSTIC
     return finalMatch
+    return await atTarget()
   }
 
   async function probeReachable(tc, sectionIndex) {
@@ -642,8 +669,13 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       message: `Section ${sectionIndex}: testing ${pending.length} remaining case${pending.length === 1 ? '' : 's'}`
     })
 
-    const ranHere = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
-    console.log('[QA run] section', sectionIndex, '— ran', ranHere.length, 'case(s) here |', pending.length, 'still pending') // TEMP DIAGNOSTIC
+      const reached = await navigateToSection(sectionName, sectionCases)
+      if (!reached) {
+        for (const tc of sectionCases) {
+          failUnreachable(tc, `Could not navigate to section "${sectionName}"`)
+        }
+        continue
+      }
 
     if (pending.length === 0 || RUN_STATE.cancellationRequested) break
 
