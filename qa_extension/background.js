@@ -103,6 +103,7 @@ const RUN_STATE = {
   passed: 0,
   failed: 0,
   skipped: 0,
+  untested: 0,
   message: '',
   summary: '',
   runId: '',
@@ -169,6 +170,16 @@ function pickCaseFieldLabel(tc = {}) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** Skips where the field was never exercised — keep the DB row at Not Run. */
+function shouldLeaveCaseNotRun(skipReason) {
+  const r = String(skipReason || '').toLowerCase().trim()
+  return (
+    r === 'field not found or not visible' ||
+    r.includes('field not found') ||
+    r.includes('not found in any reachable section')
+  )
 }
 
 function isTransientTabMessageError(msg) {
@@ -317,6 +328,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     passed: 0,
     failed: 0,
     skipped: 0,
+    untested: 0,
     message: 'Fetching test cases...',
     summary: '',
     runId: '',
@@ -384,7 +396,20 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   let passed = 0
   let failed = 0
   let skipped = 0
+  let untested = 0
   let lastConditionalParentSetupKey = ''
+
+  function reportRunProgress(message) {
+    const current = passed + failed + skipped + untested
+    setRunState({
+      current,
+      passed,
+      failed,
+      skipped,
+      untested,
+      message: message || `Completed ${current}/${testCases.length}`
+    })
+  }
   const MAX_SECTION_ADVANCES = 8
 
   async function getCurrentSectionName() {
@@ -439,18 +464,25 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     return finalMatch
   }
 
-  async function probeReachable(tc) {
+  async function probeReachable(tc, sectionIndex) {
+    const skipLabel = String(tc?.field_label || tc?.name || '').trim() // TEMP DIAGNOSTIC
     try {
       const response = await sendTabMessageWithTimeout(
         tabId,
         { type: 'QA_HELPER_PROBE_FIELD_VISIBLE', testCase: tc },
         8000
       )
+      // TEMP DIAGNOSTIC — `visible` here is log-only; the return decisions below are unchanged.
+      const controls = (response && typeof response.controlsOnPage === 'number') ? response.controlsOnPage : '?'
+      const visControls = (response && typeof response.visibleControls === 'number') ? response.visibleControls : '?'
+      const visible = !response ? true : (response.ok === false ? true : Boolean(response.visible))
+      console.log('[QA skip] section', sectionIndex, '| field', JSON.stringify(skipLabel), '| visible=' + visible, '| controls-on-page=' + controls, '| visible-controls=' + visControls) // TEMP DIAGNOSTIC
       if (!response) return true
       if (response.ok === false) return true
       if (response.visible) return true
       return false
-    } catch {
+    } catch (err) {
+      console.log('[QA skip] section', sectionIndex, '| field', JSON.stringify(skipLabel), '| visible=true (probe threw:', String(err?.message || err), ') — fail-open') // TEMP DIAGNOSTIC
       return true
     }
   }
@@ -461,7 +493,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // across forms. We re-scan in passes because running a case can reveal a conditional
   // sibling field that then becomes testable on the same section. We NEVER advance here:
   // the caller advances exactly once, only after this drains all matches on the section.
-  async function runVisibleCasesOnCurrentSection(pending) {
+  async function runVisibleCasesOnCurrentSection(pending, sectionIndex) {
     const ran = []
     let passHitSomething = true
     while (passHitSomething && !RUN_STATE.cancellationRequested) {
@@ -469,7 +501,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       for (let i = 0; i < pending.length; ) {
         if (RUN_STATE.cancellationRequested) break
         const tc = pending[i]
-        const reachable = await probeReachable(tc)
+        const reachable = await probeReachable(tc, sectionIndex)
         if (reachable) {
           pending.splice(i, 1)          // remove before running; do not advance i
           await runOneTest(tc)
@@ -523,14 +555,19 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
           screenshotDataUrl: ''
         }
       } else if (response.skipped) {
-        skipped += 1
-        runResult = {
-          id: tc.id,
-          name: tc.name,
-          passed: false,
-          skipped: true,
-          notes: `Skipped: ${response.reason || 'Not executable in extension mode'}`,
-          screenshotDataUrl: ''
+        if (shouldLeaveCaseNotRun(response.reason)) {
+          untested += 1
+          runResult = null
+        } else {
+          skipped += 1
+          runResult = {
+            id: tc.id,
+            name: tc.name,
+            passed: false,
+            skipped: true,
+            notes: `Skipped: ${response.reason || 'Not executable in extension mode'}`,
+            screenshotDataUrl: ''
+          }
         }
       } else {
         const testPassed = Boolean(response.passed)
@@ -565,20 +602,8 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     } else {
       lastConditionalParentSetupKey = ''
     }
-    results.push(runResult)
-    setRunState({ current: results.length, passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
-  }
-
-  function failUnreachable(tc, reason) {
-    failed += 1
-    results.push({
-      id: tc.id,
-      name: tc.name,
-      passed: false,
-      notes: `Failed: ${reason}`,
-      screenshotDataUrl: ''
-    })
-    setRunState({ current: results.length, passed, failed, skipped, message: `Completed ${results.length}/${testCases.length}` })
+    if (runResult) results.push(runResult)
+    reportRunProgress()
   }
 
   // Best-effort: grab the now-rendered section's headings+fields and persist them.
@@ -609,7 +634,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   const maxAdvances = Math.max(groupsToRun.length, 1)
   let advances = 0
   let sectionIndex = 0
-  console.log('[QA run] single-pass start —', pending.length, 'cases |', groupsToRun.length, 'sections | advance cap', maxAdvances) // TEMP DIAGNOSTIC
+  console.log('[QA run] single-pass start —', pending.length, 'cases |', groupsToRun.length, 'sections | advance cap', maxAdvances, '| run-start url=', startUrl, '(controls-on-page shown on the first [QA skip] line below)') // TEMP DIAGNOSTIC
 
   while (pending.length > 0 && !RUN_STATE.cancellationRequested) {
     sectionIndex += 1
@@ -617,7 +642,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       message: `Section ${sectionIndex}: testing ${pending.length} remaining case${pending.length === 1 ? '' : 's'}`
     })
 
-    const ranHere = await runVisibleCasesOnCurrentSection(pending)
+    const ranHere = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
     console.log('[QA run] section', sectionIndex, '— ran', ranHere.length, 'case(s) here |', pending.length, 'still pending') // TEMP DIAGNOSTIC
 
     if (pending.length === 0 || RUN_STATE.cancellationRequested) break
@@ -638,12 +663,15 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     await captureAndPersistFormStructure()   // silent, best-effort — never blocks the run
   }
 
-  // Anything still pending was never visible on any reachable section of the form.
-  for (const tc of pending) {
-    failUnreachable(
-      tc,
-      `Field "${pickCaseFieldLabel(tc)}" not found in any reachable section of the form`
+  // Cases still pending were never visible on a reachable section — leave them Not Run.
+  if (pending.length > 0) {
+    untested += pending.length
+    console.log(
+      '[QA run] left',
+      pending.length,
+      'case(s) untested (field not on reachable sections) — status stays Not Run'
     )
+    reportRunProgress()
   }
 
   if (RUN_STATE.cancellationRequested) {
@@ -663,7 +691,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
         // Best-effort save on stop — never lose the stopped state if upload fails.
       }
     }
-    const summary = `Stopped — ${passed} passed, ${failed} failed, ${skipped} skipped`
+    const summary = `Stopped — ${passed} passed, ${failed} failed, ${skipped} skipped${untested ? `, ${untested} not run` : ''}`
     setRunState({
       status: 'stopped',
       summary,
@@ -683,7 +711,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   const uploadData = await uploadRes.json().catch(() => ({}))
   if (!uploadRes.ok) throw new Error(uploadData.error || 'Failed to upload extension results')
 
-  const summary = `Done — ${passed} passed, ${failed} failed, ${skipped} skipped`
+  const summary = `Done — ${passed} passed, ${failed} failed, ${skipped} skipped${untested ? `, ${untested} not run` : ''}`
   setRunState({
     status: 'done',
     summary,

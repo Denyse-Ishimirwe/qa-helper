@@ -1754,25 +1754,14 @@ async function runTests(projectId, options = {}) {
       })
 
       if (testType === 'successful_submit' && passed) {
-        const skipNote =
-          'Skipped: successful submit completed earlier in this run — case not executed (results page may differ from the form).'
-        for (let j = index + 1; j < testCases.length; j += 1) {
-          const rest = testCases[j]
-          await db.run('UPDATE test_cases SET status = ?, notes = ? WHERE id = ?', 'Skipped', skipNote, rest.id)
-          results.push({
-            id: rest.id,
-            name: rest.name,
-            passed: false,
-            notes: skipNote,
-            screenshotPath: null,
-            generationReason: rest.generation_reason || ''
-          })
-        }
+        const remaining = testCases.length - index - 1
         emitProgress({
           phase: 'running_tests',
-          message: `Stopping after successful submit (${testCases.length - index - 1} case(s) skipped).`,
+          message: remaining > 0
+            ? `Stopping after successful submit (${remaining} case(s) left Not Run).`
+            : 'Stopping after successful submit.',
           total: testCases.length,
-          completed: testCases.length
+          completed: index + 1
         })
         break
       }

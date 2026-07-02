@@ -3685,6 +3685,37 @@ async function clearConditionalParent(p) {
   }
 }
 
+/** Read ng-select placeholder text without opening the dropdown. */
+function readNgSelectPlaceholderClosed(root) {
+  if (!root) return ''
+  const container = root.matches?.('.ng-select-container, [role="combobox"]')
+    ? root
+    : (root.querySelector('.ng-select-container, [role="combobox"]') || root)
+  const combobox = (root.matches?.('[role="combobox"]') ? root : null) || root.querySelector('[role="combobox"]')
+  const innerInput = container.querySelector('input') || root.querySelector('input')
+  // Read the placeholder from a CLOSED ng-select — try every source ng-select uses, first
+  // non-empty wins, all readable without opening:
+  //   1. the rendered .ng-placeholder text (present while closed with nothing selected),
+  //   2. the <ng-select placeholder="…"> attribute (its [placeholder] binding lands here),
+  //   3. the inner search input's placeholder attribute,
+  //   4. aria-placeholder on the combobox / container.
+  // Some dropdowns (e.g. the salutation select) render the placeholder via 2–4, not a
+  // .ng-placeholder node, which is why the narrower read returned empty → "(none)".
+  const candidates = [
+    container.querySelector('.ng-placeholder')?.textContent,
+    root.querySelector('.ng-placeholder')?.textContent,
+    root.getAttribute?.('placeholder'),
+    innerInput?.getAttribute?.('placeholder'),
+    combobox?.getAttribute?.('aria-placeholder'),
+    container.getAttribute?.('aria-placeholder')
+  ]
+  for (const c of candidates) {
+    const v = String(c || '').trim()
+    if (v) return v
+  }
+  return ''
+}
+
 /** Section/block name = text of the nearest visible <h1 class="section-title"> that precedes this field. */
 /** Ordered visible <h1 class="section-title"> heading elements (document order).
  *  Single source of truth for every place that reads section headings — the
@@ -3817,10 +3848,9 @@ async function executeTestCase(tc, runContext = {}) {
       return { skipped: true, reason: 'no expected label in SRD' }
     }
 
-    // Dropdowns (ng-select) only: open so the label/placeholder render correctly,
-    // run the read-only assertions, then Escape to close WITHOUT selecting a value.
-    // The finally{} guarantees it closes on every return path. All other field kinds
-    // keep their read-only behavior; no value is ever set for any label_check.
+    // ng-select: read placeholder from the closed control first (.ng-placeholder is
+    // usually present in the DOM while closed). Only open + poll when that read is
+    // empty and we need to compare a placeholder. Escape closes if we opened.
     const lcRoot = lcTarget.kind === 'ng-select'
       ? (lcField.closest('ng-select, .ng-select, [role="combobox"]') || lcField)
       : null
@@ -3828,21 +3858,22 @@ async function executeTestCase(tc, runContext = {}) {
     let lcPlaceholderPolled = ''
     let lcPolls = 0
     if (lcRoot) {
-      const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
-      if (typeof opener.click === 'function') {
-        opener.click()
-        lcOpened = true
-        // ng-select renders .ng-placeholder asynchronously after open — poll for it to
-        // become non-empty (up to ~1.5s in 100ms steps) instead of a single fixed wait,
-        // then use the polled value for the comparison. Fixes the read-before-render bug.
-        for (lcPolls = 1; lcPolls <= 15; lcPolls += 1) {
-          await wait(100)
-          lcPlaceholderPolled = String(lcRoot.querySelector('.ng-placeholder')?.textContent || '').trim()
-          if (lcPlaceholderPolled) break
+      lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
+      console.log('[QA lc-dd] closed read | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled)) // TEMP DIAGNOSTIC
+      if (!lcPlaceholderPolled && expectedPlaceholder) {
+        const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
+        if (typeof opener.click === 'function') {
+          opener.click()
+          lcOpened = true
+          for (lcPolls = 1; lcPolls <= 15; lcPolls += 1) {
+            await wait(100)
+            lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
+            if (lcPlaceholderPolled) break
+          }
+          console.log('[QA lc-dd] opened fallback | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled), 'after', lcPolls, 'poll(s)') // TEMP DIAGNOSTIC
+        } else {
+          console.log('[QA lc-dd] opener has no click() — open fallback skipped') // TEMP DIAGNOSTIC
         }
-        console.log('[QA lc-dd] opener clicked on', opener.tagName + '.' + String(opener.className || ''), '| .ng-placeholder =', JSON.stringify(lcPlaceholderPolled), 'after', lcPolls, 'poll(s)') // TEMP DIAGNOSTIC
-      } else {
-        console.log('[QA lc-dd] opener has no click() — dropdown not opened') // TEMP DIAGNOSTIC
       }
     }
     try {
@@ -4876,7 +4907,25 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {
     try {
       const visible = probeFieldVisibility(message?.testCase || {})
-      sendResponse({ ok: true, visible: Boolean(visible) })
+      // TEMP DIAGNOSTIC — count the form controls actually on the page (total + visible)
+      // so we can tell "page has no controls" (form not loaded / wrong page) apart from
+      // "controls present but no case field matches them" (field-matching failure).
+      const probeSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+      const allControls = Array.from(document.querySelectorAll(probeSel))
+      const visibleControls = allControls.filter(isVisible)
+      const probeLabel = String(message?.testCase?.field_label || message?.testCase?.name || '').trim()
+      console.log('[QA probe] field=' + JSON.stringify(probeLabel) + ' | visible=' + Boolean(visible) + ' | controlsOnPage=' + allControls.length + ' | visibleControls=' + visibleControls.length + ' | path=' + location.pathname) // TEMP DIAGNOSTIC
+      // TEMP DIAGNOSTIC — sample the first ~5 controls isVisible() rejects, to tell genuinely
+      // hidden (display:none / 0x0) from a false-negative (real size + display:block but
+      // offsetParent null, e.g. under a transformed/fixed ancestor). Read-only.
+      const notVisible = allControls.filter(el => !isVisible(el)).slice(0, 5)
+      for (const el of notVisible) {
+        const r = el.getBoundingClientRect()
+        const cs = window.getComputedStyle(el)
+        const inViewport = r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth
+        console.log('[QA vis] tag=' + el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).split(/\s+/).join('.') : '') + ' | offsetParent=' + (el.offsetParent === null ? 'null' : 'set') + ' | rect=' + Math.round(r.width) + 'x' + Math.round(r.height) + ' | display=' + cs.display + ' visibility=' + cs.visibility + ' | inViewport=' + inViewport) // TEMP DIAGNOSTIC
+      }
+      sendResponse({ ok: true, visible: Boolean(visible), controlsOnPage: allControls.length, visibleControls: visibleControls.length })
     } catch (err) {
       // Fail-open so a probe error doesn't strand a test in the deferred pile.
       sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
