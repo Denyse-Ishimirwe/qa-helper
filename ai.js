@@ -160,13 +160,14 @@ So f5 gets section "B" with its own block "b3" — the previous block "b2" from 
 LABEL CHECK (generate these FIRST, grouped by section):
 — For EVERY field in the SRD table emit exactly ONE label_check case (test_type: "label_check"), capturing: exact field label, exact placeholder if the SRD specifies one, and the section name = the carried-down SECTION column value (NOT the Block column — see SRD TABLE STRUCTURE above).
 — expected_result encoding (verbatim spelling/capitalization; segments separated by "; "):
-  • Label only:        "<Label>; section: <Section>"
-  • With placeholder:  "<Label>; placeholder: <Placeholder>; section: <Section>"
-  • Conditional field: "<Label>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>"  (omit "placeholder:" if none)
+  • Label only:        "<Label>; section: <Section>; block: <Block>"
+  • With placeholder:  "<Label>; placeholder: <Placeholder>; section: <Section>; block: <Block>"
+  • Conditional field: "<Label>; placeholder: <Placeholder>; section: <Section>; block: <Block>; parent: <ParentLabel>=<TriggerValue>"  (omit "placeholder:" if none)
+  • Include the "; block: <Block>" segment (right after section) ONLY when the field has a Block value; omit it entirely when the block is empty.
 — RADIO buttons: capture label and section ONLY — never a placeholder.
 — CONDITIONAL fields: generate ONE case per trigger option (one row per trigger), each with its own "parent: <ParentLabel>=<TriggerValue>".
-— what_to_test MUST be specific, naming section + label (+ placeholder), e.g.:
-  "Checking that the First Name field in the Personal Information section has the label 'First Name' and placeholder 'Enter your first name'".
+— what_to_test MUST be specific, naming section + block + label (+ placeholder). Include the block clause only when the field has a Block value; omit it entirely when the block is empty. e.g.:
+  "Checking that the First Name field in the Applicant Details section, Personal Information block, has the label 'First Name' and placeholder 'Enter your first name'".
 — Every test case MUST include "section": the carried-down SECTION column value for that field or rule (apply the FORWARD-FILL rule from SRD TABLE STRUCTURE so blank cells inherit the Section above) — NEVER the Block column text. For successful_submit use the final section name or "Submit".
 — ORDER: group output by section in SRD order; within each section emit that section's label_check cases FIRST, then that section's other test types (Section 1 block, then Section 2 block, …).
 
@@ -217,9 +218,9 @@ Output schema per element:
 
 STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>","test_type":"label_check","section":"<Section>","block":"<Block>"},
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>","test_type":"label_check","section":"<Section>","block":"<Block>"},
-  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section, <Block> block, has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>; block: <Block>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section, <Block> block, has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>; block: <Block>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section, <Block> block, has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; block: <Block>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check","section":"<Section>","block":"<Block>"},
   {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field","section":"<Section>","block":"<Block>"},
   {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field","section":"<Section>","block":"<Block>"},
   {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation","section":"<Section>","block":"<Block>"},
@@ -985,6 +986,11 @@ async function analyzeFormStructure(fields) {
       }
       const section = String(f?.section || '').trim()
       if (section) row.section = section
+      // Give block the SAME structured reinforcement section has: if the form structure
+      // carries a per-field block/sub-group, surface it to the model alongside section.
+      // When the structure has no block, this stays empty and is simply omitted.
+      const block = String(f?.block || '').trim()
+      if (block) row.block = block
       const err = String(f?.errorSelector || '').trim()
       const fmt = String(f?.formatErrorSelector || '').trim()
       if (err) row.errorSelector = err

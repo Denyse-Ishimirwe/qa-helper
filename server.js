@@ -1765,7 +1765,7 @@ app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
     const ownedTestCase = await ensureTestCaseOwner(req, res)
     if (!ownedTestCase) return
 
-    const { name, what_to_test, expected_result, test_type, section } = req.body
+    const { name, what_to_test, expected_result, test_type, section, block } = req.body
 
     if (!name || !what_to_test || !expected_result) {
       return res.status(400).json({ error: 'All fields are required' })
@@ -1777,13 +1777,15 @@ app.put('/api/test_cases/:id', requireAuth, async (req, res) => {
     const safeSection = isUnsetSection(section)
       ? ''
       : String(section || inferSectionFromTestCase({ name, what_to_test, expected_result, test_type: safeTestType }) || '').trim()
+    const safeBlock = String(block || '').trim()
     await db.run(
-      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ?, section = ? WHERE id = ?',
+      'UPDATE test_cases SET name = ?, what_to_test = ?, expected_result = ?, test_type = ?, section = ?, block = ? WHERE id = ?',
       name,
       what_to_test,
       expected_result,
       safeTestType,
       safeSection,
+      safeBlock,
       req.params.id
     )
 
@@ -2048,7 +2050,7 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
     const ownedProject = await ensureProjectOwner(req, res)
     if (!ownedProject) return
 
-    const { name, what_to_test, expected_result, test_type, section } = req.body
+    const { name, what_to_test, expected_result, test_type, section, block } = req.body
     const project_id = req.params.id
 
     if (!name || !what_to_test || !expected_result) {
@@ -2061,14 +2063,16 @@ app.post('/api/projects/:id/test_cases', requireAuth, async (req, res) => {
     const safeSection = isUnsetSection(section)
       ? ''
       : String(section || inferSectionFromTestCase({ name, what_to_test, expected_result, test_type: safeTestType }) || '').trim()
+    const safeBlock = String(block || '').trim()
     const result = await db.run(
-      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section) VALUES (?, ?, ?, ?, ?, ?)',
+      'INSERT INTO test_cases (project_id, name, what_to_test, expected_result, test_type, section, block) VALUES (?, ?, ?, ?, ?, ?, ?)',
       project_id,
       name,
       what_to_test,
       expected_result,
       safeTestType,
-      safeSection
+      safeSection,
+      safeBlock
     )
 
     await recomputeProjectStatusFromTestCases(project_id)

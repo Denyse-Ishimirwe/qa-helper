@@ -3716,6 +3716,12 @@ function captureLiveFormStructure() {
     .map((el, i) => ({ name: String(el.textContent || '').trim(), order: i }))
     .filter(s => s.name)
 
+  // The navigable SECTION is the stepper step; the h1.section-title is the BLOCK — two
+  // different levels. Read the stepper ONCE (it's the same for every field on this step).
+  // If the stepper can't be read, section stays '' — we do NOT fall back to the h1, which
+  // would re-mislabel the block as the section.
+  const stepperSection = getActiveStepperSectionName() || ''
+
   const controlSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
   const seen = new Set()
   const fields = []
@@ -3723,11 +3729,12 @@ function captureLiveFormStructure() {
     if (!isVisible(el)) continue
     const label = getFieldQuestionLabel(el)        // group label for radios; wrapper label for ng-select/date
     if (!label) continue
-    const section = getFieldSectionName(el)         // nearest preceding visible h1.section-title — identical to run time
-    const key = `${label}::${section}`              // dedup radio group inputs + ng-select host/inner input
+    const block = getFieldSectionName(el)           // nearest preceding visible h1.section-title IS the block
+    const section = stepperSection                  // navigable step from the stepper, NOT the h1
+    const key = `${label}::${section}::${block}`     // dedup radio group inputs + ng-select host/inner input
     if (seen.has(key)) continue
     seen.add(key)
-    fields.push({ label, section })
+    fields.push({ label, section, block })
   }
   return { sections, fields }
 }
@@ -3762,7 +3769,10 @@ async function executeTestCase(tc, runContext = {}) {
     const norm = v => String(v || '').replace(/\*/g, '').replace(/\s+/g, ' ').trim()
     const expectedLabel = norm(tc?.field_label)
     const expectedPlaceholder = norm((exp.match(/;\s*placeholder\s*:\s*([^;]+)/i) || [])[1] || '')
-    const expectedSection = norm((exp.match(/;\s*section\s*:\s*([^;]+)/i) || [])[1] || '')
+    // Section and block are stored as their own fields on the test case (two-level model).
+    // Fall back to the legacy "; section:" tag in expected_result only if tc.section is blank.
+    const expectedSection = norm(tc?.section) || norm((exp.match(/;\s*section\s*:\s*([^;]+)/i) || [])[1] || '')
+    const expectedBlock = norm(tc?.block)
     const parentM = exp.match(/;\s*parent\s*:\s*([^;=]+?)\s*=\s*([^;]+?)\s*$/i)
     const parentLabel = parentM ? norm(parentM[1]) : ''
     const parentTrigger = parentM ? String(parentM[2]).trim() : ''
@@ -3784,10 +3794,12 @@ async function executeTestCase(tc, runContext = {}) {
       // Poll for the child to appear — same 5×200ms retry shape the conditional
       // handlers use — instead of a single fixed wait that fails on slow fields.
       let childAppeared = false
-      for (let i = 0; i < 5; i += 1) {
+      for (let i = 0; i < 10; i += 1) {
         const probe = resolveFieldTarget(fieldLabel, fieldName)?.element
-        if (probe && isVisible(probe)) { childAppeared = true; break }
-        await wait(200)
+        const vis = Boolean(probe && isVisible(probe))
+        console.log('[QA cond] label_check child poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+        if (vis) { childAppeared = true; scrollTestTargetIntoView(probe); break }
+        await wait(300)
       }
       if (!childAppeared) {
         return { passed: false, message: 'conditional field did not appear after setting parent' }
@@ -3813,46 +3825,122 @@ async function executeTestCase(tc, runContext = {}) {
       ? (lcField.closest('ng-select, .ng-select, [role="combobox"]') || lcField)
       : null
     let lcOpened = false
+    let lcPlaceholderPolled = ''
+    let lcPolls = 0
     if (lcRoot) {
       const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
       if (typeof opener.click === 'function') {
         opener.click()
         lcOpened = true
-        await wait(150)
+        // ng-select renders .ng-placeholder asynchronously after open — poll for it to
+        // become non-empty (up to ~1.5s in 100ms steps) instead of a single fixed wait,
+        // then use the polled value for the comparison. Fixes the read-before-render bug.
+        for (lcPolls = 1; lcPolls <= 15; lcPolls += 1) {
+          await wait(100)
+          lcPlaceholderPolled = String(lcRoot.querySelector('.ng-placeholder')?.textContent || '').trim()
+          if (lcPlaceholderPolled) break
+        }
+        console.log('[QA lc-dd] opener clicked on', opener.tagName + '.' + String(opener.className || ''), '| .ng-placeholder =', JSON.stringify(lcPlaceholderPolled), 'after', lcPolls, 'poll(s)') // TEMP DIAGNOSTIC
+      } else {
+        console.log('[QA lc-dd] opener has no click() — dropdown not opened') // TEMP DIAGNOSTIC
       }
     }
     try {
-      // 1) Label — exact, case-sensitive. Uses the field QUESTION label (group
-      //    label for radios; formly wrapper label for ng-select/date/plain inputs).
+      // Verify ALL FOUR attributes — label, placeholder, section, block — case-insensitively,
+      // collecting every real mismatch so the tester sees them together. Section and block are
+      // read LIVE from the DOM/stepper (no hardcoded names) and only checked when BOTH the
+      // expected value and the live reading are non-empty — a blank on either side is a missing
+      // value, not a defect, so it is noted in the pass message instead of failing the test.
+      const failures = []
+      const skipNotes = []
+
+      // 1) LABEL — case-INSENSITIVE (expectedLabel is guaranteed non-empty by the guard above).
       const actualLabel = norm(getFieldQuestionLabel(lcField))
-      if (actualLabel !== expectedLabel) {
-        return { passed: false, message: `Expected label ${expectedLabel} got label ${actualLabel}` }
+      if (actualLabel.toLowerCase() !== expectedLabel.toLowerCase()) {
+        failures.push(`Expected label "${expectedLabel}" but found "${actualLabel || '(none)'}"`)
       }
-      // 2) Placeholder — exact; skipped for radio buttons. ng-select reads its own
+      const labelCaseDiffers = actualLabel !== expectedLabel && actualLabel.toLowerCase() === expectedLabel.toLowerCase()
+
+      // 2) PLACEHOLDER — case-INSENSITIVE; skipped for radios. ng-select reads its own
       //    .ng-placeholder text; plain inputs read the attribute/property.
+      let placeholderRead = ''
+      let placeholderChecked = false
+      let placeholderCaseDiffers = false
       if (expectedPlaceholder && lcTarget.kind !== 'radio') {
-        const actualPlaceholder = lcTarget.kind === 'ng-select'
-          ? norm(lcRoot.querySelector('.ng-placeholder')?.textContent || '')
+        placeholderChecked = true
+        placeholderRead = lcTarget.kind === 'ng-select'
+          ? norm(lcPlaceholderPolled)
           : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
-        if (actualPlaceholder !== expectedPlaceholder) {
-          return { passed: false, message: `Expected placeholder ${expectedPlaceholder} got placeholder ${actualPlaceholder}` }
+        if (lcTarget.kind === 'ng-select') {
+          console.log('[QA lc-dd] placeholder read=', JSON.stringify(placeholderRead), '| expected=', JSON.stringify(expectedPlaceholder), '| matchCI=', placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase()) // TEMP DIAGNOSTIC
+        }
+        // TEMP DIAGNOSTIC — reveal invisible-character / whitespace / empty-read differences.
+        console.log('[QA lc-ph] expected=' + JSON.stringify(expectedPlaceholder) + ' (len ' + expectedPlaceholder.length + ') | actual=' + JSON.stringify(placeholderRead) + ' (len ' + placeholderRead.length + ') | kind=' + lcTarget.kind + ' | matchCI=' + (placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase())) // TEMP DIAGNOSTIC
+        if (expectedPlaceholder.length !== placeholderRead.length) {
+          console.log('[QA lc-ph] len differs — expected codes=[' + Array.from(expectedPlaceholder).map(c => c.charCodeAt(0)).join(',') + '] | actual codes=[' + Array.from(placeholderRead).map(c => c.charCodeAt(0)).join(',') + ']') // TEMP DIAGNOSTIC
+        }
+        if (placeholderRead.toLowerCase() !== expectedPlaceholder.toLowerCase()) {
+          failures.push(`Expected placeholder "${expectedPlaceholder}" but found "${placeholderRead || '(none)'}"`)
+        } else {
+          placeholderCaseDiffers = placeholderRead !== expectedPlaceholder
         }
       }
-      // 3) Section — field must sit under the correct visible section heading.
-      if (expectedSection) {
-        const actualSection = norm(getFieldSectionName(lcField))
-        if (actualSection !== expectedSection) {
-          return { passed: false, message: `Expected section ${expectedSection} found in section ${actualSection || '(none)'}` }
+
+      // 3) SECTION — case-INSENSITIVE. Live section = the stepper step label ONLY. We do NOT
+      //    fall back to getCurrentSectionName() here: on some forms the stepper reads empty and
+      //    that fallback returns the h1.section-title, which is the BLOCK, not the section —
+      //    comparing the expected section against a block produces false failures. If the
+      //    stepper is empty the live section is genuinely unavailable, so we SKIP (note) rather
+      //    than compare. Checked only when BOTH sides are non-empty.
+      console.log('[QA lc-sb] expectedSection=' + JSON.stringify(expectedSection) + ' | getActiveStepperSectionName=' + JSON.stringify(norm(getActiveStepperSectionName())) + ' | getCurrentSectionName=' + JSON.stringify(norm(getCurrentSectionName())) + ' | getFieldSectionName(h1)=' + JSON.stringify(norm(getFieldSectionName(lcField))) + ' | expectedBlock=' + JSON.stringify(expectedBlock)) // TEMP DIAGNOSTIC
+      const liveSection = norm(getActiveStepperSectionName())
+      let sectionVerified = false
+      if (expectedSection && liveSection) {
+        sectionVerified = true
+        if (liveSection.toLowerCase() !== expectedSection.toLowerCase()) {
+          failures.push(`Expected section "${expectedSection}" but field is under section "${liveSection}"`)
         }
+      } else if (!expectedSection) {
+        skipNotes.push('section not verified — none specified in test case')
+      } else {
+        skipNotes.push('section not verified — live section unavailable')
       }
+
+      // 4) BLOCK — case-INSENSITIVE. Live block = nearest h1.section-title (the block-level
+      //    heading). Checked only when BOTH sides are non-empty.
+      const liveBlock = norm(getFieldSectionName(lcField))
+      let blockVerified = false
+      if (expectedBlock && liveBlock) {
+        blockVerified = true
+        if (liveBlock.toLowerCase() !== expectedBlock.toLowerCase()) {
+          failures.push(`Expected block "${expectedBlock}" but field is under block "${liveBlock}"`)
+        }
+      } else if (!expectedBlock) {
+        skipNotes.push('block not verified — none specified in test case')
+      } else {
+        skipNotes.push('block not verified — no live block heading')
+      }
+
+      if (failures.length) {
+        return { passed: false, message: failures.join('; ') }
+      }
+
+      // Full pass — confirm every attribute that was actually verified.
+      const verifiedParts = [`Label "${actualLabel}"`]
+      if (placeholderChecked) verifiedParts.push(`placeholder "${placeholderRead}"`)
+      if (sectionVerified) verifiedParts.push(`section "${liveSection}"`)
+      if (blockVerified) verifiedParts.push(`block "${liveBlock}"`)
+      const caseNote = (labelCaseDiffers || placeholderCaseDiffers) ? ' — NOTE: only letter case differs, verify' : ''
+      const skipNote = skipNotes.length ? ` (${skipNotes.join('; ')})` : ''
       return {
         passed: true,
-        message: `Label "${actualLabel}"${expectedPlaceholder ? `, placeholder "${expectedPlaceholder}"` : ''}${expectedSection ? `, section "${expectedSection}"` : ''} all match`
+        message: `${verifiedParts.join(', ')} — all correct${caseNote}${skipNote}`
       }
     } finally {
       if (lcOpened) {
         const escTarget = lcRoot.querySelector('input') || lcRoot
         escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        console.log('[QA lc-dd] Escape dispatched to close dropdown') // TEMP DIAGNOSTIC
       }
     }
   }
@@ -3974,13 +4062,15 @@ async function executeTestCase(tc, runContext = {}) {
 
     if (isVisibilityOnlyTest) {
       let probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
-      for (let i = 0; i < 5; i += 1) {
-        if (
+      for (let i = 0; i < 10; i += 1) {
+        const vis = Boolean(
           probed?.element &&
           isVisible(probed.element) &&
           resolvedTargetMatchesLocationStep(fieldLabel, probed)
-        ) break
-        await wait(200)
+        )
+        console.log('[QA cond] visibility poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+        if (vis) { scrollTestTargetIntoView(probed.element); break }
+        await wait(300)
         probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
       }
       if (probed?.element && isVisible(probed.element)) target = probed
@@ -4431,8 +4521,31 @@ async function resetFormStateAfterTest(targetField) {
 // label is never visible while it is current. We accumulate the pairs as the run
 // navigates, so each step's label is known once any OTHER step has been current.
 const stepperSectionMap = new Map()
+// Pathname the stepperSectionMap was built from. When the form/page changes the
+// accumulated step labels belong to the OLD form and must be dropped — otherwise
+// Form B shows Form A's sections. Enforced by the guard at the top of the reader.
+let lastStepperPathname = ''
+// The most recent NON-EMPTY section this reader resolved on the current form. When a
+// read momentarily can't resolve (DOM mid-transition → empty), we return this instead
+// of '' so the caller doesn't flicker down to the block-level h1 heading and break
+// sectionsMatch during navigation. Reset by the pathname guard when the form changes.
+let lastKnownStepperSection = ''
 
 function getActiveStepperSectionName() {
+  // 0) Stale-form guard: if we're on a different page than the map was built from,
+  //    the old numbered step labels are stale — clear BEFORE reading. This runs on
+  //    the FIRST section read of a new form (navigation reads the section before any
+  //    test case executes), so form-switch carry-over is fixed even though the
+  //    isRunStart reset in the RUN_TEST_CASE handler fires later.
+  let currentPath = ''
+  try { currentPath = String(window.location.pathname || '') } catch { currentPath = '' }
+  if (currentPath !== lastStepperPathname) {
+    if (stepperSectionMap.size) console.log('[QA stepper] pathname changed', JSON.stringify(lastStepperPathname), '→', JSON.stringify(currentPath), '— cleared stale stepperSectionMap') // TEMP DIAGNOSTIC
+    stepperSectionMap.clear()
+    lastKnownStepperSection = ''
+    lastStepperPathname = currentPath
+  }
+
   // 1) Harvest visible "N. Label" stepper-nav entries (confirmed <h5> on Irembo;
   //    broaden to any short numbered element only if no numbered <h5> exists, for
   //    other forms). Store number → label (number stripped) in the persistent map.
@@ -4457,8 +4570,11 @@ function getActiveStepperSectionName() {
   })
   const mm = active && String(active.className).match(/\bstep_(\d+)\b/)
   if (!mm) {
-    console.log('[QA stepper] no active step_N collapse show card | map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
-    return ''
+    // Can't resolve this read (DOM mid-transition — no active step card). Fall back to
+    // the last section we DID resolve on this form so navigation doesn't flicker to the
+    // block heading. Empty only if nothing has ever resolved on this form yet.
+    console.log('[QA stepper] no active step_N collapse show card — using lastKnown', JSON.stringify(lastKnownStepperSection), '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+    return lastKnownStepperSection
   }
   const currentNumber = Number(mm[1]) + 1
 
@@ -4468,8 +4584,37 @@ function getActiveStepperSectionName() {
   const label = stepperSectionMap.get(currentNumber) || ''
   console.log('[QA stepper] active step_' + mm[1], '→ step number', currentNumber,
     '| section', JSON.stringify(label || '(unknown — not yet seen in nav)'),
+    '| lastKnown', JSON.stringify(lastKnownStepperSection),
     '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
-  return label
+  if (label) {
+    lastKnownStepperSection = label   // remember the good resolve for future empty reads
+    return label
+  }
+  // Couldn't resolve the label this read — return the last good section (empty only if
+  // nothing has ever resolved on this form yet, letting the caller fall through to tiers).
+  return lastKnownStepperSection
+}
+
+// Clear ALL module-level run state so a new run never inherits the previous run's
+// (or a previously-tested form's) data. Called on isRunStart from the RUN_TEST_CASE
+// handler, BEFORE reusableIdValueForRun is re-assigned from the message. The
+// stepperSectionMap is ALSO cleared on pathname change inside getActiveStepperSectionName
+// (which runs earlier, during first-section navigation) — that pathname guard is what
+// fixes "different form shows the previous form's sections"; this is the belt-and-
+// suspenders reset for same-URL reruns plus the execution-time state.
+async function resetRunStateForNewRun() {
+  stepperSectionMap.clear()
+  lastStepperPathname = ''
+  lastKnownStepperSection = ''
+  reusableIdValueForRun = ''
+  hasExpandedSectionsForRun = false
+  discoveredRequiredErrors = []
+  requiredFieldRunPreflightDone = false
+  if (pendingConditionalLabelParent) {
+    try { await clearConditionalParent(pendingConditionalLabelParent) } catch {}
+    pendingConditionalLabelParent = null
+  }
+  console.log('[QA reset] run-state cleared for new run — stepperSectionMap, reusableId, expand/preflight flags, discoveredRequiredErrors, pendingConditionalLabelParent') // TEMP DIAGNOSTIC
 }
 
 /** TEMP DIAGNOSTIC — read-only DOM dump of the active step card + any numbered
@@ -4819,6 +4964,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       try {
         cancelCurrentTestRequested = false
         const tc = message?.testCase || {}
+        if (message?.isRunStart) await resetRunStateForNewRun()
         reusableIdValueForRun = String(message?.reusableIdValue || '').trim()
         throwIfCancelled()
         await expandCollapsedSectionsOnce()

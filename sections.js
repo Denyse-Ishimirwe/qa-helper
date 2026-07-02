@@ -27,6 +27,12 @@ function parseSectionFromExpectedResult(expectedResult) {
   return fromExp ? normalizeSectionName(fromExp) : ''
 }
 
+function parseBlockFromExpectedResult(expectedResult) {
+  const exp = String(expectedResult || '')
+  const fromExp = (exp.match(/;\s*block\s*:\s*([^;]+)/i) || [])[1]
+  return fromExp ? normalizeSectionName(fromExp) : ''
+}
+
 function parseSectionFromWhatToTest(whatToTest) {
   const wtt = String(whatToTest || '')
   const fromWtt = (wtt.match(/\bin\s+the\s+(.+?)\s+section\b/i) || [])[1]
@@ -286,6 +292,36 @@ function buildLabelSectionMapFromFormStructure(formStructure) {
   return map
 }
 
+// Field-label → BLOCK maps, mirroring the section maps above. Sources: the label_check
+// cases' "; block:" encodings, and the form structure's per-field block (when present).
+function buildLabelBlockMapFromLabelChecks(cases) {
+  const map = new Map()
+  for (const tc of Array.isArray(cases) ? cases : []) {
+    if (String(tc?.test_type || '').trim() !== 'label_check') continue
+    const block = parseBlockFromExpectedResult(tc?.expected_result)
+    if (!block) continue
+    const label = normalizeSectionName(String(tc?.expected_result || '').split(';')[0])
+    if (label) map.set(label.toLowerCase(), block)
+    for (const token of fieldLabelTokens(tc)) {
+      map.set(token.toLowerCase(), block)
+    }
+  }
+  return map
+}
+
+function buildLabelBlockMapFromFormStructure(formStructure) {
+  const parsed = parseFormStructure(formStructure)
+  const fields = Array.isArray(parsed?.fields) ? parsed.fields : []
+  const map = new Map()
+  for (const field of fields) {
+    const block = normalizeSectionName(field?.block)
+    const label = normalizeSectionName(field?.label)
+    if (!block || !label) continue
+    map.set(label.toLowerCase(), block)
+  }
+  return map
+}
+
 /** The captured LIVE form heading for a test case, matched by field-label overlap
  *  (exact token first, then substring). '' when no captured field matches. */
 function liveSectionForTestCase(tc, formStructureMap) {
@@ -343,7 +379,7 @@ export function enrichTestCasesWithSections(testCases, formStructure) {
   })
 
   const labelMap = labelSectionMaps[0]
-  return enriched.map(tc => {
+  const sectioned = enriched.map(tc => {
     if (!isUnsetSection(tc.section) && String(tc.section || '').trim()) return tc
     for (const token of fieldLabelTokens(tc)) {
       const needle = token.toLowerCase()
@@ -360,6 +396,36 @@ export function enrichTestCasesWithSections(testCases, formStructure) {
       }
     }
     return tc
+  })
+
+  // BLOCK recovery — mirrors the section recovery above. The model often fails to
+  // forward-fill the SRD's Block column down bare continuation rows, leaving block empty.
+  // Rebuild field-label → block maps and fill any case whose block is empty but whose
+  // field label maps to a known block. Fields with NO block source (e.g. the SRD's
+  // "Residence Details" section, which genuinely has no Block) are LEFT empty — we never
+  // invent a block, only fill from a real source (label_check encoding or form structure).
+  const labelBlockMaps = [
+    buildLabelBlockMapFromLabelChecks(list),
+    buildLabelBlockMapFromFormStructure(formStructure)
+  ]
+  const blockLabelMap = labelBlockMaps[0]
+  return sectioned.map(tc => {
+    if (String(tc.block || '').trim()) return tc   // already has a block — keep it as-is
+    for (const token of fieldLabelTokens(tc)) {
+      const needle = token.toLowerCase()
+      for (const [label, blk] of blockLabelMap.entries()) {
+        if (label === needle || label.includes(needle) || needle.includes(label)) {
+          return { ...tc, block: blk }
+        }
+      }
+    }
+    for (const map of labelBlockMaps.slice(1)) {
+      for (const token of fieldLabelTokens(tc)) {
+        const mapped = map.get(token.toLowerCase())
+        if (mapped) return { ...tc, block: mapped }
+      }
+    }
+    return tc   // no source → leave block empty (tolerate genuinely block-less fields)
   })
 }
 
