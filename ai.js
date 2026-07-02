@@ -8,8 +8,21 @@ const genAI = process.env.GOOGLE_API_KEY ? new GoogleGenerativeAI(process.env.GO
 
 /** Gemini PRIMARY model. Override with GEMINI_MODEL. (2.5-flash is a thinking model — needs a large token budget.) */
 const GEMINI_MODEL = (process.env.GEMINI_MODEL || 'gemini-2.5-flash').trim()
-/** Minimum output budget for Gemini so the thinking model does not starve the JSON output. */
-const GEMINI_MIN_OUTPUT_TOKENS = 8192
+/**
+ * gemini-2.5-flash real limits (Google): max OUTPUT tokens = 65,536; thinking budget
+ * configurable 0–24,576. We size from those, not a guess. The old 8,192 floor caused
+ * truncation (finishReason=MAX_TOKENS: ~6.3k thinking + ~1.9k JSON ≈ the 8,192 cap),
+ * so a large form's array was cut mid-output and repair salvaged only a partial set.
+ */
+const GEMINI_MAX_OUTPUT_TOKENS = 65536
+/** Output floor we request for generation: half the model ceiling. After the bounded
+ *  reasoning below (≤8,192), that still leaves ~24k tokens for the JSON array (≈250+
+ *  cases) — far beyond any realistic Irembo form. It's a CEILING: small forms still end
+ *  early on finishReason=STOP, so there's no extra cost for them. */
+const GEMINI_MIN_OUTPUT_TOKENS = 32768
+/** Cap reasoning so a thinking model can't spend the whole allowance on thoughts and
+ *  starve the JSON (the confirmed bug). 8,192 ≤ the 24,576 max; the rest goes to output. */
+const GEMINI_THINKING_BUDGET = 8192
 /** Groq fallback #1 when Gemini is unavailable. Override with GROQ_MODEL. */
 const GROQ_PRIMARY_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim()
 /**
@@ -17,6 +30,16 @@ const GROQ_PRIMARY_MODEL = (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile')
  * Override with GROQ_FALLBACK_MODEL or set to '' to disable.
  */
 const GROQ_FALLBACK_MODEL = String(process.env.GROQ_FALLBACK_MODEL ?? 'llama-3.1-8b-instant').trim()
+
+/**
+ * Ollama (OpenAI-compatible) provider — e.g. Irembo-hosted UAT server.
+ * Selected as primary via AI_PROVIDER=ollama. URL + model come from env
+ * (never hardcoded). With AI_FALLBACK=off, a failure here is surfaced instead
+ * of silently cascading to Gemini/Groq.
+ */
+const OLLAMA_BASE_URL = String(process.env.OLLAMA_BASE_URL || '').trim().replace(/\/+$/, '')
+const OLLAMA_MODEL = String(process.env.OLLAMA_MODEL || '').trim()
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS) || 60000
 
 /** Generic head+tail truncation (form JSON, etc.). */
 function trimWithHeadTail(text, maxChars) {
@@ -109,17 +132,43 @@ name (title pattern):
 — Visibility-only check: "{FieldLabel} Conditional Display Test"
 — Submit: "Successful Submit Test"
 
+SRD TABLE STRUCTURE — SECTION and BLOCK are two separate levels, BOTH required on every case:
+The SRD table columns are: Section | Block | Field name (Label) | … . Section and Block are two DIFFERENT hierarchy levels, and BOTH must be captured on every test case:
+  • section = the top-level NAVIGABLE STEP (matches the form's stepper steps). Used for grouping and navigation.
+  • block   = a sub-grouping nested INSIDE a section. One section may contain ONE or MANY blocks, and every field belongs to one of them.
+
+Blank-cell inheritance (forward-fill), applied to each column INDEPENDENTLY:
+  • Section and Block cells are filled ONLY on the first row of each group, then left blank for following rows that belong to the same group.
+  • Carry the last non-blank Section value DOWN to every following field until a new non-blank Section appears.
+  • Carry the last non-blank Block value DOWN independently — EXCEPT: when the Section changes, the carried Block is DROPPED. Never carry a block from one section into another; the new Section's first row provides its own first Block.
+  • A section has ONE or MANY blocks, and every field sits inside one of its blocks — so block is never empty.
+
+What to emit on every test case (ALL test types — required_field, format_validation, conditional_field, widget_auto_fill, attachment, successful_submit, AND label_check):
+  • section: the carried-down SECTION column value (the navigable step). NEVER a Block-column value. Never blank, never "General".
+  • block: the carried-down BLOCK column value (dropped/reset on each new Section). Every field has a block, so this is never empty.
+
+Worked example (placeholders — replace with real SRD values, never output literal brackets). Suppose the SRD reads (blanks shown as ·):
+  Section | Block | Field
+  A       | b1    | f1   → section "A", block "b1"
+  ·       | ·     | f2   → section "A", block "b1"   (both carried down)
+  ·       | b2    | f3   → section "A", block "b2"   (new block, section carried)
+  ·       | ·     | f4   → section "A", block "b2"
+  B       | b3    | f5   → section "B", block "b3"   (new SECTION starts with its OWN first block; the previous block "b2" is DROPPED)
+  ·       | ·     | f6   → section "B", block "b3"
+So f5 gets section "B" with its own block "b3" — the previous block "b2" from section A must NOT leak into section B.
+
 LABEL CHECK (generate these FIRST, grouped by section):
-— For EVERY field in the SRD table emit exactly ONE label_check case (test_type: "label_check"), capturing: exact field label, exact placeholder if the SRD specifies one, and the section name from the Block column.
+— For EVERY field in the SRD table emit exactly ONE label_check case (test_type: "label_check"), capturing: exact field label, exact placeholder if the SRD specifies one, and the section name = the carried-down SECTION column value (NOT the Block column — see SRD TABLE STRUCTURE above).
 — expected_result encoding (verbatim spelling/capitalization; segments separated by "; "):
-  • Label only:        "<Label>; section: <Section>"
-  • With placeholder:  "<Label>; placeholder: <Placeholder>; section: <Section>"
-  • Conditional field: "<Label>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>"  (omit "placeholder:" if none)
+  • Label only:        "<Label>; section: <Section>; block: <Block>"
+  • With placeholder:  "<Label>; placeholder: <Placeholder>; section: <Section>; block: <Block>"
+  • Conditional field: "<Label>; placeholder: <Placeholder>; section: <Section>; block: <Block>; parent: <ParentLabel>=<TriggerValue>"  (omit "placeholder:" if none)
+  • Include the "; block: <Block>" segment (right after section) ONLY when the field has a Block value; omit it entirely when the block is empty.
 — RADIO buttons: capture label and section ONLY — never a placeholder.
 — CONDITIONAL fields: generate ONE case per trigger option (one row per trigger), each with its own "parent: <ParentLabel>=<TriggerValue>".
-— what_to_test MUST be specific, naming section + label (+ placeholder), e.g.:
-  "Checking that the First Name field in the Personal Information section has the label 'First Name' and placeholder 'Enter your first name'".
-— Every test case MUST include "section": the SRD Block / section name for that field or rule. Use the exact Block column text from the SRD. For successful_submit use the final section name or "Submit".
+— what_to_test MUST be specific, naming section + block + label (+ placeholder). Include the block clause only when the field has a Block value; omit it entirely when the block is empty. e.g.:
+  "Checking that the First Name field in the Applicant Details section, Personal Information block, has the label 'First Name' and placeholder 'Enter your first name'".
+— Every test case MUST include "section": the carried-down SECTION column value for that field or rule (apply the FORWARD-FILL rule from SRD TABLE STRUCTURE so blank cells inherit the Section above) — NEVER the Block column text. For successful_submit use the final section name or "Submit".
 — ORDER: group output by section in SRD order; within each section emit that section's label_check cases FIRST, then that section's other test types (Section 1 block, then Section 2 block, …).
 
 CONDITIONAL FIELDS (visibility / required-if / display-if — test_type MUST be conditional_field, never required_field):
@@ -165,21 +214,21 @@ General:
 — Widget flows (choose widget type before dependent fields when the SRD says so): reflect SRD order inside what_to_test in the same short sentence style.
 
 Output schema per element:
-{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check", "section": string }
+{ "name": string, "what_to_test": string, "expected_result": string, "test_type": "required_field"|"format_validation"|"successful_submit"|"conditional_field"|"widget_auto_fill"|"attachment"|"label_check", "section": string, "block": string }
 
 STYLE EXEMPLAR (placeholders only — replace every <…> with real SRD/form labels and messages; never output literal angle-bracket tokens). Display Tests use distinct placeholders (<OptionalConditionalFieldLabel>, <OptionalDeepTargetFieldLabel>) to enforce the DEDUPLICATION RULE: a Conditional Display Test is only for conditional fields NOT already covered by a Required Field Test (e.g. optional conditional fields, or fields tested for staying hidden). Never emit a Display Test for the same field+parent that already has a Required Field Test.
 [
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>","test_type":"label_check"},
-  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>","test_type":"label_check"},
-  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check"},
-  {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field"},
-  {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field"},
-  {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation"},
-  {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field"},
-  {"name":"<OptionalConditionalFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <OptionalConditionalFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalConditionalFieldLabel> field appears","test_type":"conditional_field"},
-  {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field"},
-  {"name":"<OptionalDeepTargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then select any valid option on <Level2Label> field, and checking if <OptionalDeepTargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalDeepTargetFieldLabel> field appears","test_type":"conditional_field"},
-  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit"}
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section, <Block> block, has the label '<FieldLabel>'","expected_result":"<FieldLabel>; section: <Section>; block: <Block>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> Label Check Test","what_to_test":"Checking that the <FieldLabel> field in the <Section> section, <Block> block, has the label '<FieldLabel>' and placeholder '<Placeholder>'","expected_result":"<FieldLabel>; placeholder: <Placeholder>; section: <Section>; block: <Block>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<ChildLabel> Label Check Test","what_to_test":"Checking that the <ChildLabel> field shown when <ParentLabel> is '<TriggerValue>' in the <Section> section, <Block> block, has the label '<ChildLabel>'","expected_result":"<ChildLabel>; placeholder: <Placeholder>; section: <Section>; block: <Block>; parent: <ParentLabel>=<TriggerValue>","test_type":"label_check","section":"<Section>","block":"<Block>"},
+  {"name":"<MandatoryFieldLabel> Required Field Test","what_to_test":"Leaving <MandatoryFieldLabel> field empty","expected_result":"<Exact validation message from SRD for that field>","test_type":"required_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalFieldLabel> Optional Field Test","what_to_test":"Leaving <OptionalFieldLabel> field empty","expected_result":"No error message","test_type":"required_field","section":"<Section>","block":"<Block>"},
+  {"name":"<FieldLabel> <RuleName> Test","what_to_test":"Entering <plain-English invalid condition from SRD for this rule>","expected_result":"<Exact SRD message for that rule>","test_type":"format_validation","section":"<Section>","block":"<Block>"},
+  {"name":"<TargetFieldLabel> Required Field Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and leaving <TargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message for empty target>'","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalConditionalFieldLabel> Conditional Display Test","what_to_test":"Selecting '<ParentValue>' on <ParentFieldLabel> field and checking if <OptionalConditionalFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalConditionalFieldLabel> field appears","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<DeepTargetFieldLabel> Required Field Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then on <Level2Label> field, then leave <DeepTargetFieldLabel> field empty","expected_result":"Displayed: Yes; Required: Yes; Validation: '<Exact SRD message>'","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"<OptionalDeepTargetFieldLabel> Conditional Display Test","what_to_test":"Selecting '<RootTrigger>' on <RootParentLabel> field, then select any valid option on <Level1Label> field, then select any valid option on <Level2Label> field, and checking if <OptionalDeepTargetFieldLabel> field appears","expected_result":"Displayed: Yes; Required: N/A; <OptionalDeepTargetFieldLabel> field appears","test_type":"conditional_field","section":"<Section>","block":"<Block>"},
+  {"name":"Successful Submit Test","what_to_test":"Filling out all required fields and submitting the form","expected_result":"<Exact success message from SRD, or short confirmation phrase if SRD uses one>","test_type":"successful_submit","section":"<Section>","block":""}
 ]`
 
 function groqApiMessage(err) {
@@ -294,20 +343,31 @@ function extractFirstJsonArrayBlock(text) {
   return ''
 }
 
+/** Arrays pass through; a wrapper object like {"testCases":[...]} returns its
+ *  first array-valued property (smaller models sometimes wrap under response_format). */
+function coerceToCaseArray(parsed) {
+  if (Array.isArray(parsed)) return parsed
+  if (parsed && typeof parsed === 'object') {
+    for (const v of Object.values(parsed)) if (Array.isArray(v)) return v
+  }
+  return []
+}
+
 function parseJsonArrayOrThrow(rawText) {
   const raw = String(rawText || '').trim()
   if (!raw) return []
+  // Safety net: strip ```json fences and surrounding prose before parsing.
   const cleaned = raw.replace(/```json|```/gi, '').trim()
   try {
-    const parsed = JSON.parse(cleaned)
-    return Array.isArray(parsed) ? parsed : []
+    return coerceToCaseArray(JSON.parse(cleaned))
   } catch {
     const extracted = extractFirstJsonArrayBlock(raw)
     if (!extracted) {
+      // Never crash silently — log the FULL raw model output for inspection.
+      console.error('[ai] Model output was not parseable JSON — full raw response below:\n', raw)
       throw new Error(`AI returned non-JSON output: ${raw.slice(0, 120)}`)
     }
-    const parsed = JSON.parse(extracted)
-    return Array.isArray(parsed) ? parsed : []
+    return coerceToCaseArray(JSON.parse(extracted))
   }
 }
 
@@ -344,9 +404,11 @@ async function geminiGenerate(payload) {
   const userText =
     messages.filter(m => m.role !== 'system').map(m => String(m.content || '')).join('\n\n').trim()
   const generationConfig = {
-    // Thinking models (2.5-flash) spend output tokens on reasoning — force a large
-    // floor so the JSON array is never starved.
-    maxOutputTokens: Math.max(Number(payload.max_tokens) || 0, GEMINI_MIN_OUTPUT_TOKENS)
+    // Thinking models (2.5-flash) spend output tokens on reasoning — request a large
+    // ceiling so the JSON array is never starved, and BOUND reasoning so it can't eat
+    // the whole allowance (the confirmed MAX_TOKENS truncation).
+    maxOutputTokens: Math.max(Number(payload.max_tokens) || 0, GEMINI_MIN_OUTPUT_TOKENS),
+    thinkingConfig: { thinkingBudget: GEMINI_THINKING_BUDGET }
   }
   if (typeof payload.temperature === 'number') generationConfig.temperature = payload.temperature
   const model = genAI.getGenerativeModel({
@@ -355,16 +417,97 @@ async function geminiGenerate(payload) {
     generationConfig
   })
   const result = await model.generateContent(userText)
+  const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown' // TEMP DIAGNOSTIC
+  const u = result?.response?.usageMetadata || {} // TEMP DIAGNOSTIC
+  console.log('[gen][gemini] finishReason=', finishReason, '| maxOutputTokens=', generationConfig.maxOutputTokens,
+    '| usage(thoughts/cand/total)=', `${u.thoughtsTokenCount ?? '?'}/${u.candidatesTokenCount ?? '?'}/${u.totalTokenCount ?? '?'}`) // TEMP DIAGNOSTIC
   const text = typeof result?.response?.text === 'function' ? result.response.text() : ''
   if (!String(text || '').trim()) {
-    const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown'
     throw new Error(`Gemini returned empty text (finishReason=${finishReason})`)
   }
   return { choices: [{ message: { content: String(text) } }] }
 }
 
 /**
+ * Run an OpenAI-style payload through an OpenAI-compatible Ollama server.
+ * URL/model come from OLLAMA_BASE_URL / OLLAMA_MODEL (no hardcoding). Tries
+ * response_format json_object; the caller retries plain on rejection. Returns
+ * the same { choices:[{message:{content}}] } shape as the other providers.
+ */
+async function ollamaGenerate(payload, { allowJsonFormat = true } = {}) {
+  if (!OLLAMA_BASE_URL) throw new Error('AI_PROVIDER=ollama but OLLAMA_BASE_URL is not set')
+  if (!OLLAMA_MODEL) throw new Error('AI_PROVIDER=ollama but OLLAMA_MODEL is not set')
+  const url = `${OLLAMA_BASE_URL}/chat/completions`
+
+  const body = {
+    model: OLLAMA_MODEL,
+    messages: Array.isArray(payload.messages) ? payload.messages : [],
+    temperature: typeof payload.temperature === 'number' ? payload.temperature : 0,
+    ...(payload.max_tokens ? { max_tokens: payload.max_tokens } : {}),
+    // OpenAI-compatible structured-output hint; retried without it on rejection.
+    ...(allowJsonFormat ? { response_format: { type: 'json_object' } } : {})
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), OLLAMA_TIMEOUT_MS)
+  let res
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        // Server is open, but OpenAI-compatible clients/servers often require a
+        // non-empty key string — send a dummy bearer (override via OLLAMA_API_KEY).
+        Authorization: `Bearer ${process.env.OLLAMA_API_KEY || 'ollama'}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    })
+  } catch (err) {
+    const how = err?.name === 'AbortError' ? `timed out after ${OLLAMA_TIMEOUT_MS}ms` : String(err?.message || err)
+    throw new Error(`[ai][ollama] server UNREACHABLE at ${url} (${how}) — check VPN/network/OLLAMA_BASE_URL.`)
+  } finally {
+    clearTimeout(timer)
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    // If the server rejected response_format, signal the caller to retry plain.
+    if (allowJsonFormat && (res.status === 400 || /response_format|json_object|unsupported/i.test(errText))) {
+      const e = new Error('ollama-json-format-unsupported')
+      e.code = 'OLLAMA_JSON_FORMAT_UNSUPPORTED'
+      throw e
+    }
+    throw new Error(`[ai][ollama] HTTP ${res.status} at ${url}: ${errText.slice(0, 300)}`)
+  }
+
+  const data = await res.json().catch(() => null)
+  const content = data?.choices?.[0]?.message?.content
+  if (typeof content !== 'string' || !content.trim()) {
+    console.error('[ai][ollama] empty/unexpected response — full raw:\n', JSON.stringify(data))
+    throw new Error('[ai][ollama] returned an empty/unexpected response (raw logged above).')
+  }
+  return { choices: [{ message: { content } }] }
+}
+
+/** Ollama with response_format json_object, retrying once as a plain call if rejected. */
+async function ollamaChatWithJsonFallback(payload) {
+  try {
+    return await ollamaGenerate(payload, { allowJsonFormat: true })
+  } catch (err) {
+    if (err?.code === 'OLLAMA_JSON_FORMAT_UNSUPPORTED') {
+      console.warn('[ai][ollama] response_format json_object rejected — retrying plain call; JSON safety net will clean the output.')
+      return await ollamaGenerate(payload, { allowJsonFormat: false })
+    }
+    throw err
+  }
+}
+
+/**
  * Multi-provider cascade (kept named groqChatCompletionsCreate for back-compat with existing imports):
+ *   Provider selection (env): AI_PROVIDER=ollama makes Ollama the primary.
+ *   AI_FALLBACK=off (default on) means a primary failure is surfaced, NOT cascaded.
+ *   Default cascade (AI_PROVIDER unset):
  *   1) Gemini (gemini-2.5-flash via GOOGLE_API_KEY)
  *   2) on any failure → Groq llama-3.3-70b-versatile (GROQ_API_KEY)
  *   3) on 429 → Groq llama-3.1-8b-instant
@@ -372,6 +515,23 @@ async function geminiGenerate(payload) {
  * @param {Record<string, unknown>} payload
  */
 async function groqChatCompletionsCreate(payload) {
+  const provider = String(process.env.AI_PROVIDER || '').toLowerCase().trim()
+  const fallbackEnabled = !/^(off|false|0|no)$/i.test(String(process.env.AI_FALLBACK ?? 'on').trim())
+
+  // Selectable primary: Ollama (OpenAI-compatible, e.g. Irembo-hosted UAT).
+  if (provider === 'ollama') {
+    try {
+      return await ollamaChatWithJsonFallback(payload)
+    } catch (err) {
+      if (!fallbackEnabled) {
+        // Surface the real failure — do NOT silently fall back to Gemini/Groq.
+        throw new Error(`[ai] Ollama failed and fallback is OFF (set AI_FALLBACK=on to cascade). Cause: ${String(err?.message || err)}`)
+      }
+      console.warn(`[ai] Ollama failed (${String(err?.message || err).slice(0, 160)}) — AI_FALLBACK on; cascading to Gemini/Groq.`)
+      // fall through to the existing cascade
+    }
+  }
+
   const groqPrimary = (payload.model || GROQ_PRIMARY_MODEL).trim()
   const groqFallback = GROQ_FALLBACK_MODEL && GROQ_FALLBACK_MODEL !== groqPrimary ? GROQ_FALLBACK_MODEL : ''
 
@@ -511,78 +671,76 @@ async function generateTestCases(srdText, formStructure) {
         what_to_test: String(tc?.what_to_test || '').trim(),
         expected_result: String(tc?.expected_result || '').trim(),
         test_type: normalizeGeneratedType(tc?.test_type),
-        section: String(tc?.section || '').trim()
+        section: String(tc?.section || '').trim(),
+        block: String(tc?.block || '').trim()
       }))
       .filter(tc => tc.name && tc.what_to_test && tc.expected_result && tc.test_type !== '__drop__')
   }
 
   function retagSpecialCaseTypes(list) {
     const cases = Array.isArray(list) ? list : []
+    const VALID = ['required_field', 'format_validation', 'successful_submit', 'conditional_field', 'widget_auto_fill', 'attachment', 'label_check']
+
+    // Classify by what the test actually CHECKS, not by whether it has a parent
+    // prerequisite. A bare "selecting 'X' on Y field" prerequisite appears in
+    // widget AND required tests too, so it must NOT, on its own, force conditional.
     return cases.map((tc) => {
-      const merged = `${tc.name} ${tc.what_to_test} ${tc.expected_result}`.toLowerCase()
-      const currentType = String(tc?.test_type || '').toLowerCase().trim()
+      const name = String(tc?.name || '')
+      const exp = String(tc?.expected_result || '')
+      const merged = `${name} ${tc?.what_to_test || ''} ${exp}`.toLowerCase()
+      const t = String(tc?.test_type || '').toLowerCase().trim()
 
-      if (
-        currentType === 'conditional_display' ||
-        currentType === 'conditional_displayed' ||
-        currentType === 'display_conditional' ||
-        currentType === 'conditional_required' ||
-        currentType === 'conditional_required_field' ||
-        currentType === 'required_if' ||
-        currentType === 'conditional_field'
-      ) {
-        return { ...tc, test_type: 'conditional_field' }
-      }
-
-      if (/displayed\s*:/i.test(String(tc.expected_result || ''))) {
-        return { ...tc, test_type: 'conditional_field' }
-      }
-      const wtt = String(tc.what_to_test || '')
-      if (/selecting\s+['"]/i.test(wtt) && /\bon\s+.+\s+field\b/i.test(wtt)) {
-        return { ...tc, test_type: 'conditional_field' }
-      }
-
-      if (
-        merged.includes('auto-fill') ||
-        merged.includes('autofill') ||
-        merged.includes('auto populate') ||
-        merged.includes('auto-populate') ||
-        merged.includes('gets populated') ||
-        merged.includes('field destination') ||
+      // 1) WIDGET — highest precedence. Explicit tag or clear intent wins and is
+      //    never reachable by the conditional re-tag below.
+      const isWidget =
+        t === 'widget_auto_fill' ||
+        /\bwidget\b/.test(merged) ||
+        merged.includes('auto-fill') || merged.includes('autofill') ||
+        merged.includes('auto populate') || merged.includes('auto-populate') ||
+        merged.includes('gets populated') || merged.includes('field destination') ||
         merged.includes('widget data')
-      ) {
-        return { ...tc, test_type: 'widget_auto_fill' }
-      }
+      if (isWidget) return { ...tc, test_type: 'widget_auto_fill' }
 
-      if (
-        merged.includes('attachment') ||
-        merged.includes('upload') ||
-        merged.includes('file format') ||
-        merged.includes('500kb') ||
-        merged.includes('larger than')
-      ) {
-        return { ...tc, test_type: 'attachment' }
-      }
+      // 2) ATTACHMENT — next precedence.
+      const isAttachment =
+        t === 'attachment' ||
+        merged.includes('attachment') || merged.includes('upload') ||
+        merged.includes('file format') || merged.includes('500kb') || merged.includes('larger than')
+      if (isAttachment) return { ...tc, test_type: 'attachment' }
 
+      // 3) GENUINE conditional — the test's primary assertion is appearance/hiding
+      //    or an appears-but-optional check. Signalled by a display/hidden name or
+      //    a "Displayed: No" / "Required: N/A" / "field appears|is hidden" encoding.
+      const isVisibilityCheck =
+        /\bconditional\s+display\b|\bdisplay\s+test\b/i.test(name) ||
+        /\bdisplayed\s*:\s*no\b/i.test(exp) ||
+        /\brequired\s*:\s*n\/?a\b/i.test(exp) ||
+        /field\s+appears\b|is\s+hidden\b|not\s+displayed\b/i.test(exp)
+      if (isVisibilityCheck) return { ...tc, test_type: 'conditional_field' }
+
+      // 4) REQUIRED-once-visible — a required check, even when the field is
+      //    revealed by a parent. Keep it required_field; do NOT collapse into
+      //    conditional just because it has a parent prerequisite.
+      const isRequiredCheck =
+        /\brequired\s+field\s+test\b/i.test(name) ||
+        /\brequired\s*:\s*yes\b/i.test(exp) ||
+        /\bvalidation\s*:/i.test(exp)
+      if (isRequiredCheck) return { ...tc, test_type: 'required_field' }
+
+      // 5) Respect an explicit, already-valid tag from the model (don't let text
+      //    heuristics overwrite a correct required/format/label/submit/conditional).
+      if (VALID.includes(t)) return { ...tc, test_type: t }
+
+      // 6) Last-resort inference for unlabeled cases — narrowed conditional signal
+      //    (appears/shown/visible/hidden WHEN…, or required WHEN/IF…), NOT a bare
+      //    parent selection.
       const conditionalLeadIn =
-        merged.includes('if "') ||
-        merged.includes('when "') ||
-        /\bonly\s+(when|if)\b/.test(merged) ||
-        /\bappears\s+(when|if)\b/.test(merged) ||
-        /\bshown\s+(when|if)\b/.test(merged) ||
-        /\bvisible\s+(when|if)\b/.test(merged) ||
-        /\bhidden\s+(when|if)\b/.test(merged) ||
-        merged.includes('display rule') ||
-        /\bwhen\s+[^.]{2,120}\s+is\s+/.test(merged) ||
-        /\bif\s+[^.]{2,120}\s+is\s+/.test(merged) ||
-        /\brequired\s+when\b/.test(merged) ||
-        /\brequired\s+if\b/.test(merged)
+        /\b(appears|shown|visible|hidden)\s+(when|if)\b/.test(merged) ||
+        /\brequired\s+(when|if)\b/.test(merged) ||
+        merged.includes('display rule')
+      if (conditionalLeadIn) return { ...tc, test_type: 'conditional_field' }
 
-      if (conditionalLeadIn) {
-        return { ...tc, test_type: 'conditional_field' }
-      }
-
-      return tc
+      return { ...tc, test_type: 'required_field' }
     })
   }
 
@@ -629,6 +787,7 @@ async function generateTestCases(srdText, formStructure) {
         let effSrdChars = plan.srdChars
         if (srdCap) effSrdChars = Math.min(effSrdChars, srdCap)
         const srdForPrompt = trimSrdForPrompt(srdText, effSrdChars)
+        console.log('[gen] plan', planIdx, '| max_tokens=', plan.maxTokens, '| srd budget=', effSrdChars, '| srd sent=', srdForPrompt.length, '/ full', String(srdText || '').length) // TEMP DIAGNOSTIC
         const compactStructure = compactStructureForPrompt(formStructure, plan.structureChars)
         const structureSection = compactStructure
           ? `=== FORM STRUCTURE (JSON — match field names; rules only from SRD) ===\n${compactStructure}`
@@ -642,7 +801,7 @@ ${srdForPrompt}
 ${structureSection}
 
 ${extraRules ? `Additional instructions:\n${extraRules}\n` : ''}
-Respond with ONLY one JSON array. Each object must have: name, what_to_test, expected_result, test_type.
+Respond with ONLY one JSON array. Each object must have: name, what_to_test, expected_result, test_type, section (the navigable step, forward-filled, never the Block, never blank/"General"), block (the sub-grouping, reset on each new Section, "" if the field has no block).
 Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_to_test (like the EXEMPLAR), expected_result from SRD or the same concise style as the exemplar.`
 
         const completion = await groqChatCompletionsCreate({
@@ -657,11 +816,14 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
 
         const response = completion.choices?.[0]?.message?.content || '[]'
         let parsed
+        let viaRepair = false // TEMP DIAGNOSTIC
         try {
           parsed = parseJsonArrayOrThrow(response)
         } catch {
+          viaRepair = true // TEMP DIAGNOSTIC
           parsed = await repairResponseToJsonArray(response)
         }
+        console.log('[gen] response chars=', response.length, '| parsed cases=', Array.isArray(parsed) ? parsed.length : 0, '| viaRepair=', viaRepair) // TEMP DIAGNOSTIC
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
@@ -824,6 +986,11 @@ async function analyzeFormStructure(fields) {
       }
       const section = String(f?.section || '').trim()
       if (section) row.section = section
+      // Give block the SAME structured reinforcement section has: if the form structure
+      // carries a per-field block/sub-group, surface it to the model alongside section.
+      // When the structure has no block, this stays empty and is simply omitted.
+      const block = String(f?.block || '').trim()
+      if (block) row.block = block
       const err = String(f?.errorSelector || '').trim()
       const fmt = String(f?.formatErrorSelector || '').trim()
       if (err) row.errorSelector = err

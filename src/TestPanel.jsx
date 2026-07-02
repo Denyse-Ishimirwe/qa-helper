@@ -29,9 +29,9 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
   const [loading, setLoading] = useState(false)
   const [running, setRunning] = useState(false)
   const [editingId, setEditingId] = useState(null)
-  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
+  const [editForm, setEditForm] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '', block: '' })
   const [showAddForm, setShowAddForm] = useState(false)
-  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
+  const [newCase, setNewCase] = useState({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '', block: '' })
   const [addError, setAddError] = useState('')
   const [confirmDelete, setConfirmDelete] = useState(null)
   const [comparison, setComparison] = useState(null)
@@ -174,7 +174,8 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
       what_to_test: tc.what_to_test,
       expected_result: tc.expected_result,
       test_type: normalizeTestTypeUi(tc.test_type),
-      section: displaySection(tc)
+      section: displaySection(tc),
+      block: tc.block || ''
     })
   }
 
@@ -240,7 +241,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
         body: JSON.stringify(newCase)
       })
       if (res.ok) {
-        setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
+        setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '', block: '' })
         setShowAddForm(false)
         setAddError('')
         await fetchTestCases()
@@ -327,6 +328,12 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
             />
             <input
               className="panel-input"
+              value={editForm.block}
+              onChange={e => setEditForm({ ...editForm, block: e.target.value })}
+              placeholder="Block name"
+            />
+            <input
+              className="panel-input"
               value={editForm.what_to_test}
               onChange={e => setEditForm({ ...editForm, what_to_test: e.target.value })}
               placeholder="What to test"
@@ -389,6 +396,12 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
                 <span className="field-label">Section</span>
                 <span className="field-value">{displaySection(tc)}</span>
               </div>
+              {tc.block && (
+                <div className="card-field">
+                  <span className="field-label">Block</span>
+                  <span className="field-value">{tc.block}</span>
+                </div>
+              )}
               <div className="card-field">
                 <span className="field-label">Test type</span>
                 <span className="field-value">{normalizeTestTypeUi(tc.test_type)}</span>
@@ -582,6 +595,14 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               value={newCase.section}
               onChange={e => setNewCase({ ...newCase, section: e.target.value })}
             />
+            <label>Block</label>
+            <input
+              className="panel-input"
+              type="text"
+              placeholder="e.g. Personal Information"
+              value={newCase.block}
+              onChange={e => setNewCase({ ...newCase, block: e.target.value })}
+            />
             <label>What to Test</label>
             <input
               className="panel-input"
@@ -617,7 +638,7 @@ function TestPanel({ project, token, onProjectsNeedRefresh, onClose }) {
               <button className="btn-cancel" onClick={() => {
                 setShowAddForm(false)
                 setAddError('')
-                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '' })
+                setNewCase({ name: '', what_to_test: '', expected_result: '', test_type: 'required_field', section: '', block: '' })
               }}
               >
                 Cancel
