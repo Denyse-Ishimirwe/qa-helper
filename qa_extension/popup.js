@@ -1,7 +1,7 @@
 /* global chrome, CONFIG, resolveApiUrl */
 let API_BASE = CONFIG.API_URL
 let APP_BASE = CONFIG.API_URL
-const APP_BASES = ['http://localhost:5173', 'https://qa-helper-tool.onrender.com', CONFIG.LOCAL_URL, CONFIG.PRODUCTION_URL]
+const APP_BASES = ['http://localhost:5173', 'https://qa-helper-1.onrender.com', CONFIG.LOCAL_URL, CONFIG.PRODUCTION_URL]
 const ACTIVE_JOB_KEY = 'qa_ext_active_job'
 const REUSABLE_ID_KEY = 'qa_ext_reusable_id_value'
 let lastEventSeq = 0

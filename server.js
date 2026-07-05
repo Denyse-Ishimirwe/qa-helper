@@ -14,6 +14,7 @@ import ExcelJS from 'exceljs'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 import { launchChromiumBrowser } from './playwright-launch.js'
+import { EXTENSION_CONFIG } from './extension-config.js'
 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -90,6 +91,13 @@ app.use(express.json({ limit: '25mb' }))
 
 app.get('/api/health', (req, res) => {
   res.status(200).json({ ok: true, time: new Date().toISOString() })
+})
+
+// Remote settings for the Chrome extension — edit extension-config.js, redeploy,
+// and every installed extension picks the changes up on its next run.
+app.get('/api/extension-config', (req, res) => {
+  res.set('Cache-Control', 'no-store')
+  res.status(200).json(EXTENSION_CONFIG)
 })
 
 async function resolveBestFormContext(page) {
