@@ -701,11 +701,26 @@ async function generateTestCases(srdText, formStructure) {
         merged.includes('widget data')
       if (isWidget) return { ...tc, test_type: 'widget_auto_fill' }
 
-      // 2) ATTACHMENT — next precedence.
+      // 2) ATTACHMENT — only when the FIELD ITSELF is a document upload. A field that merely
+      //    SITS in a block named "Attachments" (now surfaced in what_to_test) must NOT be
+      //    retagged. Two safeguards:
+      //    (a) never override an explicit label_check — a label check for a field in an
+      //        "Attachments" block is still a label check;
+      //    (b) key off an upload ACTION / file constraint (an upload/attach VERB + a file noun,
+      //        "click to upload", file size/format, a KB/MB size, "larger than"), NOT the bare
+      //        noun "attachment"/"upload" — which now comes from the block name. Note the verbs
+      //        use \b so "attachment"/"attachments" (no boundary before "ment") never match.
+      const uploadActionSignal =
+        (/\b(upload(ing|s|ed)?|attach(ing|es|ed)?|re-?upload)\b/.test(merged) &&
+          /\b(file|document|doc|proof|copy|scan|photo|image|pdf|attachment)\b/.test(merged)) ||
+        merged.includes('click to upload') || merged.includes('choose file') || merged.includes('select a file') ||
+        /\bfile\s+(size|format|type)\b/.test(merged) ||
+        /\bwrong\s+(file\s+)?format\b/.test(merged) ||
+        /\b\d+\s*(kb|mb|gb)\b/.test(merged) ||
+        merged.includes('larger than') || merged.includes('exceeds') || merged.includes('maximum file')
       const isAttachment =
         t === 'attachment' ||
-        merged.includes('attachment') || merged.includes('upload') ||
-        merged.includes('file format') || merged.includes('500kb') || merged.includes('larger than')
+        (t !== 'label_check' && uploadActionSignal)
       if (isAttachment) return { ...tc, test_type: 'attachment' }
 
       // 3) GENUINE conditional — the test's primary assertion is appearance/hiding
