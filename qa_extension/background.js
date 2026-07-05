@@ -75,13 +75,60 @@ function _nextCaseContinuesConditionalChain(cur, next) {
 /** Default cap when test_type is unknown (keep full runs roughly 3–5 minutes for typical suites). */
 const PER_TEST_CASE_TIMEOUT_MS = 3 * 60 * 1000
 
+// ---------------------------------------------------------------------------
+// Remote engine config ("host once, tune from the backend").
+// Fetched from GET /api/extension-config at run start, cached in
+// chrome.storage.local, and pushed to the content script. If the backend has
+// no such route yet (404) or is unreachable, the extension silently keeps its
+// built-in defaults (engine-config.js) — a run NEVER fails because of this.
+// ---------------------------------------------------------------------------
+let _engineConfig = null // last known config (remote or cached), null = defaults
+
+async function fetchEngineConfig(apiBase, token) {
+  try {
+    const res = await fetch(`${apiBase}/api/extension-config`, {
+      headers: authHeaders(token),
+      cache: 'no-store'
+    })
+    if (res.ok) {
+      const cfg = await res.json()
+      if (cfg && typeof cfg === 'object') {
+        _engineConfig = cfg
+        try { await chrome.storage.local.set({ qaEngineConfig: cfg }) } catch { /* cache is best-effort */ }
+        console.log('[QA config] fetched remote engine config, version:', cfg.version)
+        return cfg
+      }
+    }
+  } catch { /* fall through to cached copy */ }
+  try {
+    const { qaEngineConfig } = await chrome.storage.local.get('qaEngineConfig')
+    if (qaEngineConfig && typeof qaEngineConfig === 'object') {
+      _engineConfig = qaEngineConfig
+      console.log('[QA config] backend unreachable — using cached engine config, version:', qaEngineConfig.version)
+      return qaEngineConfig
+    }
+  } catch { /* storage unavailable */ }
+  console.log('[QA config] no remote/cached engine config — using built-in defaults')
+  return null
+}
+
+async function sendEngineConfigToTab(tabId) {
+  if (!_engineConfig) return
+  try {
+    await sendTabMessageOnce(tabId, { type: 'QA_HELPER_SET_ENGINE_CONFIG', config: _engineConfig })
+  } catch { /* content script not ready yet — inject path retries */ }
+}
+
 function perTestCaseTimeoutMs(tc = {}) {
   const t = String(tc?.test_type || '').trim()
+  const cfgByType = _engineConfig?.timeouts?.perTestCaseByType
+  if (cfgByType && Number(cfgByType[t]) > 0) return Number(cfgByType[t])
+  const cfgDefault = Number(_engineConfig?.timeouts?.perTestCaseDefaultMs)
   if (t === 'successful_submit') return 5 * 60 * 1000
   if (t === 'conditional_display' || t === 'conditional_required' || t === 'conditional_field') return 4 * 60 * 1000
   if (t === 'required_field' || t === 'format_validation') return 3 * 60 * 1000
   if (t === 'label_check') return 15 * 1000
-  return PER_TEST_CASE_TIMEOUT_MS
+  return cfgDefault > 0 ? cfgDefault : PER_TEST_CASE_TIMEOUT_MS
 }
 
 function _shouldRetryAfterSectionAdvance(response) {
@@ -191,8 +238,11 @@ function isTransientTabMessageError(msg) {
 async function injectContentIntoTab(tabId) {
   await chrome.scripting.executeScript({
     target: { tabId },
-    files: ['config.js', 'content.js']
+    files: ['config.js', 'engine-config.js', 'content.js']
   })
+  // Freshly injected content script starts with built-in defaults — push the
+  // remote config (if we have one) so it runs with current backend settings.
+  await sendEngineConfigToTab(tabId)
 }
 
 function sendTabMessageOnce(tabId, payload) {
@@ -340,6 +390,11 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     lastRunTabUrl: startUrl
   })
 
+  // Pull the latest engine settings (selectors/timeouts/test values) from the
+  // backend and push them to the page — falls back to built-in defaults.
+  await fetchEngineConfig(apiBase, token)
+  await sendEngineConfigToTab(tabId)
+
   const skipQuery = skipTestTypes.length ? `?skipTypes=${encodeURIComponent(skipTestTypes.join(','))}` : ''
   const fetchUrl = `${apiBase}/api/projects/${projectId}/extension-test-cases${skipQuery}`
   console.log('[QA fetch] run start — projectId:', Number(projectId || 0), '| fetch URL:', fetchUrl) // TEMP DIAGNOSTIC
@@ -422,13 +477,32 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   }
 
   async function attemptSectionAdvance() {
+    console.log('[QA advance] START — looking for Continue button') // TEMP DIAGNOSTIC
     try {
       const response = await sendTabMessageWithTimeout(
         tabId,
         { type: 'QA_HELPER_ADVANCE_AND_PROBE' },
         90000
       )
+      console.log('[QA advance] response — ok=' + Boolean(response?.ok) + ' | buttonFound=' + Boolean(response?.buttonFound) + ' | sectionChanged=' + Boolean(response?.sectionChanged) + (response?.error ? ' | error=' + JSON.stringify(response.error) : '')) // TEMP DIAGNOSTIC
       return Boolean(response?.ok && response?.sectionChanged)
+    } catch (err) {
+      console.log('[QA advance] attemptSectionAdvance threw (timeout/no content?):', String(err?.message || err)) // TEMP DIAGNOSTIC
+      return false
+    }
+  }
+
+  // Fill the current step's visible fields WITHOUT clicking Continue, to reveal
+  // progressively-gated sibling fields so their cases can be probed/run on this section
+  // before advancing. Returns true if the form changed (new fields appeared).
+  async function fillToReveal() {
+    try {
+      const response = await sendTabMessageWithTimeout(
+        tabId,
+        { type: 'QA_HELPER_FILL_TO_REVEAL' },
+        60000
+      )
+      return Boolean(response?.ok && response?.changed)
     } catch {
       return false
     }
@@ -438,7 +512,6 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // (the single forward pass drains each section by probe, then advances once), not by
   // section-name matching. Retained only for reference and the [QA nav] diagnostics;
   // sectionsMatch is intentionally NOT the gate for running a test.
-  async function navigateToSection(targetSection) {
   async function isSectionReachable(targetSection, sectionCases = []) {
     try {
       const response = await sendTabMessageWithTimeout(
@@ -529,6 +602,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
         if (RUN_STATE.cancellationRequested) break
         const tc = pending[i]
         const reachable = await probeReachable(tc, sectionIndex)
+        console.log('[QA drain] section', sectionIndex, '| field', JSON.stringify(pickCaseFieldLabel(tc)), '| type', String(tc?.test_type || ''), '| probeReachable=', reachable) // TEMP DIAGNOSTIC
         if (reachable) {
           pending.splice(i, 1)          // remove before running; do not advance i
           await runOneTest(tc)
@@ -657,8 +731,16 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // `pending` is form-ordered (buildSectionOrder) only so we present cases sensibly; the
   // stored section NAME is never matched — a case belongs to "this section" iff its field
   // is visible now. Advances are capped to the number of sections to avoid infinite loops.
-  const pending = testCases.slice()
+  // Hold successful_submit for the very END. Its probe is ALWAYS "visible" (it acts on the
+  // Continue/Submit button, not a field), so if left in the pool it would match on the FIRST
+  // section and submit the form prematurely — jumping past every later section. Everything
+  // else drains section-by-section; submit runs once, after all sections are traversed.
+  const submitCases = testCases.filter(tc => String(tc?.test_type || '').trim() === 'successful_submit')
+  const pending = testCases.filter(tc => String(tc?.test_type || '').trim() !== 'successful_submit')
   const maxAdvances = Math.max(groupsToRun.length, 1)
+  const MAX_REVEAL_ROUNDS = 30   // SAFETY cap only (prevent a true infinite loop). Rounds normally
+                                 // stop far sooner via the no-progress exit below. Large sections
+                                 // with many progressive/conditional fields need many rounds to drain.
   let advances = 0
   let sectionIndex = 0
   console.log('[QA run] single-pass start —', pending.length, 'cases |', groupsToRun.length, 'sections | advance cap', maxAdvances, '| run-start url=', startUrl, '(controls-on-page shown on the first [QA skip] line below)') // TEMP DIAGNOSTIC
@@ -669,22 +751,42 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       message: `Section ${sectionIndex}: testing ${pending.length} remaining case${pending.length === 1 ? '' : 's'}`
     })
 
-      const reached = await navigateToSection(sectionName, sectionCases)
-      if (!reached) {
-        for (const tc of sectionCases) {
-          failUnreachable(tc, `Could not navigate to section "${sectionName}"`)
-        }
-        continue
-      }
+    const pendingBefore = pending.length // TEMP DIAGNOSTIC
+    // Drain currently-visible cases, THEN — only while cases are still pending — interleave
+    // fill→reveal→re-probe→run so progressively-gated fields (which render after earlier ones
+    // are filled) get tested on THIS section before advancing. Keep going as long as a round
+    // makes PROGRESS — either the fill revealed something (`changed`) OR it ran new cases
+    // (`moreRan > 0`). A big section may need a round that reveals fields which only become
+    // testable on the NEXT round, so we must NOT stop on the first `moreRan === 0`. Stop only
+    // when a full round makes NO progress at all (nothing revealed AND nothing ran); the
+    // MAX_REVEAL_ROUNDS cap is a safety backstop that should almost never be reached.
+    let ranHere = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
+    let revealRounds = 0
+    while (pending.length > 0 && !RUN_STATE.cancellationRequested && revealRounds < MAX_REVEAL_ROUNDS) {
+      const changed = await fillToReveal()
+      revealRounds += 1
+      const moreRan = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
+      ranHere = ranHere.concat(moreRan)
+      console.log('[QA flow] section', sectionIndex, '| reveal round', revealRounds, '| fill_changed=' + changed + ' | newly_ran=' + moreRan.length + ' | still_pending=' + pending.length) // TEMP DIAGNOSTIC
+      if (!changed && moreRan.length === 0) break   // NO progress this round (nothing revealed, nothing ran) → section drained
+    }
+    if (revealRounds >= MAX_REVEAL_ROUNDS) console.log('[QA flow] section', sectionIndex, '— hit MAX_REVEAL_ROUNDS safety cap; proceeding to advance (NOT ending run)') // TEMP DIAGNOSTIC
+    console.log('[QA run] section', sectionIndex, '— ran', ranHere.length, 'case(s) here |', pending.length, 'still pending') // TEMP DIAGNOSTIC
 
-    if (pending.length === 0 || RUN_STATE.cancellationRequested) break
+    if (pending.length === 0 || RUN_STATE.cancellationRequested) {
+      console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=false (done/cancelled)') // TEMP DIAGNOSTIC
+      break
+    }
 
     if (advances >= maxAdvances) {
+      console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=false (advance cap reached)') // TEMP DIAGNOSTIC
       console.log('[QA run] advance cap', maxAdvances, 'reached — stranding', pending.length, 'case(s)') // TEMP DIAGNOSTIC
       break
     }
+    console.log('[QA advance] drain done for section ' + sectionIndex + ', calling attemptSectionAdvance') // TEMP DIAGNOSTIC
     const advanced = await attemptSectionAdvance()
     advances += 1
+    console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=' + advanced) // TEMP DIAGNOSTIC
     console.log('[QA run] advanced to next section? ', advanced, '| advances', advances, '/', maxAdvances) // TEMP DIAGNOSTIC
     if (!advanced) {
       console.log('[QA run] form cannot advance further — stranding', pending.length, 'case(s)') // TEMP DIAGNOSTIC
@@ -704,6 +806,13 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       'case(s) untested (field not on reachable sections) — status stays Not Run'
     )
     reportRunProgress()
+  }
+
+  // successful_submit runs LAST — every section has now been traversed and filled.
+  for (const tc of submitCases) {
+    if (RUN_STATE.cancellationRequested) break
+    console.log('[QA run] running successful_submit last —', JSON.stringify(tc?.name || '')) // TEMP DIAGNOSTIC
+    await runOneTest(tc)
   }
 
   if (RUN_STATE.cancellationRequested) {

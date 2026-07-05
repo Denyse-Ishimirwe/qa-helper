@@ -2,9 +2,9 @@
 // On startup, the popup tries LOCAL_URL first and falls back to PRODUCTION_URL.
 const CONFIG = {
   LOCAL_URL: 'http://localhost:3000',
-  PRODUCTION_URL: 'https://qa-helper-tool.onrender.com',
+  PRODUCTION_URL: 'https://qa-helper-1.onrender.com',
   // Default picked at load time; resolveApiUrl() will update this.
-  API_URL: 'https://qa-helper-tool.onrender.com'
+  API_URL: 'https://qa-helper-1.onrender.com'
 }
 
 // eslint-disable-next-line no-unused-vars

@@ -448,16 +448,7 @@ function scrollTestTargetIntoView(el) {
 }
 
 function getVisibleValidationEntries() {
-  const selectors = [
-    '.invalid-feedback',
-    'formly-validation-message',
-    'mat-error',
-    '.mat-mdc-form-field-error',
-    '.mdc-text-field-helper-text--validation-msg',
-    '.text-danger',
-    '[class*="validation-message"]',
-    '.ng-star-inserted .text-danger'
-  ].join(', ')
+  const selectors = QA_ENGINE.selectors.validationMessages.join(', ')
   const all = Array.from(document.querySelectorAll(selectors))
   const leafLike = all.filter(el => {
     if (!isVisible(el)) return false
@@ -486,9 +477,10 @@ function getVisibleValidationEntries() {
 
 async function getVisibleValidationEntriesWithRetry(opts = {}) {
   const quick = Boolean(opts.quick)
-  const initialWaitMs = quick ? 180 : 600
-  const maxMs = quick ? 360 : 800
-  const stepMs = quick ? 60 : 90
+  const T = QA_ENGINE.timeouts
+  const initialWaitMs = quick ? T.validationQuickInitialWaitMs : T.validationInitialWaitMs
+  const maxMs = quick ? T.validationQuickMaxMs : T.validationMaxMs
+  const stepMs = quick ? T.validationQuickStepMs : T.validationStepMs
   await wait(initialWaitMs)
   const tries = Math.ceil(maxMs / stepMs)
   let last = []
@@ -921,11 +913,12 @@ function getLocalFieldTextBlobForScoring(el) {
 }
 
 function minAcceptScoreForDeclaredField(scoreKey) {
+  const S = QA_ENGINE.matching.minAcceptScores
   const words = significantLabelWords(sanitizeSearchLabel(scoreKey))
-  if (words.length >= 3) return 36
-  if (words.length === 2) return 26
-  if (words.length === 1) return words[0].length > 6 ? 20 : 14
-  return 10
+  if (words.length >= 3) return S.threeOrMoreWords
+  if (words.length === 2) return S.twoWords
+  if (words.length === 1) return words[0].length > 6 ? S.oneLongWord : S.oneShortWord
+  return S.fallback
 }
 
 /** How well `el` matches the test case's declared field (label + optional field_name + hint). */
@@ -1457,17 +1450,7 @@ async function setDateValuePreferPicker(inputEl, fallbackValue = '') {
     await wait(120)
   }
 
-  const daySelectors = [
-    '.mat-calendar-body-cell-content',
-    '.mat-calendar-body-cell',
-    '.day:not(.old):not(.new)',
-    '.ngb-dp-day div[role="button"]',
-    '.ngb-dp-day',
-    '[role="gridcell"] button',
-    '[role="gridcell"]',
-    '.datepicker td:not(.disabled):not(.off) button',
-    '.datepicker td:not(.disabled):not(.off)'
-  ]
+  const daySelectors = QA_ENGINE.selectors.datePickerDayCells
   const dayCells = Array.from(document.querySelectorAll(daySelectors.join(', '))).filter(isPickerCellVisible)
   const pickable = dayCells.find(cell => {
     const t = String(cell.textContent || '').trim()
@@ -1497,7 +1480,9 @@ async function setDateValuePreferPicker(inputEl, fallbackValue = '') {
   return Boolean(String(inputEl.value || '').trim())
 }
 
-const LOCATION_CASCADE_STEPS = ['district', 'sector', 'cell', 'village', 'province']
+// Alias to the (remote-tunable) engine config; applyQaEngineConfig mutates the
+// array in place, so this alias always reflects the latest backend settings.
+const LOCATION_CASCADE_STEPS = QA_ENGINE.locationCascadeSteps
 
 /** Earliest location keyword in the field wrapper reading order (district before sector, …). */
 function primaryLocationStepForControl(el) {
@@ -1954,9 +1939,19 @@ function getInvalidValueForFormat(tc) {
     /(?:older than|at least|minimum|min\.?|over)\s*\d{1,3}\s*(?:years?|yrs?)/.test(text) ||
     /\b\d{1,3}\s*(?:or older|and above|or above)\b/.test(text)
   if (isAgeRule) {
+    // Parse the age threshold N from the rule text — NO fixed assumption. A DOB that makes
+    // the applicant age N-1 (one year under) violates "above/at least N". If no number is
+    // present, fall back to age 0 (today), which violates any positive minimum without
+    // inventing a threshold. Date is relative to TODAY, formatted DD/MM/YYYY (the form's order).
+    const nMatch =
+      text.match(/(?:above|over|older\s+than|at\s+least|min(?:imum)?\.?|>=?)\s*(\d{1,3})\s*(?:years?|yrs?)?/) ||
+      text.match(/(\d{1,3})\s*(?:years?|yrs?)\s*(?:or\s+older|and\s+above|or\s+above|old|of\s+age)/) ||
+      text.match(/\b(\d{1,3})\s*(?:years?|yrs?)\b/)
+    const n = nMatch ? Number(nMatch[1]) : 0
+    const yearsBack = n > 0 ? Math.max(0, n - 1) : 0
     const d = new Date()
-    d.setFullYear(d.getFullYear() - 10)
-    return d.toISOString().slice(0, 10)
+    d.setFullYear(d.getFullYear() - yearsBack)
+    return formatDateDmy(d)
   }
 
   // Exact digit length (e.g. "ID Number must be 16 digits") → too few digits.
@@ -1976,10 +1971,10 @@ function getInvalidValueForFormat(tc) {
   if (maxChars) return 'A'.repeat(Number(maxChars[1]) + 5)
 
   // "letters only" / "no numbers" → enter digits.
-  if (/letters?\s*only|alphabetic|alphabetical|only\s*letters?|no\s*(?:numbers?|digits?)/.test(text)) return '12345'
+  if (/letters?\s*only|alphabetic|alphabetical|only\s*letters?|no\s*(?:numbers?|digits?)/.test(text)) return QA_ENGINE.invalidValues.lettersOnlyViolation
 
   // "numbers only" / "no letters" → enter letters.
-  if (/numbers?\s*only|numeric\s*only|digits?\s*only|only\s*(?:numbers?|digits?)|no\s*letters?/.test(text)) return 'abcdef'
+  if (/numbers?\s*only|numeric\s*only|digits?\s*only|only\s*(?:numbers?|digits?)|no\s*letters?/.test(text)) return QA_ENGINE.invalidValues.numbersOnlyViolation
 
   // "N digits" (e.g. "must be 10 digits") → too short.
   const digitCount = text.match(/(\d+)\s*digits?/)
@@ -1989,13 +1984,13 @@ function getInvalidValueForFormat(tc) {
   }
 
   // Email.
-  if (/valid\s*email|email\s*format|e-?mail/.test(text)) return 'notanemail'
+  if (/valid\s*email|email\s*format|e-?mail/.test(text)) return QA_ENGINE.invalidValues.email
 
   // Phone.
-  if (/phone|mobile|tel(?:ephone)?/.test(text)) return 'abcdef'
+  if (/phone|mobile|tel(?:ephone)?/.test(text)) return QA_ENGINE.invalidValues.phone
 
   // Fallback — letters + numbers + symbols to break most rules.
-  return 'INVALID123!@#'
+  return QA_ENGINE.invalidValues.fallback
 }
 
 function findClickToUploadElementNear(root) {
@@ -2037,11 +2032,9 @@ async function openAttachmentUploadModal(attachmentInput) {
   return true
 }
 
-const UPLOAD_SOURCE_MENU_PATTERNS = {
-  previous: [/previous\s+uploaded\s+documents?/i, /previously\s+uploaded/i],
-  certificates: [/my\s+certificates?/i],
-  device: [/upload\s+from\s+device/i, /from\s+(?:your\s+)?device/i]
-}
+// Alias to the (remote-tunable) engine config — compiled RegExp objects,
+// refreshed in place when a remote config is applied.
+const UPLOAD_SOURCE_MENU_PATTERNS = QA_ENGINE.uploadSourceMenuPatterns
 
 function findVisibleUploadModals() {
   const selectors = [
@@ -2703,15 +2696,10 @@ async function selectFirstNonEmptyNgSelect(selectRoot) {
   await wait(120)
 
   // Poll for options to appear — up to 6 seconds total for slow API responses
-  const optionSelectors = [
-    '.ng-dropdown-panel .ng-option',
-    '[role="listbox"] [role="option"]',
-    '.ng-option',
-    '[role="option"]'
-  ]
+  const optionSelectors = QA_ENGINE.selectors.ngSelectOptions
   let visibleOptions = []
-  const maxWaitMs = 6000
-  const stepMs = 300
+  const maxWaitMs = QA_ENGINE.timeouts.ngSelectOptionsMaxWaitMs
+  const stepMs = QA_ENGINE.timeouts.ngSelectOptionsStepMs
   const tries = Math.ceil(maxWaitMs / stepMs)
 
   for (let attempt = 0; attempt < tries; attempt += 1) {
@@ -3358,17 +3346,17 @@ function ngSelectRootAppearsUnselected(root) {
 function getSafeDefaultInputValue(control, kind) {
   const type = String(control?.type || '').toLowerCase()
   const label = normalizeLabelText(`${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''}`)
-  if (type === 'email' || /\bemail\b/.test(label)) return 'test@example.com'
-  if (type === 'tel' || /\b(phone|mobile|tel)\b/.test(label)) return '0781234567'
+  if (type === 'email' || /\bemail\b/.test(label)) return QA_ENGINE.validValues.email
+  if (type === 'tel' || /\b(phone|mobile|tel)\b/.test(label)) return QA_ENGINE.validValues.phone
   if (kind === 'date' || type === 'date') return getSafeDateFallbackValue()
   if (/\b(date of birth|dob)\b/.test(label)) return getSafeDateFallbackValue()
   if (/\bdate\b/.test(label)) return getSafeDateFallbackValue()
   if (isIdLikeControl(control) && String(reusableIdValueForRun || '').trim()) return reusableIdValueForRun
-  if (type === 'number' || /\b(age|number|amount|count|qty|quantity)\b/.test(label)) return '123'
-  if (/\b(first name|lastname|last name|surname|name)\b/.test(label)) return 'John'
+  if (type === 'number' || /\b(age|number|amount|count|qty|quantity)\b/.test(label)) return QA_ENGINE.validValues.number
+  if (/\b(first name|lastname|last name|surname|name)\b/.test(label)) return QA_ENGINE.validValues.name
   if (/\b(id number|id no|national id|nin|application number|citizen application)\b/.test(label)) return reusableIdValueForRun
-  if (type === 'url' || /\b(url|website|site)\b/.test(label)) return 'https://example.com'
-  return 'ValidInput'
+  if (type === 'url' || /\b(url|website|site)\b/.test(label)) return QA_ENGINE.validValues.url
+  return QA_ENGINE.validValues.fallback
 }
 
 /**
@@ -3741,15 +3729,9 @@ async function requiredFieldRunPreflightStepAB() {
   await wait(80)
 }
 
-const REQUIRED_FIELD_CONTAINER_MSG_SEL = [
-  '.invalid-feedback',
-  'formly-validation-message',
-  'mat-error',
-  '.mat-mdc-form-field-error',
-  '.mdc-text-field-helper-text--validation-msg',
-  '.text-danger',
-  '[class*="validation-message"]'
-].join(', ')
+function requiredFieldContainerMsgSel() {
+  return QA_ENGINE.selectors.requiredFieldContainerMsg.join(', ')
+}
 
 function getRequiredFieldValidationRoots(targetEl) {
   const roots = new Set()
@@ -3776,7 +3758,7 @@ function getRequiredFieldValidationInContainer(targetEl) {
   const seen = new Set()
   for (const root of roots) {
     if (!root?.querySelectorAll) continue
-    for (const el of root.querySelectorAll(REQUIRED_FIELD_CONTAINER_MSG_SEL)) {
+    for (const el of root.querySelectorAll(requiredFieldContainerMsgSel())) {
       if (!isVisible(el)) continue
       const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
       if (!t || seen.has(t)) continue
@@ -3793,6 +3775,20 @@ function detectFormAdvanced(urlBefore, sectionEl) {
   return false
 }
 
+// Proxy for "the Angular model went valid" after a programmatic date restore: the field
+// must hold a value AND Angular must NOT mark the control invalid (ng-invalid on the input
+// or anywhere in its formly wrapper). If this returns false, the cheap commit didn't take
+// and the caller must fall back to the calendar re-drive.
+function isDatePickerModelValid(inputEl, host) {
+  if (!inputEl) return false
+  if (!String(inputEl.value || '').trim()) return false
+  const scope = host || inputEl.closest?.('formly-field, formly-wrapper-form-field') || inputEl.parentElement || inputEl
+  if (inputEl.classList?.contains('ng-invalid')) return false
+  if (scope?.classList?.contains?.('ng-invalid')) return false
+  if (scope?.querySelector?.('.ng-invalid')) return false
+  return true
+}
+
 async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
   if (!target) return
   if (kind === 'radio') {
@@ -3806,7 +3802,21 @@ async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
   if (kind === 'date') {
     const dateInput = findDateInputForLabel(fieldLabel) || target
     if (isCustomDatePickerInput(dateInput)) {
-      await setDateValuePreferPicker(dateInput, getSafeDateFallbackValue())
+      // Cheap restore first: write the display value AND the hidden ISO model input + fire the
+      // full event sequence synchronously (~0ms), instead of re-driving the calendar (~700ms).
+      // Then VERIFY the Angular model actually went valid — a programmatic set is sometimes
+      // ignored by custom pickers (visible field looks valid, model stays ng-invalid, and the
+      // next Continue is still blocked). If it didn't validate, fall back to the reliable
+      // calendar re-drive. Correct first, fast second.
+      const host =
+        dateInput.closest('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+        dateInput.parentElement
+      commitDateValueToControl(dateInput, host, getSafeDateFallbackValue())
+      await wait(80) // let Angular re-run validation on the fired events before checking
+      if (!isDatePickerModelValid(dateInput, host)) {
+        console.log('[QA-format] cheap date refill left model invalid — falling back to calendar re-drive') // TEMP DIAGNOSTIC
+        await setDateValuePreferPicker(dateInput, getSafeDateFallbackValue())
+      }
     } else {
       dateInput.value = getSafeDateFallbackValue()
       dispatchInputEvents(dateInput)
@@ -4064,23 +4074,27 @@ async function clearConditionalParent(p) {
 /** Read ng-select placeholder text without opening the dropdown. */
 function readNgSelectPlaceholderClosed(root) {
   if (!root) return ''
-  const container = root.matches?.('.ng-select-container, [role="combobox"]')
-    ? root
-    : (root.querySelector('.ng-select-container, [role="combobox"]') || root)
-  const combobox = (root.matches?.('[role="combobox"]') ? root : null) || root.querySelector('[role="combobox"]')
-  const innerInput = container.querySelector('input') || root.querySelector('input')
-  // Read the placeholder from a CLOSED ng-select — try every source ng-select uses, first
-  // non-empty wins, all readable without opening:
-  //   1. the rendered .ng-placeholder text (present while closed with nothing selected),
-  //   2. the <ng-select placeholder="…"> attribute (its [placeholder] binding lands here),
-  //   3. the inner search input's placeholder attribute,
-  //   4. aria-placeholder on the combobox / container.
-  // Some dropdowns (e.g. the salutation select) render the placeholder via 2–4, not a
-  // .ng-placeholder node, which is why the narrower read returned empty → "(none)".
+  // Climb to the TRUE ng-select root FIRST. The caller often hands us the INNER .ng-input /
+  // [role="combobox"] div — .ng-placeholder is NOT inside that; it's a sibling in
+  // .ng-value-container one level UP inside <ng-select>. Searching from the .ng-input alone
+  // misses it, so resolve the ancestor <ng-select>/.ng-select and search from there.
+  const selectRoot = root.closest?.('ng-select, .ng-select') || root
+  const container = selectRoot.matches?.('.ng-select-container, [role="combobox"]')
+    ? selectRoot
+    : (selectRoot.querySelector('.ng-select-container, [role="combobox"]') || selectRoot)
+  const combobox = (selectRoot.matches?.('[role="combobox"]') ? selectRoot : null) || selectRoot.querySelector('[role="combobox"]')
+  const innerInput = container.querySelector('input') || selectRoot.querySelector('input')
+  // Try every source ng-select uses, first non-empty wins, all readable without opening:
+  //   1. .ng-value-container .ng-placeholder text (canonical spot; sibling of .ng-input),
+  //   2. any .ng-placeholder text under the ng-select,
+  //   3. the <ng-select placeholder="…"> attribute (its [placeholder] binding lands here),
+  //   4. the inner search input's placeholder attribute,
+  //   5. aria-placeholder on the combobox / container.
   const candidates = [
+    selectRoot.querySelector('.ng-value-container .ng-placeholder')?.textContent,
+    selectRoot.querySelector('.ng-placeholder')?.textContent,
     container.querySelector('.ng-placeholder')?.textContent,
-    root.querySelector('.ng-placeholder')?.textContent,
-    root.getAttribute?.('placeholder'),
+    selectRoot.getAttribute?.('placeholder'),
     innerInput?.getAttribute?.('placeholder'),
     combobox?.getAttribute?.('aria-placeholder'),
     container.getAttribute?.('aria-placeholder')
@@ -4090,6 +4104,24 @@ function readNgSelectPlaceholderClosed(root) {
     if (v) return v
   }
   return ''
+}
+
+// Read a date field's placeholder from the INNER display <input>, not the wrapper. For a
+// custom irembogov date picker, the resolved lcField is the host/component, whose own
+// getAttribute('placeholder') is empty — the placeholder (e.g. "DD/MM/YYYY") lives on the
+// inner input. Falls back to the host's own placeholder for native <input type="date">.
+function readDatePickerPlaceholder(lcField, fieldLabel) {
+  const host =
+    lcField?.closest?.('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+    lcField
+  const inner =
+    findDateInputForLabel(fieldLabel) ||
+    host?.querySelector?.('input') ||
+    (String(lcField?.tagName || '').toLowerCase() === 'input' ? lcField : null)
+  return String(
+    inner?.getAttribute?.('placeholder') || inner?.placeholder ||
+    lcField?.getAttribute?.('placeholder') || lcField?.placeholder || ''
+  )
 }
 
 /** Section/block name = text of the nearest visible <h1 class="section-title"> that precedes this field. */
@@ -4251,6 +4283,11 @@ async function executeTestCase(tc, runContext = {}) {
           console.log('[QA lc-dd] opener has no click() — open fallback skipped') // TEMP DIAGNOSTIC
         }
       }
+      // Placeholder STILL empty after all four sources + open/poll — dump the resolved
+      // ng-select outerHTML so we can see which element/attribute actually holds the text.
+      if (!lcPlaceholderPolled) {
+        console.log('[QA lc-html]', String(lcRoot?.outerHTML || lcField?.outerHTML || '').slice(0, 2000)) // TEMP DIAGNOSTIC
+      }
     }
     try {
       // Verify ALL FOUR attributes — label, placeholder, section, block — case-insensitively,
@@ -4273,11 +4310,20 @@ async function executeTestCase(tc, runContext = {}) {
       let placeholderRead = ''
       let placeholderChecked = false
       let placeholderCaseDiffers = false
-      if (expectedPlaceholder && lcTarget.kind !== 'radio') {
+      // Placeholder applies only to free-text-style controls. Skip types with NO placeholder
+      // concept — radio, file, and checkbox (checkbox falls through to kind 'input', so detect
+      // it by the element's type) — otherwise the read is always empty → false "(none)".
+      const lcType = String(lcField?.type || '').toLowerCase()
+      const placeholderApplies =
+        lcTarget.kind !== 'radio' && lcTarget.kind !== 'file' && lcType !== 'checkbox'
+      if (expectedPlaceholder && placeholderApplies) {
         placeholderChecked = true
-        placeholderRead = lcTarget.kind === 'ng-select'
-          ? norm(lcPlaceholderPolled)
-          : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
+        placeholderRead =
+          lcTarget.kind === 'ng-select'
+            ? norm(lcPlaceholderPolled)
+            : lcTarget.kind === 'date'
+              ? norm(readDatePickerPlaceholder(lcField, fieldLabel))
+              : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
         if (lcTarget.kind === 'ng-select') {
           console.log('[QA lc-dd] placeholder read=', JSON.stringify(placeholderRead), '| expected=', JSON.stringify(expectedPlaceholder), '| matchCI=', placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase()) // TEMP DIAGNOSTIC
         }
@@ -4601,6 +4647,13 @@ async function executeTestCase(tc, runContext = {}) {
     // Fix 4: format validation is not meaningful for dropdowns — there is no free text to make "invalid".
     if (target.kind === 'ng-select' || target.kind === 'select') {
       return { skipped: true, reason: 'format validation not applicable to dropdown fields' }
+    }
+    // Checkboxes/radios have no free-text "format" to violate — they are checked/selected, not
+    // typed into. Writing an invalid STRING to a checkbox (setInputValueNative below) triggers a
+    // spurious "invalid (pattern)" that blocks Continue. Skip them, like dropdowns.
+    const fieldType = String(field?.type || '').toLowerCase()
+    if (fieldType === 'checkbox' || fieldType === 'radio' || target.kind === 'radio') {
+      return { skipped: true, reason: 'format validation not applicable to checkbox/radio fields' }
     }
 
     const invalid = getInvalidValueForFormat(tc)
@@ -5124,20 +5177,17 @@ function getCurrentSectionName() {
     }
   }
 
-  // 3) Fallback: first visible heading anywhere (previous behavior).
-  for (const h of headings) {
-    const txt = String(h.textContent || '').trim()
-    if (txt) {
-      console.log('[QA section] tier3 first-visible-heading →', JSON.stringify(txt)) // TEMP DIAGNOSTIC
-      return txt
-  // Prefer top-level wizard step titles; block sub-headings (h2/h3) come second.
+  // 3) Fallback: prefer top-level wizard step titles; block sub-headings (h2/h3) come second.
   const sectionSelectors = '.wizard-title, .step-title, .section-title, h1.section-title, h1'
   const blockSelectors = 'h2, h3, h4, [class*="block-title"], [class*="group-title"]'
   for (const sel of [sectionSelectors, blockSelectors]) {
     for (const h of document.querySelectorAll(sel)) {
       if (!isVisible(h)) continue
       const txt = String(h.textContent || '').trim()
-      if (txt) return txt
+      if (txt) {
+        console.log('[QA section] tier3 fallback heading →', JSON.stringify(txt)) // TEMP DIAGNOSTIC
+        return txt
+      }
     }
   }
   console.log('[QA section] none — no visible heading found') // TEMP DIAGNOSTIC
@@ -5296,6 +5346,13 @@ function probeFieldVisibility(tc) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'QA_HELPER_SET_ENGINE_CONFIG') {
+    const applied = typeof globalThis.applyQaEngineConfig === 'function'
+      ? globalThis.applyQaEngineConfig(message.config)
+      : false
+    sendResponse({ ok: true, applied })
+    return true
+  }
   if (message?.type === 'QA_HELPER_CANCEL_CURRENT_TEST') {
     cancelCurrentTestRequested = true
     sendResponse({ ok: true })
@@ -5319,31 +5376,35 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true
   }
   if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {
-    try {
-      const visible = probeFieldVisibility(message?.testCase || {})
-      // TEMP DIAGNOSTIC — count the form controls actually on the page (total + visible)
-      // so we can tell "page has no controls" (form not loaded / wrong page) apart from
-      // "controls present but no case field matches them" (field-matching failure).
-      const probeSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
-      const allControls = Array.from(document.querySelectorAll(probeSel))
-      const visibleControls = allControls.filter(isVisible)
-      const probeLabel = String(message?.testCase?.field_label || message?.testCase?.name || '').trim()
-      console.log('[QA probe] field=' + JSON.stringify(probeLabel) + ' | visible=' + Boolean(visible) + ' | controlsOnPage=' + allControls.length + ' | visibleControls=' + visibleControls.length + ' | path=' + location.pathname) // TEMP DIAGNOSTIC
-      // TEMP DIAGNOSTIC — sample the first ~5 controls isVisible() rejects, to tell genuinely
-      // hidden (display:none / 0x0) from a false-negative (real size + display:block but
-      // offsetParent null, e.g. under a transformed/fixed ancestor). Read-only.
-      const notVisible = allControls.filter(el => !isVisible(el)).slice(0, 5)
-      for (const el of notVisible) {
-        const r = el.getBoundingClientRect()
-        const cs = window.getComputedStyle(el)
-        const inViewport = r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth
-        console.log('[QA vis] tag=' + el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).split(/\s+/).join('.') : '') + ' | offsetParent=' + (el.offsetParent === null ? 'null' : 'set') + ' | rect=' + Math.round(r.width) + 'x' + Math.round(r.height) + ' | display=' + cs.display + ' visibility=' + cs.visibility + ' | inViewport=' + inViewport) // TEMP DIAGNOSTIC
+    ;(async () => {
+      try {
+        const tc = message?.testCase || {}
+        let visible = probeFieldVisibility(tc)
+        if (!visible) {
+          // A present-but-unscrolled or mid-render field can read not-visible. Best-effort:
+          // resolve the target element, scroll it into view, settle ~180ms, then re-probe once.
+          try {
+            const rawLbl = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+            const lbl = sanitizeSearchLabel(
+              shouldStripConditionalClauseForFieldLabel(String(tc?.test_type || '')) ? stripConditionalClause(rawLbl) : rawLbl
+            )
+            const el = resolveFieldTarget(lbl, String(tc?.field_name || ''))?.element
+            if (el) scrollTestTargetIntoView(el)
+          } catch { /* resolution is best-effort */ }
+          await wait(180)
+          visible = probeFieldVisibility(tc)
+        }
+        const probeSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+        const allControls = Array.from(document.querySelectorAll(probeSel))
+        const visibleControls = allControls.filter(isVisible)
+        const probeLabel = String(tc?.field_label || tc?.name || '').trim()
+        console.log('[QA probe] field=' + JSON.stringify(probeLabel) + ' | visible=' + Boolean(visible) + ' | controlsOnPage=' + allControls.length + ' | visibleControls=' + visibleControls.length + ' | path=' + location.pathname) // TEMP DIAGNOSTIC
+        sendResponse({ ok: true, visible: Boolean(visible), controlsOnPage: allControls.length, visibleControls: visibleControls.length })
+      } catch (err) {
+        // Fail-open so a probe error doesn't strand a test in the deferred pile.
+        sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
       }
-      sendResponse({ ok: true, visible: Boolean(visible), controlsOnPage: allControls.length, visibleControls: visibleControls.length })
-    } catch (err) {
-      // Fail-open so a probe error doesn't strand a test in the deferred pile.
-      sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
-    }
+    })()
     return true
   }
   if (message?.type === 'QA_HELPER_IS_SECTION_REACHABLE') {
@@ -5357,6 +5418,26 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     } catch (err) {
       sendResponse({ ok: false, reachable: false, error: String(err?.message || 'Section reachability check failed') })
     }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_FILL_TO_REVEAL') {
+    ;(async () => {
+      try {
+        // Fill the current step's visible fields (same logic as advance) but DO NOT click
+        // Continue. This reveals progressively-gated sibling fields so their test cases can be
+        // probed and run on THIS section before advancing. Returns whether the section
+        // signature changed (i.e. new fields appeared). Generic — fills the live DOM by
+        // structure, no hardcoded names.
+        const before = getSectionSignature()
+        const fillOpts = { manualLike: true, fillEvenIfPopulated: false, widgetWaitMs: 2400, deferCascadeChains: false }
+        await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 2)
+        await wait(180)
+        const after = getSectionSignature()
+        sendResponse({ ok: true, changed: before !== after })
+      } catch (err) {
+        sendResponse({ ok: false, changed: false, error: String(err?.message || 'Fill-to-reveal failed') })
+      }
+    })()
     return true
   }
   if (message?.type === 'QA_HELPER_ADVANCE_AND_PROBE') {
@@ -5375,16 +5456,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           deferCascadeChains: false
         }
         await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 4)
+        const btn = findContinueButton() // TEMP DIAGNOSTIC
+        console.log('[QA advance] Continue button: found=' + Boolean(btn) + ', text=' + JSON.stringify(String(btn?.textContent || '').replace(/\s+/g, ' ').trim())) // TEMP DIAGNOSTIC
         const clicked = await clickContinueWithoutValidationRead()
+        console.log('[QA advance] clicked Continue = ' + Boolean(clicked.ok)) // TEMP DIAGNOSTIC
         if (!clicked.ok) {
-          sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false })
+          console.log('[QA advance] section changed after click = false (button not found:', JSON.stringify(clicked.error || 'Continue button not found') + ')') // TEMP DIAGNOSTIC
+          sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false, buttonFound: false })
           return
         }
         await wait(900)
         const signatureAfter = getSectionSignature()
+        const sectionChanged = signatureBefore !== signatureAfter
+        console.log('[QA advance] section changed after click = ' + sectionChanged + ' | sigLen ' + signatureBefore.length + ' → ' + signatureAfter.length) // TEMP DIAGNOSTIC
+        if (!sectionChanged) {
+          const errs = getVisibleValidationEntries().map(e => e.text).slice(0, 6) // TEMP DIAGNOSTIC
+          console.log('[QA advance] NOT advanced — Continue clicked but section signature unchanged | visible validation errors:', JSON.stringify(errs)) // TEMP DIAGNOSTIC
+        }
         sendResponse({
           ok: true,
-          sectionChanged: signatureBefore !== signatureAfter,
+          sectionChanged,
+          buttonFound: true,
           signatureBeforeLen: signatureBefore.length,
           signatureAfterLen: signatureAfter.length
         })
