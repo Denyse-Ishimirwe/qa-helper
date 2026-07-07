@@ -417,10 +417,7 @@ async function geminiGenerate(payload) {
     generationConfig
   })
   const result = await model.generateContent(userText)
-  const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown' // TEMP DIAGNOSTIC
-  const u = result?.response?.usageMetadata || {} // TEMP DIAGNOSTIC
-  console.log('[gen][gemini] finishReason=', finishReason, '| maxOutputTokens=', generationConfig.maxOutputTokens,
-    '| usage(thoughts/cand/total)=', `${u.thoughtsTokenCount ?? '?'}/${u.candidatesTokenCount ?? '?'}/${u.totalTokenCount ?? '?'}`) // TEMP DIAGNOSTIC
+  const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown'
   const text = typeof result?.response?.text === 'function' ? result.response.text() : ''
   if (!String(text || '').trim()) {
     throw new Error(`Gemini returned empty text (finishReason=${finishReason})`)
@@ -802,7 +799,7 @@ async function generateTestCases(srdText, formStructure) {
         let effSrdChars = plan.srdChars
         if (srdCap) effSrdChars = Math.min(effSrdChars, srdCap)
         const srdForPrompt = trimSrdForPrompt(srdText, effSrdChars)
-        console.log('[gen] plan', planIdx, '| max_tokens=', plan.maxTokens, '| srd budget=', effSrdChars, '| srd sent=', srdForPrompt.length, '/ full', String(srdText || '').length) // TEMP DIAGNOSTIC
+
         const compactStructure = compactStructureForPrompt(formStructure, plan.structureChars)
         const structureSection = compactStructure
           ? `=== FORM STRUCTURE (JSON — match field names; rules only from SRD) ===\n${compactStructure}`
@@ -831,14 +828,12 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
 
         const response = completion.choices?.[0]?.message?.content || '[]'
         let parsed
-        let viaRepair = false // TEMP DIAGNOSTIC
         try {
           parsed = parseJsonArrayOrThrow(response)
         } catch {
-          viaRepair = true // TEMP DIAGNOSTIC
           parsed = await repairResponseToJsonArray(response)
         }
-        console.log('[gen] response chars=', response.length, '| parsed cases=', Array.isArray(parsed) ? parsed.length : 0, '| viaRepair=', viaRepair) // TEMP DIAGNOSTIC
+
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
