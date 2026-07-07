@@ -3395,7 +3395,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   const sectionScope = getCurrentSectionScope()
   const allControls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
   const controls = allControls.filter(sectionScope.inSection)
-  console.log('[QA fill] ENTER — section:', JSON.stringify(sectionScope.sectionName), '— controls:', controls.length, `(of ${allControls.length} on page)`) // TEMP DIAGNOSTIC
+
   const handledRadioGroups = new Set()
   const handledNgSelectRoots = new Set()
   const skipEl = targetToSkip?.element || null
@@ -3418,6 +3418,7 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   for (const control of controls) {
     if (!isVisible(control)) continue
     if (excludePredicate(control)) continue
+    try {   // per-field resilience: one field's fill error must NOT abort the rest of the pass
     const kind = detectFieldKind(control)
     if (kind === 'radio') {
       const name = String(control.name || '').trim()
@@ -3435,19 +3436,17 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     }
     if (kind === 'ng-select') {
       const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
-      const lcPh = String(root.querySelector?.('.ng-placeholder')?.textContent || '').trim() // TEMP DIAGNOSTIC
-      const lcDisabled = root.hasAttribute?.('disabled') || root.getAttribute?.('aria-disabled') === 'true' || root.classList?.contains('ng-select-disabled') === true // TEMP DIAGNOSTIC
-      console.log('[QA fill] ng-select ph=', JSON.stringify(lcPh), '| disabled=', lcDisabled, '| isLocationCascade=', isLocationCascadeSelectRoot(root), '| appearsUnselected=', ngSelectRootAppearsUnselected(root), '| deferCascadeChains=', deferCascadeChains) // TEMP DIAGNOSTIC
+
       if (deferCascadeChains && isLocationCascadeSelectRoot(root)) {
-        console.log('[QA fill]   → SKIP: deferred location cascade', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+
         continue
       }
       if (handledNgSelectRoots.has(root)) {
-        console.log('[QA fill]   → SKIP: already handled this pass', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+
         continue
       }
       if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) {
-        console.log('[QA fill]   → SKIP: appears already filled (ngSelectRootAppearsUnselected=false)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+
         continue
       }
       // Skip disabled ng-selects — most commonly cascade children whose parent
@@ -3463,11 +3462,11 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
         root.getAttribute?.('aria-disabled') === 'true' ||
         root.classList?.contains('ng-select-disabled') === true
       if (isDisabled) {
-        console.log('[QA fill]   → SKIP: disabled (cascade child? retried next pass)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+
         continue
       }
       handledNgSelectRoots.add(root)
-      console.log('[QA fill]   → FILL:', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+
       await selectFirstNonEmptyNgSelect(root)
       continue
     }
@@ -3521,6 +3520,10 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     if (beforeWidget) {
       await waitForWidgetSideEffects(beforeWidget, widgetWaitMs, 1)
     }
+    } catch (fillErr) {
+
+      continue   // skip this bad field, keep filling the rest
+    }
   }
 
   const datePickerHosts = Array.from(
@@ -3529,10 +3532,14 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
   for (const comp of datePickerHosts) {
     if (!isVisible(comp)) continue
     if (excludePredicate(comp)) continue
-    const inp = comp.querySelector('input:not([type="hidden"])')
-    if (!inp || inp.disabled || inp.readOnly) continue
-    await setDateValuePreferPicker(inp, getSafeDateFallbackValue())
-    await wait(200)
+    try {
+      const inp = comp.querySelector('input:not([type="hidden"])')
+      if (!inp || inp.disabled || inp.readOnly) continue
+      await setDateValuePreferPicker(inp, getSafeDateFallbackValue())
+      await wait(200)
+    } catch (fillErr) {
+
+    }
   }
 
   const ngRoots = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]')).filter(sectionScope.inSection)
@@ -3541,8 +3548,12 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
     if (excludePredicate(root)) continue
     if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
     if (!ngSelectRootAppearsUnselected(root)) continue
-    await selectFirstNonEmptyNgSelect(root)
-    await wait(200)
+    try {
+      await selectFirstNonEmptyNgSelect(root)
+      await wait(200)
+    } catch (fillErr) {
+
+    }
   }
 
   const natWraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).filter(w => {
@@ -3559,8 +3570,12 @@ async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
       if (open.length === 0) break
       for (const el of open) {
         if (excludePredicate(el)) continue
-        await selectFirstNonEmptyNgSelect(el)
-        await wait(420)
+        try {
+          await selectFirstNonEmptyNgSelect(el)
+          await wait(420)
+        } catch (fillErr) {
+
+        }
       }
     }
   }
@@ -3640,7 +3655,7 @@ async function runSuccessfulSubmitFillSequence(fillOptions, maxWizardSteps = 3) 
   const urlAtStart = String(location.href || '')
   for (let step = 0; step < maxWizardSteps; step += 1) {
     const { remaining } = await ensureAllVisibleFieldsFilledForSubmit(fillOptions, 3)
-    console.log('[QA-submit] wizard step', step + 1, 'remaining empty fields:', remaining)
+
     if (remaining === lastRemaining && remaining > 0) noProgressRounds += 1
     else noProgressRounds = 0
     lastRemaining = remaining
@@ -3814,7 +3829,7 @@ async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
       commitDateValueToControl(dateInput, host, getSafeDateFallbackValue())
       await wait(80) // let Angular re-run validation on the fired events before checking
       if (!isDatePickerModelValid(dateInput, host)) {
-        console.log('[QA-format] cheap date refill left model invalid — falling back to calendar re-drive') // TEMP DIAGNOSTIC
+
         await setDateValuePreferPicker(dateInput, getSafeDateFallbackValue())
       }
     } else {
@@ -4236,7 +4251,7 @@ async function executeTestCase(tc, runContext = {}) {
       for (let i = 0; i < 10; i += 1) {
         const probe = resolveFieldTarget(fieldLabel, fieldName)?.element
         const vis = Boolean(probe && isVisible(probe))
-        console.log('[QA cond] label_check child poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+
         if (vis) { childAppeared = true; scrollTestTargetIntoView(probe); break }
         await wait(300)
       }
@@ -4267,7 +4282,7 @@ async function executeTestCase(tc, runContext = {}) {
     let lcPolls = 0
     if (lcRoot) {
       lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
-      console.log('[QA lc-dd] closed read | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled)) // TEMP DIAGNOSTIC
+
       if (!lcPlaceholderPolled && expectedPlaceholder) {
         const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
         if (typeof opener.click === 'function') {
@@ -4278,15 +4293,7 @@ async function executeTestCase(tc, runContext = {}) {
             lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
             if (lcPlaceholderPolled) break
           }
-          console.log('[QA lc-dd] opened fallback | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled), 'after', lcPolls, 'poll(s)') // TEMP DIAGNOSTIC
-        } else {
-          console.log('[QA lc-dd] opener has no click() — open fallback skipped') // TEMP DIAGNOSTIC
         }
-      }
-      // Placeholder STILL empty after all four sources + open/poll — dump the resolved
-      // ng-select outerHTML so we can see which element/attribute actually holds the text.
-      if (!lcPlaceholderPolled) {
-        console.log('[QA lc-html]', String(lcRoot?.outerHTML || lcField?.outerHTML || '').slice(0, 2000)) // TEMP DIAGNOSTIC
       }
     }
     try {
@@ -4324,14 +4331,6 @@ async function executeTestCase(tc, runContext = {}) {
             : lcTarget.kind === 'date'
               ? norm(readDatePickerPlaceholder(lcField, fieldLabel))
               : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
-        if (lcTarget.kind === 'ng-select') {
-          console.log('[QA lc-dd] placeholder read=', JSON.stringify(placeholderRead), '| expected=', JSON.stringify(expectedPlaceholder), '| matchCI=', placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase()) // TEMP DIAGNOSTIC
-        }
-        // TEMP DIAGNOSTIC — reveal invisible-character / whitespace / empty-read differences.
-        console.log('[QA lc-ph] expected=' + JSON.stringify(expectedPlaceholder) + ' (len ' + expectedPlaceholder.length + ') | actual=' + JSON.stringify(placeholderRead) + ' (len ' + placeholderRead.length + ') | kind=' + lcTarget.kind + ' | matchCI=' + (placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase())) // TEMP DIAGNOSTIC
-        if (expectedPlaceholder.length !== placeholderRead.length) {
-          console.log('[QA lc-ph] len differs — expected codes=[' + Array.from(expectedPlaceholder).map(c => c.charCodeAt(0)).join(',') + '] | actual codes=[' + Array.from(placeholderRead).map(c => c.charCodeAt(0)).join(',') + ']') // TEMP DIAGNOSTIC
-        }
         if (placeholderRead.toLowerCase() !== expectedPlaceholder.toLowerCase()) {
           failures.push(`Expected placeholder "${expectedPlaceholder}" but found "${placeholderRead || '(none)'}"`)
         } else {
@@ -4345,7 +4344,7 @@ async function executeTestCase(tc, runContext = {}) {
       //    comparing the expected section against a block produces false failures. If the
       //    stepper is empty the live section is genuinely unavailable, so we SKIP (note) rather
       //    than compare. Checked only when BOTH sides are non-empty.
-      console.log('[QA lc-sb] expectedSection=' + JSON.stringify(expectedSection) + ' | getActiveStepperSectionName=' + JSON.stringify(norm(getActiveStepperSectionName())) + ' | getCurrentSectionName=' + JSON.stringify(norm(getCurrentSectionName())) + ' | getFieldSectionName(h1)=' + JSON.stringify(norm(getFieldSectionName(lcField))) + ' | expectedBlock=' + JSON.stringify(expectedBlock)) // TEMP DIAGNOSTIC
+
       const liveSection = norm(getActiveStepperSectionName())
       let sectionVerified = false
       if (expectedSection && liveSection) {
@@ -4393,7 +4392,7 @@ async function executeTestCase(tc, runContext = {}) {
       if (lcOpened) {
         const escTarget = lcRoot.querySelector('input') || lcRoot
         escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
-        console.log('[QA lc-dd] Escape dispatched to close dropdown') // TEMP DIAGNOSTIC
+
       }
     }
   }
@@ -4521,7 +4520,7 @@ async function executeTestCase(tc, runContext = {}) {
           isVisible(probed.element) &&
           resolvedTargetMatchesLocationStep(fieldLabel, probed)
         )
-        console.log('[QA cond] visibility poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+
         if (vis) { scrollTestTargetIntoView(probed.element); break }
         await wait(300)
         probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
@@ -4678,7 +4677,7 @@ async function executeTestCase(tc, runContext = {}) {
     await wait(60)
     const afterVal = String(valueHost?.value || '').trim()
     if (!afterVal) {
-      console.warn('[QA-format] invalid value not accepted by field:', fieldLabel, '| tried:', invalid)
+
       return { skipped: true, reason: 'invalid value was not accepted by field — Angular may have rejected it' }
     }
 
@@ -5018,7 +5017,7 @@ function getActiveStepperSectionName() {
   let currentPath = ''
   try { currentPath = String(window.location.pathname || '') } catch { currentPath = '' }
   if (currentPath !== lastStepperPathname) {
-    if (stepperSectionMap.size) console.log('[QA stepper] pathname changed', JSON.stringify(lastStepperPathname), '→', JSON.stringify(currentPath), '— cleared stale stepperSectionMap') // TEMP DIAGNOSTIC
+    
     stepperSectionMap.clear()
     lastKnownStepperSection = ''
     lastStepperPathname = currentPath
@@ -5051,7 +5050,7 @@ function getActiveStepperSectionName() {
     // Can't resolve this read (DOM mid-transition — no active step card). Fall back to
     // the last section we DID resolve on this form so navigation doesn't flicker to the
     // block heading. Empty only if nothing has ever resolved on this form yet.
-    console.log('[QA stepper] no active step_N collapse show card — using lastKnown', JSON.stringify(lastKnownStepperSection), '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+
     return lastKnownStepperSection
   }
   const currentNumber = Number(mm[1]) + 1
@@ -5060,10 +5059,7 @@ function getActiveStepperSectionName() {
   //    first step (its label hasn't appeared in the nav yet) — caller then falls back
   //    to the heading tiers (which fuzzy-match e.g. "Guidelines" ⊂ the block name).
   const label = stepperSectionMap.get(currentNumber) || ''
-  console.log('[QA stepper] active step_' + mm[1], '→ step number', currentNumber,
-    '| section', JSON.stringify(label || '(unknown — not yet seen in nav)'),
-    '| lastKnown', JSON.stringify(lastKnownStepperSection),
-    '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+
   if (label) {
     lastKnownStepperSection = label   // remember the good resolve for future empty reads
     return label
@@ -5092,49 +5088,7 @@ async function resetRunStateForNewRun() {
     try { await clearConditionalParent(pendingConditionalLabelParent) } catch {}
     pendingConditionalLabelParent = null
   }
-  console.log('[QA reset] run-state cleared for new run — stepperSectionMap, reusableId, expand/preflight flags, discoveredRequiredErrors, pendingConditionalLabelParent') // TEMP DIAGNOSTIC
-}
 
-/** TEMP DIAGNOSTIC — read-only DOM dump of the active step card + any numbered
- *  "N. Label" elements, to locate where the true section title lives. Used by no logic. */
-function dumpActiveStepCard() {
-  try {
-    const directText = el => {
-      let t = ''
-      for (const n of (el.childNodes || [])) if (n.nodeType === 3) t += n.textContent || ''
-      return t.replace(/\s+/g, ' ').trim()
-    }
-    const cards = Array.from(document.querySelectorAll('[class*="step_"]'))
-      .filter(el => /\bstep_\d+\b/.test(String(el.className || '')))
-    const active = cards.filter(isVisible).find(el => {
-      const c = String(el.className || '')
-      return /\bcollapse\b/.test(c) && /\bshow\b/.test(c)
-    })
-    if (!active) {
-      console.log('[QA dump] no active step_N collapse show card')
-    } else {
-      console.log('[QA dump] active card class=', JSON.stringify(active.className))
-      Array.from(active.querySelectorAll('*')).slice(0, 15).forEach((el, i) => console.log(
-        `[QA dump]  ${i}:`, el.tagName,
-        '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
-        '| text=', JSON.stringify(directText(el).slice(0, 60))
-      ))
-    }
-    console.log('[QA dump] --- numbered "N. Label" elements anywhere (stepper nav) ---')
-    const numbered = Array.from(document.querySelectorAll('*')).filter(el => {
-      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
-      return /^\d+\.\s+\S/.test(t) && t.length <= 60
-    })
-    const leaves = numbered.filter(el => !numbered.some(o => o !== el && el.contains(o)))
-    if (leaves.length === 0) console.log('[QA dump]  (none found)')
-    leaves.slice(0, 20).forEach((el, i) => console.log(
-      `[QA dump]  num ${i}:`, el.tagName,
-      '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
-      '| text=', JSON.stringify(String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60))
-    ))
-  } catch (e) {
-    console.log('[QA dump] error', String(e?.message || e))
-  }
 }
 
 function getCurrentSectionName() {
@@ -5144,7 +5098,7 @@ function getCurrentSectionName() {
   //    stepper yields '' (non-stepper form).
   const stepperSection = getActiveStepperSectionName()
   if (stepperSection) {
-    console.log('[QA section] tier0 stepper →', JSON.stringify(stepperSection)) // TEMP DIAGNOSTIC
+
     return stepperSection
   }
 
@@ -5153,7 +5107,7 @@ function getCurrentSectionName() {
   const sectionTitle = visibleSectionHeadings()[0]
   if (sectionTitle && String(sectionTitle.textContent || '').trim()) {
     const t1 = String(sectionTitle.textContent || '').trim()
-    console.log('[QA section] tier1 h1.section-title →', JSON.stringify(t1)) // TEMP DIAGNOSTIC
+
     return t1
   }
 
@@ -5172,7 +5126,7 @@ function getCurrentSectionName() {
       if (txt && (h.compareDocumentPosition(firstControl) & Node.DOCUMENT_POSITION_FOLLOWING)) best = txt
     }
     if (best) {
-      console.log('[QA section] tier2 heading-before-control →', JSON.stringify(best)) // TEMP DIAGNOSTIC
+
       return best
     }
   }
@@ -5185,12 +5139,12 @@ function getCurrentSectionName() {
       if (!isVisible(h)) continue
       const txt = String(h.textContent || '').trim()
       if (txt) {
-        console.log('[QA section] tier3 fallback heading →', JSON.stringify(txt)) // TEMP DIAGNOSTIC
+
         return txt
       }
     }
   }
-  console.log('[QA section] none — no visible heading found') // TEMP DIAGNOSTIC
+
   return ''
 }
 
@@ -5360,7 +5314,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === 'QA_HELPER_GET_CURRENT_SECTION') {
     try {
-      try { dumpActiveStepCard() } catch {} // TEMP DIAGNOSTIC — read-only DOM dump, drives nothing
       sendResponse({ ok: true, section: getCurrentSectionName() })
     } catch (err) {
       sendResponse({ ok: false, section: '', error: String(err?.message || 'Failed to read section') })
@@ -5398,7 +5351,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         const allControls = Array.from(document.querySelectorAll(probeSel))
         const visibleControls = allControls.filter(isVisible)
         const probeLabel = String(tc?.field_label || tc?.name || '').trim()
-        console.log('[QA probe] field=' + JSON.stringify(probeLabel) + ' | visible=' + Boolean(visible) + ' | controlsOnPage=' + allControls.length + ' | visibleControls=' + visibleControls.length + ' | path=' + location.pathname) // TEMP DIAGNOSTIC
+
         sendResponse({ ok: true, visible: Boolean(visible), controlsOnPage: allControls.length, visibleControls: visibleControls.length })
       } catch (err) {
         // Fail-open so a probe error doesn't strand a test in the deferred pile.
@@ -5456,23 +5409,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           deferCascadeChains: false
         }
         await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 4)
-        const btn = findContinueButton() // TEMP DIAGNOSTIC
-        console.log('[QA advance] Continue button: found=' + Boolean(btn) + ', text=' + JSON.stringify(String(btn?.textContent || '').replace(/\s+/g, ' ').trim())) // TEMP DIAGNOSTIC
         const clicked = await clickContinueWithoutValidationRead()
-        console.log('[QA advance] clicked Continue = ' + Boolean(clicked.ok)) // TEMP DIAGNOSTIC
         if (!clicked.ok) {
-          console.log('[QA advance] section changed after click = false (button not found:', JSON.stringify(clicked.error || 'Continue button not found') + ')') // TEMP DIAGNOSTIC
           sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false, buttonFound: false })
           return
         }
         await wait(900)
         const signatureAfter = getSectionSignature()
         const sectionChanged = signatureBefore !== signatureAfter
-        console.log('[QA advance] section changed after click = ' + sectionChanged + ' | sigLen ' + signatureBefore.length + ' → ' + signatureAfter.length) // TEMP DIAGNOSTIC
-        if (!sectionChanged) {
-          const errs = getVisibleValidationEntries().map(e => e.text).slice(0, 6) // TEMP DIAGNOSTIC
-          console.log('[QA advance] NOT advanced — Continue clicked but section signature unchanged | visible validation errors:', JSON.stringify(errs)) // TEMP DIAGNOSTIC
-        }
         sendResponse({
           ok: true,
           sectionChanged,

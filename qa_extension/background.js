@@ -1,6 +1,5 @@
 /* global chrome */
 
-
 function isConditionalChainType(t) {
   const x = String(t || '').trim()
   return x === 'conditional_display' || x === 'conditional_required' || x === 'conditional_field'
@@ -397,7 +396,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
   const skipQuery = skipTestTypes.length ? `?skipTypes=${encodeURIComponent(skipTestTypes.join(','))}` : ''
   const fetchUrl = `${apiBase}/api/projects/${projectId}/extension-test-cases${skipQuery}`
-  console.log('[QA fetch] run start — projectId:', Number(projectId || 0), '| fetch URL:', fetchUrl) // TEMP DIAGNOSTIC
+
   const tcRes = await fetch(fetchUrl, {
     headers: authHeaders(token),
     cache: 'no-store' // always pull the CURRENT cases (e.g. just-regenerated), never a stale HTTP-cached copy
@@ -413,13 +412,6 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
           ? tcData.testCases
           : (Array.isArray(tcData) ? tcData : [])
       }]
-
-  const fetchedAll = sectionGroups.flatMap(g => Array.isArray(g?.testCases) ? g.testCases : []) // TEMP DIAGNOSTIC
-  console.log('[QA fetch] HTTP', tcRes.status, tcRes.ok ? 'OK' : 'FAILED',
-    '| projectId', Number(projectId || 0),
-    '| count', fetchedAll.length,
-    '| first 3:', JSON.stringify(fetchedAll.slice(0, 3).map(tc =>
-      ({ name: tc?.name, section: tc?.section || '', block: tc?.block || '' })))) // TEMP DIAGNOSTIC
 
   const filterList = Array.isArray(sectionsFilter)
     ? sectionsFilter.map(s => normalizeSectionName(s)).filter(Boolean)
@@ -477,17 +469,17 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   }
 
   async function attemptSectionAdvance() {
-    console.log('[QA advance] START — looking for Continue button') // TEMP DIAGNOSTIC
+
     try {
       const response = await sendTabMessageWithTimeout(
         tabId,
         { type: 'QA_HELPER_ADVANCE_AND_PROBE' },
         90000
       )
-      console.log('[QA advance] response — ok=' + Boolean(response?.ok) + ' | buttonFound=' + Boolean(response?.buttonFound) + ' | sectionChanged=' + Boolean(response?.sectionChanged) + (response?.error ? ' | error=' + JSON.stringify(response.error) : '')) // TEMP DIAGNOSTIC
+
       return Boolean(response?.ok && response?.sectionChanged)
     } catch (err) {
-      console.log('[QA advance] attemptSectionAdvance threw (timeout/no content?):', String(err?.message || err)) // TEMP DIAGNOSTIC
+
       return false
     }
   }
@@ -504,6 +496,9 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       )
       return Boolean(response?.ok && response?.changed)
     } catch {
+      // A fill failure must NEVER end the run — swallow and return false; the drain loop then
+      // proceeds to attemptSectionAdvance and continues to the next section.
+
       return false
     }
   }
@@ -535,7 +530,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
     async function atTarget() {
       const current = await getCurrentSectionName()
-      console.log('[QA nav] attempt', attempt, '— target:', JSON.stringify(target), '| current:', JSON.stringify(current), '| match:', sectionsMatch(current, target)) // TEMP DIAGNOSTIC
+
       if (sectionsMatch(current, target)) return true
       // Block names (e.g. "Attachments") often differ from the wizard step title
       // (e.g. "Additional Information") — also accept heading/file-upload presence.
@@ -546,9 +541,9 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       if (await atTarget()) return true
       if (attempt >= MAX_SECTION_ADVANCES) break
       const advanced = await attemptSectionAdvance()
-      console.log('[QA nav]   advance attempt', attempt, '→ advanced?', advanced) // TEMP DIAGNOSTIC
+
       if (!advanced) {
-        console.log('[QA nav] GAVE UP after', attempt + 1, 'attempt(s) — could not advance further; target', JSON.stringify(target), 'never matched → failUnreachable') // TEMP DIAGNOSTIC
+
         return false
       }
       if (!advanced) return await atTarget()
@@ -558,31 +553,23 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     }
     const finalSection = await getCurrentSectionName()
     const finalMatch = sectionsMatch(finalSection, target)
-    console.log('[QA nav] FINAL — target:', JSON.stringify(target), '| current:', JSON.stringify(finalSection), '| match:', finalMatch) // TEMP DIAGNOSTIC
-    if (!finalMatch) console.log('[QA nav] GAVE UP after exhausting', MAX_SECTION_ADVANCES + 1, 'attempts; target', JSON.stringify(target), 'never matched → failUnreachable') // TEMP DIAGNOSTIC
+
     return finalMatch
     return await atTarget()
   }
 
-  async function probeReachable(tc, sectionIndex) {
-    const skipLabel = String(tc?.field_label || tc?.name || '').trim() // TEMP DIAGNOSTIC
+  async function probeReachable(tc) {
     try {
       const response = await sendTabMessageWithTimeout(
         tabId,
         { type: 'QA_HELPER_PROBE_FIELD_VISIBLE', testCase: tc },
         8000
       )
-      // TEMP DIAGNOSTIC — `visible` here is log-only; the return decisions below are unchanged.
-      const controls = (response && typeof response.controlsOnPage === 'number') ? response.controlsOnPage : '?'
-      const visControls = (response && typeof response.visibleControls === 'number') ? response.visibleControls : '?'
-      const visible = !response ? true : (response.ok === false ? true : Boolean(response.visible))
-      console.log('[QA skip] section', sectionIndex, '| field', JSON.stringify(skipLabel), '| visible=' + visible, '| controls-on-page=' + controls, '| visible-controls=' + visControls) // TEMP DIAGNOSTIC
       if (!response) return true
       if (response.ok === false) return true
       if (response.visible) return true
       return false
-    } catch (err) {
-      console.log('[QA skip] section', sectionIndex, '| field', JSON.stringify(skipLabel), '| visible=true (probe threw:', String(err?.message || err), ') — fail-open') // TEMP DIAGNOSTIC
+    } catch {
       return true
     }
   }
@@ -602,7 +589,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
         if (RUN_STATE.cancellationRequested) break
         const tc = pending[i]
         const reachable = await probeReachable(tc, sectionIndex)
-        console.log('[QA drain] section', sectionIndex, '| field', JSON.stringify(pickCaseFieldLabel(tc)), '| type', String(tc?.test_type || ''), '| probeReachable=', reachable) // TEMP DIAGNOSTIC
+
         if (reachable) {
           pending.splice(i, 1)          // remove before running; do not advance i
           await runOneTest(tc)
@@ -743,7 +730,6 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
                                  // with many progressive/conditional fields need many rounds to drain.
   let advances = 0
   let sectionIndex = 0
-  console.log('[QA run] single-pass start —', pending.length, 'cases |', groupsToRun.length, 'sections | advance cap', maxAdvances, '| run-start url=', startUrl, '(controls-on-page shown on the first [QA skip] line below)') // TEMP DIAGNOSTIC
 
   while (pending.length > 0 && !RUN_STATE.cancellationRequested) {
     sectionIndex += 1
@@ -751,7 +737,6 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       message: `Section ${sectionIndex}: testing ${pending.length} remaining case${pending.length === 1 ? '' : 's'}`
     })
 
-    const pendingBefore = pending.length // TEMP DIAGNOSTIC
     // Drain currently-visible cases, THEN — only while cases are still pending — interleave
     // fill→reveal→re-probe→run so progressively-gated fields (which render after earlier ones
     // are filled) get tested on THIS section before advancing. Keep going as long as a round
@@ -767,31 +752,15 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       revealRounds += 1
       const moreRan = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
       ranHere = ranHere.concat(moreRan)
-      console.log('[QA flow] section', sectionIndex, '| reveal round', revealRounds, '| fill_changed=' + changed + ' | newly_ran=' + moreRan.length + ' | still_pending=' + pending.length) // TEMP DIAGNOSTIC
       if (!changed && moreRan.length === 0) break   // NO progress this round (nothing revealed, nothing ran) → section drained
     }
-    if (revealRounds >= MAX_REVEAL_ROUNDS) console.log('[QA flow] section', sectionIndex, '— hit MAX_REVEAL_ROUNDS safety cap; proceeding to advance (NOT ending run)') // TEMP DIAGNOSTIC
-    console.log('[QA run] section', sectionIndex, '— ran', ranHere.length, 'case(s) here |', pending.length, 'still pending') // TEMP DIAGNOSTIC
 
-    if (pending.length === 0 || RUN_STATE.cancellationRequested) {
-      console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=false (done/cancelled)') // TEMP DIAGNOSTIC
-      break
-    }
+    if (pending.length === 0 || RUN_STATE.cancellationRequested) break
+    if (advances >= maxAdvances) break
 
-    if (advances >= maxAdvances) {
-      console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=false (advance cap reached)') // TEMP DIAGNOSTIC
-      console.log('[QA run] advance cap', maxAdvances, 'reached — stranding', pending.length, 'case(s)') // TEMP DIAGNOSTIC
-      break
-    }
-    console.log('[QA advance] drain done for section ' + sectionIndex + ', calling attemptSectionAdvance') // TEMP DIAGNOSTIC
     const advanced = await attemptSectionAdvance()
     advances += 1
-    console.log('[QA flow] section ' + sectionIndex + ' | pending=' + pendingBefore + ' | ran=' + ranHere.length + ' | still_pending=' + pending.length + ' | advanced=' + advanced) // TEMP DIAGNOSTIC
-    console.log('[QA run] advanced to next section? ', advanced, '| advances', advances, '/', maxAdvances) // TEMP DIAGNOSTIC
-    if (!advanced) {
-      console.log('[QA run] form cannot advance further — stranding', pending.length, 'case(s)') // TEMP DIAGNOSTIC
-      break
-    }
+    if (!advanced) break
     setRunState({ contentNeedsReprime: true })
     lastConditionalParentSetupKey = ''
     await captureAndPersistFormStructure()   // silent, best-effort — never blocks the run
@@ -800,18 +769,14 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // Cases still pending were never visible on a reachable section — leave them Not Run.
   if (pending.length > 0) {
     untested += pending.length
-    console.log(
-      '[QA run] left',
-      pending.length,
-      'case(s) untested (field not on reachable sections) — status stays Not Run'
-    )
+
     reportRunProgress()
   }
 
   // successful_submit runs LAST — every section has now been traversed and filled.
   for (const tc of submitCases) {
     if (RUN_STATE.cancellationRequested) break
-    console.log('[QA run] running successful_submit last —', JSON.stringify(tc?.name || '')) // TEMP DIAGNOSTIC
+
     await runOneTest(tc)
   }
 
