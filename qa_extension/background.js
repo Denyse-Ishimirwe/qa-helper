@@ -487,6 +487,16 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // Fill the current step's visible fields WITHOUT clicking Continue, to reveal
   // progressively-gated sibling fields so their cases can be probed/run on this section
   // before advancing. Returns true if the form changed (new fields appeared).
+  // Ask the content script to wait until the current section's fields are rendered + settled
+  // before we drain/probe it, so we never race Angular's async mount (best-effort; never blocks).
+  async function waitForSectionRender() {
+    try {
+      await sendTabMessageWithTimeout(tabId, { type: 'QA_HELPER_WAIT_FOR_RENDER' }, 8000)
+    } catch {
+      // Render-wait is best-effort — a failure here must never stop the run.
+    }
+  }
+
   async function fillToReveal() {
     try {
       const response = await sendTabMessageWithTimeout(
@@ -724,7 +734,14 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
   // else drains section-by-section; submit runs once, after all sections are traversed.
   const submitCases = testCases.filter(tc => String(tc?.test_type || '').trim() === 'successful_submit')
   const pending = testCases.filter(tc => String(tc?.test_type || '').trim() !== 'successful_submit')
-  const maxAdvances = Math.max(groupsToRun.length, 1)
+  // Cap advances by a generous constant, NOT by how many section groups the
+  // AI-generated data happened to carry — wrongly-grouped test cases must not
+  // stop the runner from reaching later wizard steps. The loop still exits
+  // naturally when Continue stops advancing. Tunable from the backend config.
+  const maxAdvances = Math.max(
+    groupsToRun.length + 2,
+    Number(_engineConfig?.run?.maxSectionAdvances) || 10
+  )
   const MAX_REVEAL_ROUNDS = 30   // SAFETY cap only (prevent a true infinite loop). Rounds normally
                                  // stop far sooner via the no-progress exit below. Large sections
                                  // with many progressive/conditional fields need many rounds to drain.
@@ -733,6 +750,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
 
   while (pending.length > 0 && !RUN_STATE.cancellationRequested) {
     sectionIndex += 1
+    console.log('[TRACE] section', sectionIndex, 'pending', pending.length)
     setRunState({
       message: `Section ${sectionIndex}: testing ${pending.length} remaining case${pending.length === 1 ? '' : 's'}`
     })
@@ -745,6 +763,7 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
     // testable on the NEXT round, so we must NOT stop on the first `moreRan === 0`. Stop only
     // when a full round makes NO progress at all (nothing revealed AND nothing ran); the
     // MAX_REVEAL_ROUNDS cap is a safety backstop that should almost never be reached.
+    await waitForSectionRender()   // settle: don't probe before this section's fields have mounted
     let ranHere = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
     let revealRounds = 0
     while (pending.length > 0 && !RUN_STATE.cancellationRequested && revealRounds < MAX_REVEAL_ROUNDS) {
@@ -752,19 +771,31 @@ async function runExtensionTestsInBackground({ projectId, apiBase, token, tabId,
       revealRounds += 1
       const moreRan = await runVisibleCasesOnCurrentSection(pending, sectionIndex)
       ranHere = ranHere.concat(moreRan)
+      console.log('[TRACE] round', revealRounds, 'ran', moreRan.length, 'newlyVisible', changed)
       if (!changed && moreRan.length === 0) break   // NO progress this round (nothing revealed, nothing ran) → section drained
     }
 
     if (pending.length === 0 || RUN_STATE.cancellationRequested) break
     if (advances >= maxAdvances) break
 
-    const advanced = await attemptSectionAdvance()
+    console.log('[TRACE] rounds done for section', sectionIndex, '- calling attemptSectionAdvance')
+    let advanced = await attemptSectionAdvance()
+    if (!advanced && !RUN_STATE.cancellationRequested) {
+      // One flaky Continue (slow render, transient validation) must not end the
+      // whole run and leave every later section untested — settle, retry once.
+      console.log('[TRACE] advance failed — retrying once after settle')
+      await sleep(Number(_engineConfig?.run?.advanceRetryDelayMs) || 1800)
+      advanced = await attemptSectionAdvance()
+    }
+    console.log('[TRACE] advance result =', advanced)
     advances += 1
     if (!advanced) break
     setRunState({ contentNeedsReprime: true })
     lastConditionalParentSetupKey = ''
     await captureAndPersistFormStructure()   // silent, best-effort — never blocks the run
   }
+
+  console.log('[TRACE] RUN COMPLETE - last section', sectionIndex, 'pending remaining', pending.length)
 
   // Cases still pending were never visible on a reachable section — leave them Not Run.
   if (pending.length > 0) {

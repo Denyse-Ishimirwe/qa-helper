@@ -5189,6 +5189,30 @@ function getSectionSignature() {
 }
 
 /**
+ * Wait until the CURRENT section's form fields are actually rendered and settled, so the run
+ * never probes/fills a section before Angular has mounted it (the race that made every section
+ * after the first get ran=0). Generic — polls the DOM rather than using a fixed blind delay:
+ * returns as soon as at least one visible form control is present AND the section signature is
+ * stable across two consecutive reads. When `priorSignature` is provided (post-advance), it
+ * ALSO requires the signature to differ from it, i.e. a genuinely NEW section rendered. Falls
+ * through on a ~2.5s timeout so a slow/odd form can't hang the run.
+ */
+async function waitForSectionReady(priorSignature = null, timeoutMs = 2500) {
+  const controlSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+  const deadline = Date.now() + timeoutMs
+  let lastSig = null
+  while (Date.now() < deadline) {
+    const sig = getSectionSignature()
+    const hasControls = Array.from(document.querySelectorAll(controlSel)).some(isVisible)
+    const isNew = priorSignature == null || sig !== priorSignature
+    if (hasControls && isNew && sig === lastSig) return sig   // present + (new) + stable across 2 reads
+    lastSig = sig
+    await wait(150)
+  }
+  return getSectionSignature()
+}
+
+/**
  * Fast read-only check: can this test case be executed on the current section?
  *
  *  - successful_submit: always reachable (it operates on Continue/Submit).
@@ -5328,6 +5352,17 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
     return true
   }
+  if (message?.type === 'QA_HELPER_WAIT_FOR_RENDER') {
+    ;(async () => {
+      try {
+        await waitForSectionReady(null, 2000)   // just wait for controls to be present + settled
+        sendResponse({ ok: true })
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || err) })
+      }
+    })()
+    return true
+  }
   if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {
     ;(async () => {
       try {
@@ -5414,8 +5449,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false, buttonFound: false })
           return
         }
-        await wait(900)
-        const signatureAfter = getSectionSignature()
+        // Wait for the NEW section to actually render its fields before reporting success —
+        // otherwise the drain probes an empty, not-yet-mounted section and gets ran=0. Polls
+        // for a changed+settled section signature with visible controls, replacing the
+        // old fixed 900ms wait that raced the render. Timeout is backend-tunable: a slow
+        // Angular step that renders in 3-4s must not be misreported as "advance failed"
+        // (which would end the run and leave later sections untested).
+        const signatureAfter = await waitForSectionReady(
+          signatureBefore,
+          Number(QA_ENGINE?.timeouts?.sectionReadyMs) || 4000
+        )
         const sectionChanged = signatureBefore !== signatureAfter
         sendResponse({
           ok: true,

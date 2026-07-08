@@ -26,6 +26,9 @@
       // ng-select option polling (selectFirstNonEmptyNgSelect)
       ngSelectOptionsMaxWaitMs: 6000,
       ngSelectOptionsStepMs: 300,
+      // How long the new section may take to render after Continue before the
+      // advance is reported as failed
+      sectionReadyMs: 4000,
       // background.js per-test-case caps (ms)
       perTestCaseDefaultMs: 180000,
       perTestCaseByType: {
@@ -80,6 +83,15 @@
         '.ng-option',
         '[role="option"]'
       ]
+    },
+
+    // Run orchestration (used by background.js)
+    run: {
+      // Max Continue clicks per run — generous so forms with many wizard steps
+      // are fully traversed; the loop still exits when Continue stops working.
+      maxSectionAdvances: 10,
+      // Settle time before retrying a failed section advance once.
+      advanceRetryDelayMs: 1800
     },
 
     // Rwanda administrative location cascade, outermost first

@@ -8,7 +8,16 @@
 // browser console so you can confirm which config a run used.
 
 export const EXTENSION_CONFIG = {
-  version: 1,
+  version: 2,
+
+  // Run orchestration (background.js)
+  run: {
+    // Max Continue clicks per run — generous so forms with many wizard steps
+    // are fully traversed; the loop still exits when Continue stops working.
+    maxSectionAdvances: 10,
+    // Settle time before retrying a failed section advance once.
+    advanceRetryDelayMs: 1800
+  },
 
   timeouts: {
     validationInitialWaitMs: 600,
@@ -19,6 +28,9 @@ export const EXTENSION_CONFIG = {
     validationQuickStepMs: 60,
     ngSelectOptionsMaxWaitMs: 6000,
     ngSelectOptionsStepMs: 300,
+    // How long a new section may take to render after Continue before the
+    // advance is reported as failed
+    sectionReadyMs: 4000,
     perTestCaseDefaultMs: 180000,
     perTestCaseByType: {
       successful_submit: 300000,
