@@ -546,8 +546,13 @@ async function groqChatCompletionsCreate(payload) {
   try {
     return await groq.chat.completions.create({ ...payload, model: groqPrimary })
   } catch (err) {
+    // A 413/"request too large" must escape UNWRAPPED so the caller's
+    // payload-downsize loop can retry with a smaller SRD chunk — waiting
+    // a minute can never fix an over-size request.
+    if (isGroqRequestTooLargeError(err) && !isGroqRateLimitError(err)) throw err
     if (!isGroqRateLimitError(err)) throw err
     if (!groqFallback) {
+      if (isGroqRequestTooLargeError(err)) throw err
       throw new Error(`Gemini and Groq ${groqPrimary} are both rate-limited. ${humanizeGroqRateLimit(groqApiMessage(err))}`)
     }
     console.warn(`[ai] Groq ${groqPrimary} rate-limited — falling back to ${groqFallback}.`)
@@ -555,6 +560,10 @@ async function groqChatCompletionsCreate(payload) {
     try {
       return await groq.chat.completions.create({ ...payload, model: groqFallback })
     } catch (err2) {
+      // Same rule for the fallback model: a too-large rejection (Groq labels
+      // TPM-oversize as 413 rate_limit_exceeded) must propagate as-is so the
+      // caller shrinks the payload instead of telling the user to wait.
+      if (isGroqRequestTooLargeError(err2)) throw err2
       if (!isGroqRateLimitError(err2)) throw err2
       // 4) Everything rate-limited.
       throw new Error(
@@ -789,7 +798,12 @@ async function generateTestCases(srdText, formStructure) {
       { maxTokens: 2048, srdChars: 12000, structureChars: 4000 },
       { maxTokens: 2048, srdChars: 9000, structureChars: 3500 },
       { maxTokens: 1536, srdChars: 6500, structureChars: 3000 },
-      { maxTokens: 1536, srdChars: 4500, structureChars: 2500 }
+      { maxTokens: 1536, srdChars: 4500, structureChars: 2500 },
+      // Last-resort plans sized for llama-3.1-8b-instant's 6000 TPM cap:
+      // the fixed system prompt alone is ~3.8k tokens, so user payload +
+      // output must stay under ~2.2k tokens combined.
+      { maxTokens: 1024, srdChars: 3000, structureChars: 1500 },
+      { maxTokens: 900, srdChars: 2200, structureChars: 1000 }
     ]
 
     let lastErr = null
@@ -837,13 +851,18 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
         return retagSpecialCaseTypes(normalizeCases(parsed))
       } catch (err) {
         lastErr = err
-        // If every provider is rate-limited, don't fire the payload-size retry
-        // loop — that would re-run the whole Gemini→Groq→Groq cascade up to 8x.
-        if (isGroqRateLimitError(err)) throw err
+        // ORDER MATTERS: check "request too large" BEFORE "rate limit". Groq
+        // reports an over-size request as 413 rate_limit_exceeded, so the
+        // rate-limit check would swallow it and abort — telling the user to
+        // wait a minute for a request that can never fit. Downsize instead.
         if (isGroqRequestTooLargeError(err)) {
           if (planIdx + 1 < payloadPlans.length) await sleep(2300)
           continue
         }
+        // A genuine rate limit (daily/temporal quota): don't fire the
+        // payload-size retry loop — that would re-run the whole
+        // Gemini→Groq→Groq cascade up to 8x.
+        if (isGroqRateLimitError(err)) throw err
         throw err
       }
     }
