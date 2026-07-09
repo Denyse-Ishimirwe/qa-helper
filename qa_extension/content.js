@@ -4635,6 +4635,46 @@ async function executeTestCase(tc, runContext = {}) {
     updateLiveRunIndicator(tc, field, 'Testing field')
   }
 
+  // OPTIONAL-FIELD check — the expected result says NO error should appear
+  // (e.g. "No error message"). The regular required-field flow HUNTS for an
+  // error and would mark these Failed; here the assertion is inverted: leave
+  // the field empty, blur it (Formly validates touched fields on blur), and
+  // PASS when no field-scoped error appears and the label carries no required
+  // asterisk. Continue is deliberately NOT clicked — that could advance the
+  // section early and starve sibling tests still pending on this section.
+  const expectsNoError = /\bno\s+error(?:\s+message)?s?\b|\bshould\s+not\s+(?:show|display)\b|\bwithout\s+(?:any\s+)?error/i.test(
+    String(tc?.expected_result || '')
+  )
+  if (testType === 'required_field' && expectsNoError) {
+    try {
+      const kind = detectFieldKind(field)
+      if (kind === 'radio') forceClearRadioGroupSelection(field)
+      else clearFieldValue(field)
+    } catch { /* clearing is best-effort — an untouched empty field is equivalent */ }
+    await wait(240)
+    try { dispatchBlurEvent(field) } catch { /* blur is best-effort */ }
+    await wait(700)
+    const scoped = getRequiredFieldValidationInContainer(field)
+    const scopedTexts = scoped.map(e => String(e?.text || '')).filter(Boolean)
+    if (scopedTexts.length > 0) {
+      return {
+        passed: false,
+        message: `Expected no error for optional field "${fieldLabel}", but the form shows: "${scopedTexts[0].slice(0, 200)}"`
+      }
+    }
+    const labelText = getLabelText(field)
+    if (hasRequiredAsterisk(field, labelText)) {
+      return {
+        passed: false,
+        message: `Expected "${fieldLabel}" to be optional, but its label carries a required marker (*) on the form`
+      }
+    }
+    return {
+      passed: true,
+      message: `Optional field confirmed: left "${fieldLabel}" empty and no validation error appeared`
+    }
+  }
+
   if (testType === 'required_field') {
     return executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, field)
   }

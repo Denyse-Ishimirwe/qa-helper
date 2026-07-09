@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "QA Helper",
   "version": "1.0",
-  "description": "Runs QA Helper test cases against Irembo portal forms and reports pass/fail results to your QA Helper project.",
+  "description": "Runs QA Helper test cases against your web forms and reports pass/fail results to your QA Helper project.",
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
