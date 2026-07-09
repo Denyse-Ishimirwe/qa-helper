@@ -612,9 +612,22 @@ function buildSrdSectionMaps(srdText) {
   const blockToSection = new Map()
   const fieldToSection = new Map()
   const lines = String(srdText || '').split('\n')
+
+  function ingestRow(c1, c2, c3, state) {
+    if (c1) state.section = c1
+    if (c2) state.block = c2
+    if (!state.section) return
+    if (state.block && !blockToSection.has(_normNameKey(state.block))) {
+      blockToSection.set(_normNameKey(state.block), state.section)
+    }
+    if (c3 && !fieldToSection.has(_normNameKey(c3))) {
+      fieldToSection.set(_normNameKey(c3), state.section)
+    }
+  }
+
+  // Layout 1 — markdown pipe table: | Section | Block | Field name |
   let inTable = false
-  let section = ''
-  let block = ''
+  const state = { section: '', block: '' }
   for (const line of lines) {
     const t = line.trim()
     if (!t.startsWith('|')) {
@@ -625,20 +638,37 @@ function buildSrdSectionMaps(srdText) {
     if (!inTable) {
       if (cells.length >= 3 && /section/i.test(cells[0]) && /block/i.test(cells[1]) && /field/i.test(cells[2])) {
         inTable = true
-        section = ''
-        block = ''
+        state.section = ''
+        state.block = ''
       }
       continue
     }
     if (cells.length < 3) { inTable = false; continue }
     if (cells.every(c => /^[-\s:]*$/.test(c))) continue // separator row
-    const [c1, c2, c3] = cells
-    if (c1) section = c1
-    if (c2) block = c2
-    const field = c3 || ''
-    if (!section) continue
-    if (block && !blockToSection.has(_normNameKey(block))) blockToSection.set(_normNameKey(block), section)
-    if (field && !fieldToSection.has(_normNameKey(field))) fieldToSection.set(_normNameKey(field), section)
+    ingestRow(cells[0], cells[1], cells[2], state)
+  }
+  if (blockToSection.size || fieldToSection.size) return { blockToSection, fieldToSection }
+
+  // Layout 2 — Word/docx extraction (mammoth extractRawText): each table cell
+  // becomes its own line, so the structure table appears as a "Section" /
+  // "Block" / "Field name" header trio followed by cells in row-major groups
+  // of three (empty cells = empty lines, which carry the forward-fill).
+  for (let i = 0; i + 2 < lines.length; i += 1) {
+    if (!/^section$/i.test(lines[i].trim())) continue
+    if (!/^block/i.test(lines[i + 1].trim())) continue
+    if (!/^field/i.test(lines[i + 2].trim())) continue
+    const rowState = { section: '', block: '' }
+    let rows = 0
+    for (let j = i + 3; j + 2 < lines.length && rows < 300; j += 3, rows += 1) {
+      const a = lines[j].trim()
+      const b = lines[j + 1].trim()
+      const c = lines[j + 2].trim()
+      // Stop at the next document heading or an entirely blank row.
+      if (/^(blocks?|form elements?|form information|validation rules?|display rules?|pricing|workflow|#|---+)/i.test(a) && !b && !c) break
+      if (!a && !b && !c) break
+      ingestRow(a, b, c, rowState)
+    }
+    break
   }
   return { blockToSection, fieldToSection }
 }
