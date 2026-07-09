@@ -236,10 +236,14 @@ async function fetchNotionSrdText(notionUrl) {
 
     if (type === 'table_row') {
       const cells = Array.isArray(block?.table_row?.cells) ? block.table_row.cells : []
-      const rowText = cells
-        .map(cell => richTextToString(cell))
-        .filter(Boolean)
-      return rowText.length ? [rowText.join(' | ')] : []
+      // PRESERVE EMPTY CELLS AND COLUMN POSITIONS. SRD structure tables use
+      // blank cells to mean "inherit the Section/Block above" (forward-fill);
+      // dropping empties collapses columns so neither the generation model nor
+      // the section corrector can tell which column a value came from — the
+      // root cause of section/block mix-ups. Emit proper markdown pipe rows.
+      const rowText = cells.map(cell => String(richTextToString(cell) || '').trim())
+      const hasContent = rowText.some(Boolean)
+      return hasContent ? [`| ${rowText.join(' | ')} |`] : []
     }
 
     return []
