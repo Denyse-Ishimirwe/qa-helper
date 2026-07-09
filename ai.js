@@ -869,8 +869,13 @@ async function generateTestCases(srdText, formStructure) {
 
   async function requestOnce(extraRules = '') {
     const envMaxSrd = Number(process.env.GROQ_GENERATE_MAX_SRD_CHARS)
+    // Cap the SRD only for the LOCAL model (finite num_ctx window) — cloud
+    // providers must keep receiving the full payload plans, otherwise large
+    // SRDs silently generate fewer cases than they used to.
+    const provider = String(process.env.AI_PROVIDER || '').toLowerCase().trim()
+    const defaultCap = provider === 'ollama' ? 16000 : null
     const srdCap =
-      Number.isFinite(envMaxSrd) && envMaxSrd >= 4000 ? Math.floor(envMaxSrd) : null
+      Number.isFinite(envMaxSrd) && envMaxSrd >= 4000 ? Math.floor(envMaxSrd) : defaultCap
 
     const payloadPlans = [
       { maxTokens: 4096, srdChars: 32000, structureChars: 8000 },
