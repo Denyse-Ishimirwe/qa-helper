@@ -1,0 +1,5575 @@
+/* global chrome */
+/**
+ * In-page test runner — ngx-formly / complex portals first-class; also falls back to generic
+ * label + selector resolution. Strategy: (1) resolve by Formly id model key when `field_name` matches;
+ * (2) label + optional test-name context, with generic synonyms (cascades, nationality); (3) DOM-kind detection
+ * (radio, ng-select, date hosts); (4) conditional triggers from natural-language when/if/select
+ * (parsed parent + value — not hardcoded to one country or contract label).
+ */
+let hasExpandedSectionsForRun = false
+let cancelCurrentTestRequested = false
+let activeHighlightedField = null
+let reusableIdValueForRun = ''
+/** Set once per extension run: Step A+B discover required messages + fill all. */
+let requiredFieldRunPreflightDone = false
+/** Text from Step A (.invalid-feedback + formly-validation-message). */
+let discoveredRequiredErrors = []
+
+function clearActiveFieldHighlight() {
+  if (!activeHighlightedField) return
+  try {
+    activeHighlightedField.style.outline = ''
+    activeHighlightedField.style.outlineOffset = ''
+    activeHighlightedField.style.boxShadow = ''
+    activeHighlightedField.removeAttribute('data-qa-active-field')
+  } catch {
+    // Ignore cleanup issues on detached nodes.
+  }
+  activeHighlightedField = null
+}
+
+function getOrCreateRunIndicator() {
+  let node = document.getElementById('qa-helper-run-indicator')
+  if (node) return node
+  node = document.createElement('div')
+  node.id = 'qa-helper-run-indicator'
+  node.style.position = 'fixed'
+  node.style.right = '12px'
+  node.style.top = '12px'
+  node.style.zIndex = '2147483647'
+  node.style.maxWidth = '420px'
+  node.style.padding = '8px 10px'
+  node.style.borderRadius = '8px'
+  node.style.background = 'rgba(31,56,100,0.94)'
+  node.style.color = '#fff'
+  node.style.fontSize = '12px'
+  node.style.lineHeight = '1.35'
+  node.style.boxShadow = '0 4px 14px rgba(0,0,0,0.25)'
+  node.style.pointerEvents = 'none'
+  document.documentElement.appendChild(node)
+  return node
+}
+
+function updateLiveRunIndicator(tc, fieldEl = null, stage = 'Checking field') {
+  const node = getOrCreateRunIndicator()
+  const fieldName =
+    String(tc?.field_label || '').trim() ||
+    String(getLabelText(fieldEl) || '').trim() ||
+    String(tc?.field_name || '').trim() ||
+    String(tc?.name || '').trim() ||
+    'Unknown field'
+  const type = String(tc?.test_type || 'required_field').trim()
+  node.textContent = `${stage}: ${fieldName} (${type})`
+  if (!fieldEl || !isVisible(fieldEl)) return
+  clearActiveFieldHighlight()
+  activeHighlightedField = fieldEl
+  fieldEl.setAttribute('data-qa-active-field', '1')
+  fieldEl.style.outline = '2px solid #2e75b6'
+  fieldEl.style.outlineOffset = '2px'
+  fieldEl.style.boxShadow = '0 0 0 3px rgba(46,117,182,0.2)'
+}
+
+function clearLiveRunIndicator() {
+  clearActiveFieldHighlight()
+  const node = document.getElementById('qa-helper-run-indicator')
+  if (node?.parentNode) node.parentNode.removeChild(node)
+}
+
+function throwIfCancelled() {
+  if (cancelCurrentTestRequested) {
+    throw new Error('Test execution cancelled by user')
+  }
+}
+function getLabelText(el) {
+  const id = el.id
+  if (id) {
+    const byFor = document.querySelector(`label[for="${id}"]`)
+    if (byFor?.textContent?.trim()) return byFor.textContent.trim()
+  }
+  const wrapped = el.closest('label')
+  if (wrapped?.textContent?.trim()) return wrapped.textContent.trim()
+  const aria = el.getAttribute('aria-label')
+  if (aria?.trim()) return aria.trim()
+  return ''
+}
+
+/** Field's QUESTION label (for label_check). For radios this is the GROUP
+ *  question, not the selected option. Reads the Irembo formly wrapper label,
+ *  then label[for]/aria-label. Generic — DOM structure only, no field names. */
+function getFieldQuestionLabel(el) {
+  if (!el) return ''
+  const wrapper = el.closest?.('formly-field, formly-wrapper-form-field')
+  const wrapLabel = wrapper?.querySelector('label.form-label, .field-label, legend')
+  if (wrapLabel?.textContent?.trim()) return wrapLabel.textContent.trim()
+  const type = String(el.getAttribute?.('type') || el.type || '').toLowerCase()
+  if (type !== 'radio') {                       // radios never fall back to a per-option <label>
+    const id = el.id
+    if (id) {
+      const byFor = document.querySelector(`label[for="${id}"]`)
+      if (byFor?.textContent?.trim()) return byFor.textContent.trim()
+    }
+    const wrapped = el.closest('label')
+    if (wrapped?.textContent?.trim()) return wrapped.textContent.trim()
+  }
+  const aria = el.getAttribute?.('aria-label')
+  return aria?.trim() || ''
+}
+
+function hasRequiredAsterisk(el, labelText) {
+  if (/\*/.test(String(labelText || ''))) return true
+  const id = el.id
+  if (id) {
+    const byFor = document.querySelector(`label[for="${id}"]`)
+    if (byFor && /\*/.test(byFor.textContent || '')) return true
+  }
+  const wrapped = el.closest('label')
+  if (wrapped && /\*/.test(wrapped.textContent || '')) return true
+  const container = el.closest('.form-group, .field, .input-group, .form-field') || el.parentElement
+  if (container && /\*/.test(container.textContent || '')) return true
+  return false
+}
+
+function scanFormFields() {
+  const elements = Array.from(document.querySelectorAll('input, select, textarea, button'))
+  return elements
+    .map((el, idx) => {
+      const tag = el.tagName.toLowerCase()
+      const rawType = String(el.getAttribute('type') || '').toLowerCase()
+      const type = rawType || (tag === 'select' ? 'select' : tag)
+      const id = el.id || ''
+      const name = el.getAttribute('name') || ''
+      const placeholder = el.getAttribute('placeholder') || ''
+      const label = getLabelText(el)
+      const requiredAttr = Boolean(el.required) || el.hasAttribute('required')
+      const ariaRaw = String(el.getAttribute('aria-required') || '').toLowerCase()
+      const ariaRequired = ['true', 'required', '1'].includes(ariaRaw)
+      const labelHasAsterisk = hasRequiredAsterisk(el, label)
+      const required = Boolean(requiredAttr || ariaRequired || labelHasAsterisk)
+      return {
+        index: idx + 1,
+        element: tag,
+        type,
+        id,
+        name,
+        placeholder,
+        label,
+        required,
+        requiredSignals: {
+          requiredAttr,
+          ariaRequired,
+          labelHasAsterisk
+        }
+      }
+    })
+}
+
+function wait(ms) {
+  return new Promise((resolve, reject) => {
+    const raw = Number(ms || 0)
+    const paced = raw <= 0 ? 0 : raw
+    const started = Date.now()
+    const step = () => {
+      if (cancelCurrentTestRequested) {
+        reject(new Error('Test execution cancelled by user'))
+        return
+      }
+      if (Date.now() - started >= paced) {
+        resolve()
+        return
+      }
+      setTimeout(step, 40)
+    }
+    step()
+  })
+}
+
+function normalizeText(v) {
+  return String(v || '').trim().toLowerCase()
+}
+
+function normalizeLabelText(v) {
+  return normalizeText(v).replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim()
+}
+
+function sanitizeSearchLabel(v) {
+  return normalizeLabelText(v)
+    .replace(/\bconditional\b/g, ' ')
+    .replace(/\brequired\b/g, ' ')
+    .replace(/\boptional\b/g, ' ')
+    .replace(/\bdisplay\b/g, ' ')
+    .replace(/\btest\b/g, ' ')
+    .replace(/\bformat\b/g, ' ')
+    .replace(/\bvalidation\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Align raw labels with server inference: trailing " field", and test-title tails like
+ * "… required field test for NIN". Without this, falling back to `tc.name` leaves tokens
+ * such as "field for nin" after sanitizeSearchLabel strips only "required"/"test".
+ */
+function normalizeCaseFieldLabelRaw(raw) {
+  let h = String(raw || '').trim()
+    h = h.replace(/^test\s+(required\s+field|format\s+validation|optional\s+field|conditional\s+(required|display|field)|widget\s+auto\s+fill|attachment|disabled\s+field)\s*:\s*/i, '').trim()
+  h = h.replace(/^(required|format|optional|conditional|widget|attachment|disabled)\s+(field|validation|display|required|auto\s+fill)\s*:\s*/i, '').trim()
+  h = h.replace(/^[^-:]+-\s*/g, '').trim()
+  h = h.replace(/^[^-:]+:\s*/g, '').trim()
+  h = h.replace(/\s+required\s+field\s+test(\s+for\s+[^\s.]+)?\s*$/i, '').trim()
+  h = h.replace(/\s+optional\s+field\s+test(\s+for\s+[^\s.]+)?\s*$/i, '').trim()
+  h = h.replace(/\s+field\s*$/i, '').trim()
+  h = h.replace(/^(the|a|an)\s+/i, '').trim()
+  h = h
+    .replace(/\s+(required|invalid|missing|more\s+than|too\s+long|less\s+than|invalid\s+email|invalid\s+phone|invalid\s+format)\b.*$/i, '')
+    .trim()
+  h = h.replace(/\s+error\s*$/i, '').trim()
+  h = h.replace(/\s+test\s+case\s*$/i, '').trim()
+  return h
+}
+
+/** Irembo formly ids: `formly_20_radio_gender_6`, `formly_34_customcascadingdropdowns_location_1` → last segment before trailing index is the model key. */
+function parseFormlyFieldIdKey(fieldId) {
+  const parts = String(fieldId || '').split('_')
+  if (parts.length < 4 || parts[0] !== 'formly') return ''
+  const last = parts[parts.length - 1]
+  if (!/^\d+$/.test(last)) return ''
+  return String(parts[parts.length - 2] || '')
+}
+
+function splitFieldNameIntoWords(raw) {
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_\s]/g, '')
+  const spaced = cleaned
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .trim()
+  return spaced.split(/\s+/).filter(Boolean)
+}
+
+/** Derives plausible formly model keys from any API field_name without name-specific branches. */
+function keyResolutionCandidates(fieldName) {
+  const raw = String(fieldName || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_]/g, '')
+  if (!raw) return []
+  const out = new Set()
+  out.add(raw)
+  out.add(raw.toLowerCase())
+  if (raw.length) out.add(raw.charAt(0).toLowerCase() + raw.slice(1))
+  const words = splitFieldNameIntoWords(raw)
+  if (words.length) {
+    const lower = words.map(w => w.toLowerCase())
+    out.add(lower.join(''))
+    out.add(lower.join('_'))
+    out.add(
+      words
+        .map((w, i) =>
+          i === 0 ? w.charAt(0).toLowerCase() + w.slice(1).toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()
+        )
+        .join('')
+    )
+    out.add(words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(''))
+  }
+  return [...out].filter(Boolean)
+}
+
+function resolveFieldTargetByFormlyKey(fieldName) {
+  const candidates = keyResolutionCandidates(fieldName)
+  if (candidates.length === 0) return { element: null, kind: 'unknown' }
+  const lowered = new Set(candidates.map(c => String(c).toLowerCase()))
+  const wraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field'))
+  for (const wrap of wraps) {
+    const fid = String(wrap.id || '')
+    const parsed = parseFormlyFieldIdKey(fid)
+    if (!parsed || !lowered.has(parsed.toLowerCase())) continue
+    const radio = wrap.querySelector('input[type="radio"]')
+    if (radio) return { element: radio, kind: 'radio' }
+    const ng = wrap.querySelector('ng-select, .ng-select, div[role="combobox"]')
+    if (ng) return { element: ng, kind: 'ng-select' }
+    const inner = wrap.querySelector(
+      'input:not([type="hidden"]), select, textarea, irembogov-custom-date-picker input, irembogov-irembo-date-picker input'
+    )
+    if (inner) return { element: inner, kind: detectFieldKind(inner) }
+  }
+  return { element: null, kind: 'unknown' }
+}
+
+function significantLabelWords(norm) {
+  return norm
+    .split(/\s+/)
+    .map(w => w.replace(/[^a-z0-9]/gi, ''))
+    .filter(w => w.length > 2)
+}
+
+/**
+ * Adds search variants from on-page formly copy: score wrappers by overlap with the label,
+ * then combine label tokens with other distinctive tokens from the best-matching wrappers.
+ */
+function expandLabelSearchTerms(fieldLabel, hintBlob = '') {
+  const terms = []
+  const add = t => {
+    const n = sanitizeSearchLabel(t)
+    if (n && !terms.includes(n)) terms.push(n)
+  }
+  add(fieldLabel)
+  const baseNorm = normalizeLabelText(`${fieldLabel} ${hintBlob}`)
+  const labelWords = significantLabelWords(baseNorm)
+  if (labelWords.length === 0) return terms
+
+  const wraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field'))
+  const scored = wraps
+    .map(w => {
+      const t = normalizeLabelText(w.textContent || '')
+      let score = 0
+      for (const lw of labelWords) {
+        if (t.includes(lw)) score += 1
+      }
+      return { t, score }
+    })
+    .filter(x => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+
+  for (const { t } of scored.slice(0, 8)) {
+    if (terms.length >= 36) break
+    const extraTokens = [
+      ...new Set(
+        significantLabelWords(t).filter(w => !labelWords.includes(w))
+      )
+    ].slice(0, 10)
+    for (const ew of extraTokens) {
+      if (terms.length >= 36) break
+      for (const lw of labelWords) {
+        add(`${lw} ${ew}`)
+        add(`${ew} ${lw}`)
+        if (terms.length >= 36) break
+      }
+      add(`${labelWords.join(' ')} ${ew}`.trim())
+    }
+  }
+  return terms
+}
+
+/** District/Sector/Cell/Village often live under one `location` customcascadingdropdowns field. */
+function resolveLocationCascadeChild(fieldLabel, contextHint = '') {
+  const norm = sanitizeSearchLabel(fieldLabel)
+  const steps = ['district', 'sector', 'cell', 'village']
+  const step = steps.find(s => new RegExp(`\\b${s}\\b`).test(norm))
+  if (!step) return { element: null, kind: 'unknown' }
+  const hint = normalizeLabelText(contextHint)
+  const candidates = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).filter(w => {
+    const k = parseFormlyFieldIdKey(w.id)
+    return k && /location/i.test(String(k))
+  })
+  let locationWrap = null
+  if (hint.includes('processing')) {
+    locationWrap =
+      candidates.find(w => normalizeLabelText(w.textContent).includes('processing')) || null
+  } else {
+    locationWrap =
+      candidates.find(w => !normalizeLabelText(w.textContent).includes('processing')) ||
+      candidates[0] ||
+      null
+  }
+  if (!locationWrap && candidates.length > 0) locationWrap = candidates[0]
+  if (!locationWrap) return { element: null, kind: 'unknown' }
+  const selects = Array.from(locationWrap.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+
+  // Use each dropdown's OWN placeholder text to identify which level it is.
+  // All dropdowns share the same parent wrapper so container text always contains
+  // all level names — checking individual placeholder avoids matching the wrong level.
+  function getSelectOwnText(sel) {
+    const placeholder = sel.querySelector('.ng-placeholder')?.textContent || ''
+    const input = sel.querySelector('input[placeholder]')?.getAttribute('placeholder') || ''
+    const ownText = placeholder || input || sel.getAttribute('placeholder') || ''
+    return normalizeLabelText(ownText)
+  }
+
+  for (const sel of selects) {
+    const ownText = getSelectOwnText(sel)
+    if (ownText && ownText.includes(step)) return { element: sel, kind: 'ng-select' }
+  }
+
+  // Fallback: use index position in the cascade order
+  const idx = steps.indexOf(step)
+  if (idx >= 0 && selects[idx]) return { element: selects[idx], kind: 'ng-select' }
+  return { element: null, kind: 'unknown' }
+}
+
+function resolveNationalityCascadeChild(fieldLabel) {
+  const norm = sanitizeSearchLabel(fieldLabel)
+  if (!/\bnationality\b/i.test(String(fieldLabel || '')) && !norm.includes('nationality')) {
+    return { element: null, kind: 'unknown' }
+  }
+  const steps = ['province', 'district', 'sector', 'cell', 'village']
+  const step = steps.find(s => new RegExp(`\\b${s}\\b`).test(norm))
+  if (!step) return { element: null, kind: 'unknown' }
+  const natWrap = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).find(w => {
+    const k = parseFormlyFieldIdKey(w.id)
+    return k && k.toLowerCase() === 'nationality'
+  })
+  if (!natWrap) return { element: null, kind: 'unknown' }
+  const selects = Array.from(natWrap.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+  for (const sel of selects) {
+    const blob = normalizeLabelText(
+      `${getControlContainer(sel)?.textContent || ''} ${sel.textContent || ''}`
+    )
+    if (blob.includes(step)) return { element: sel, kind: 'ng-select' }
+  }
+  const idx = steps.indexOf(step)
+  if (idx >= 0 && selects[idx]) return { element: selects[idx], kind: 'ng-select' }
+  return { element: null, kind: 'unknown' }
+}
+
+function isVisible(el) {
+  if (!el) return false
+  if (el.offsetParent === null) return false
+  const style = window.getComputedStyle(el)
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+}
+
+/** Smooth-scroll the active control into view so you can watch the extension run. */
+function scrollTestTargetIntoView(el) {
+  if (!el || typeof el.scrollIntoView !== 'function') return
+  try {
+    el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' })
+  } catch {
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'nearest' })
+    } catch {
+      try {
+        el.scrollIntoView(true)
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function getVisibleValidationEntries() {
+  const selectors = QA_ENGINE.selectors.validationMessages.join(', ')
+  const all = Array.from(document.querySelectorAll(selectors))
+  const leafLike = all.filter(el => {
+    if (!isVisible(el)) return false
+    const txt = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+    if (!txt) return false
+    // Keep the most specific node: ignore container nodes that include smaller error nodes.
+    const childHits = Array.from(el.querySelectorAll(selectors))
+      .filter(child => child !== el && isVisible(child))
+      .some(child => String(child.textContent || '').replace(/\s+/g, ' ').trim().length > 0)
+    return !childHits
+  })
+  const seen = new Set()
+  return leafLike
+    .map(el => ({
+      element: el,
+      text: String(el.textContent || '').replace(/\s+/g, ' ').trim()
+    }))
+    .filter(entry => {
+      if (!entry.text) return false
+      const key = normalizeLabelText(entry.text)
+      if (!key || seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+}
+
+async function getVisibleValidationEntriesWithRetry(opts = {}) {
+  const quick = Boolean(opts.quick)
+  const T = QA_ENGINE.timeouts
+  const initialWaitMs = quick ? T.validationQuickInitialWaitMs : T.validationInitialWaitMs
+  const maxMs = quick ? T.validationQuickMaxMs : T.validationMaxMs
+  const stepMs = quick ? T.validationQuickStepMs : T.validationStepMs
+  await wait(initialWaitMs)
+  const tries = Math.ceil(maxMs / stepMs)
+  let last = []
+  for (let i = 0; i < tries; i += 1) {
+    last = getVisibleValidationEntries()
+    if (last.length > 0) return last
+    await wait(stepMs)
+  }
+  return last
+}
+
+function getTargetFieldValidationRoot(targetEl) {
+  if (!targetEl?.closest) return null
+  const formly = targetEl.closest('formly-wrapper-form-field, formly-field, formly-group')
+  if (formly) return formly
+  const mat = targetEl.closest(
+    'mat-form-field, .mat-mdc-form-field, .mat-form-field, .mdc-text-field, .mat-mdc-text-field-wrapper'
+  )
+  if (mat) return mat
+  const radioRoot = getRadioGroupContainer(targetEl)
+  if (radioRoot) return radioRoot
+  return targetEl.closest('.form-group, .field, .mb-3, .form-field')
+}
+
+function isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl) {
+  const root = getTargetFieldValidationRoot(targetEl)
+  if (!root || !msgEl) return false
+  if (root.contains(msgEl)) return true
+  let sib = root.nextElementSibling
+  for (let i = 0; i < 6 && sib; i += 1) {
+    if (sib === msgEl || sib.contains?.(msgEl)) return true
+    sib = sib.nextElementSibling
+  }
+  const wrap = root.parentElement
+  if (wrap && wrap.contains(msgEl)) {
+    try {
+      const rb = root.getBoundingClientRect?.()
+      const mb = msgEl.getBoundingClientRect?.()
+      if (rb && mb && mb.height > 0 && Math.abs(mb.top - rb.bottom) < 120 && Math.abs(mb.left - rb.left) < 240) {
+        return true
+      }
+    } catch {
+      // ignore geometry failures
+    }
+  }
+  return false
+}
+
+function tokenizeNormalizedPhrase(norm) {
+  return String(norm || '')
+    .split(/\s+/)
+    .map(w => w.replace(/[^a-z0-9]/gi, ''))
+    .filter(Boolean)
+}
+
+/** True when msg and expected share the same three consecutive non-empty tokens (no single-word shortcuts). */
+function messageContainsThreeConsecutiveWordsFromExpected(msgNorm, expectedNorm) {
+  const words = tokenizeNormalizedPhrase(expectedNorm)
+  if (words.length < 3) return false
+  for (let i = 0; i <= words.length - 3; i += 1) {
+    const phrase = `${words[i]} ${words[i + 1]} ${words[i + 2]}`
+    if (msgNorm.includes(phrase)) return true
+  }
+  return false
+}
+
+function messageContainsTwoConsecutiveWordsFromExpected(msgNorm, expectedNorm) {
+  const words = tokenizeNormalizedPhrase(expectedNorm)
+  if (words.length < 2) return false
+  for (let i = 0; i <= words.length - 2; i += 1) {
+    const phrase = `${words[i]} ${words[i + 1]}`
+    if (phrase.length > 3 && msgNorm.includes(phrase)) return true
+  }
+  return false
+}
+
+/** Short expected strings like "Invalid email format" vs real mat-error copy. */
+function formatValidationLooseMatch(msgNorm, expectedNorm, whatToTestNorm, targetNorm) {
+  if (!/(invalid|incorrect|format|characters|pattern|not\s+valid|must\s+be)/i.test(msgNorm)) return false
+  if (/email|e-mail/.test(targetNorm) && /email/.test(whatToTestNorm)) {
+    return /(invalid|incorrect|format|address|valid)/i.test(msgNorm)
+  }
+  if (/(phone|mobile|tel)/.test(targetNorm) && /phone/.test(whatToTestNorm)) {
+    return /(invalid|incorrect|format|number|digit)/i.test(msgNorm)
+  }
+  if (/\blast\s+name\b/.test(targetNorm) || /\blast\s+name\b/.test(whatToTestNorm)) {
+    return /(last|name|invalid|characters|format|pattern)/i.test(msgNorm)
+  }
+  if (/start\s*date/.test(targetNorm) || /start\s*date/.test(whatToTestNorm)) {
+    return /(start|date|invalid|format)/i.test(msgNorm)
+  }
+  if (/date\s+of\s+birth|\bdob\b/.test(targetNorm) || /date\s+of\s+birth/.test(whatToTestNorm)) {
+    return /(date|birth|invalid|format|age)/i.test(msgNorm)
+  }
+  const ew = tokenizeNormalizedPhrase(expectedNorm)
+  for (let i = 0; i < ew.length - 1; i += 1) {
+    const pair = `${ew[i]} ${ew[i + 1]}`
+    if (pair.length > 4 && msgNorm.includes(pair)) return true
+  }
+  return false
+}
+
+function isGenericRequiredLikeMessage(norm) {
+  const n = String(norm || '').trim()
+  return (
+    /^this field is required/i.test(n) ||
+    /^field is required/i.test(n) ||
+    /^value is required/i.test(n) ||
+    /please (select|choose)/i.test(n) ||
+    /^(an option|a value) must be selected/i.test(n)
+  )
+}
+
+function looksAggregatedDiscoveryLine(norm) {
+  const n = String(norm || '').trim()
+  if (!n) return false
+  const reqCount = (n.match(/\brequired\b/g) || []).length
+  return n.length > 180 || reqCount > 2
+}
+
+/** Pull the human validation line from expected_result (run notes + matching). Supports Displayed/Required/Validation: … and plain "City is required". */
+function extractValidationMessageForRunNotes(expectedResult) {
+  const s = String(expectedResult || '').trim()
+  if (!s) return ''
+  const quoted = s.match(/validation\s*:\s*["'“”]([^"'“”\n]+)["'“”]/i)
+  if (quoted) return quoted[1].trim()
+  const plain = s.match(/validation\s*:\s*([^;\n]+?)(?:\s*;|\s*$)/i)
+  if (plain) return plain[1].replace(/^["'“”\s]+|["'“”\s]+$/g, '').trim()
+  if (!/displayed\s*:|required\s*:/i.test(s) && s.length < 220) return s
+  return ''
+}
+
+/** Require multiple label tokens when the field name has several words (reduces wrong-field matches on long error blobs). */
+function labelStrongMatch(norm, targetNorm) {
+  const parts = sanitizeSearchLabel(targetNorm).split(/\s+/).filter(Boolean)
+  if (!parts.length) return false
+  const need = parts.filter(p => p.length > 1)
+  if (!need.length) return false
+  const hits = need.filter(p => norm.includes(p))
+  if (need.length >= 2) return hits.length >= 2
+  return hits.length === 1
+}
+
+function dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, msgNorm) {
+  if (!/date\s+of\s+birth|dob|birthdate|birth\s+date/.test(targetNorm)) return false
+  if (!/under\s+18|below\s+18|less\s+than\s*18|150|greater\s+than|over\s+150|years?\s+old|too\s+old|too\s+young/i.test(whatToTestNorm)) {
+    return false
+  }
+  if (!/date\s+of\s+birth|dob|birth|age|year|18|150|invalid|required|eligib|minor|adult|allowed|least|most|maximum|minimum/i.test(msgNorm)) {
+    return false
+  }
+  if (expectedNorm && /date\s+of\s+birth/.test(expectedNorm) && /required|invalid/.test(expectedNorm)) {
+    return true
+  }
+  return /invalid|required|age|18|150|year|eligib|minor|allowed|must|least|most|maximum|minimum/.test(msgNorm)
+}
+
+function pickMatchedMessage(entries, expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
+  const targetNorm = sanitizeSearchLabel(targetLabel)
+  const targetEl = targetField?.element
+  const expectedNorm = normalizeLabelText(String(expectedResult || ''))
+  const whatToTestNorm = normalizeLabelText(String(whatToTest || ''))
+  const loginPageSignals = /enter your details|sign in|username or password|invalid username/i
+  const reqish = /required|invalid|must|select|choose|missing|empty|option/i
+
+  const scored = (entries || [])
+    .map(entry => {
+      const norm = normalizeLabelText(entry.text)
+      if (!norm || loginPageSignals.test(norm)) return null
+      const msgEl = entry?.element
+      const associated = Boolean(targetEl && msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+      const textOk3 = messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)
+      const textOk2 = messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)
+      const dobAgeOk = dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, norm)
+      const formatOk = formatValidationLooseMatch(norm, expectedNorm, whatToTestNorm, targetNorm)
+      const textOk = textOk3 || textOk2 || dobAgeOk || formatOk
+      const labelHit = labelStrongMatch(norm, targetNorm)
+      const generic = isGenericRequiredLikeMessage(norm)
+      return { entry, norm, associated, textOk, labelHit, generic, dobAgeOk, formatOk }
+    })
+    .filter(Boolean)
+
+  if (scored.length === 0) return ''
+
+  const multi = scored.length > 1
+  const pick = (pred) => scored.find(pred)
+
+  let hit = pick(
+    c =>
+      c.associated &&
+      (c.textOk ||
+        (c.labelHit && reqish.test(c.norm)) ||
+        (c.generic && (!multi || c.labelHit || c.textOk)))
+  )
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.dobAgeOk && (c.associated || c.labelHit))
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.formatOk && (c.associated || c.labelHit))
+  if (hit) return hit.entry.text
+
+  hit = pick(
+    c =>
+      c.labelHit &&
+      reqish.test(c.norm) &&
+      c.norm.length < 200 &&
+      (!multi || c.associated || c.textOk)
+  )
+  if (hit) return hit.entry.text
+
+  hit = pick(c => c.textOk && c.labelHit && (c.associated || c.norm.length < 96))
+  if (hit) return hit.entry.text
+
+  return ''
+}
+
+function pickMatchedMessageForConditionalRequired(entries, expectedResult, targetLabel = '', targetField = null) {
+  const targetEl = targetField?.element
+  if (!targetEl || !Array.isArray(entries) || entries.length === 0) return ''
+  const validationNeedle = extractValidationMessageForRunNotes(expectedResult)
+  const expectedNorm = normalizeLabelText(String(validationNeedle || expectedResult || ''))
+  const targetNorm = sanitizeSearchLabel(targetLabel)
+  const loginPageSignals = /enter your details|sign in|username or password|invalid username/i
+
+  function scorePool(pool) {
+    return pool
+      .map(({ entry, norm, associated, labelHit }) => {
+        let score = 0
+        if (expectedNorm) {
+          if (messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)) score += 130
+          else if (messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)) score += 90
+        }
+        if (labelHit) score += 75
+        if (associated) score += 55
+        if (isGenericRequiredLikeMessage(norm)) score += targetNorm.length >= 8 ? 8 : 22
+        if (looksAggregatedDiscoveryLine(norm)) score -= 200
+        if (norm.length > 160) score -= 40
+        return { entry, score }
+      })
+      .sort((a, b) => b.score - a.score)
+  }
+
+  let scoped = entries
+    .map(entry => {
+      const norm = normalizeLabelText(entry?.text || '')
+      if (!norm || loginPageSignals.test(norm)) return null
+      const msgEl = entry?.element
+      const associated = Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+      const labelHit = labelStrongMatch(norm, targetNorm)
+      if (!associated && !labelHit) return null
+      return { entry, norm, associated, labelHit }
+    })
+    .filter(Boolean)
+
+  if (scoped.length === 0) {
+    scoped = entries
+      .map(entry => {
+        const norm = normalizeLabelText(entry?.text || '')
+        if (!norm || loginPageSignals.test(norm)) return null
+        const labelHit = labelStrongMatch(norm, targetNorm)
+        if (!labelHit) return null
+        return { entry, norm, associated: false, labelHit }
+      })
+      .filter(Boolean)
+  }
+
+  let ranked = scorePool(scoped)
+  if (!ranked.length || ranked[0].score < 25) {
+    const loose = entries
+      .map(entry => {
+        const norm = normalizeLabelText(entry?.text || '')
+        if (!norm || loginPageSignals.test(norm)) return null
+        const msgEl = entry?.element
+        const associated = Boolean(msgEl && isMessageDomDescendantOfTargetFieldContainer(msgEl, targetEl))
+        const labelHit = labelStrongMatch(norm, targetNorm)
+        return { entry, norm, associated, labelHit }
+      })
+      .filter(Boolean)
+    ranked = scorePool(loose)
+  }
+
+  return ranked[0]?.entry?.text || ''
+}
+
+function dispatchInputEvents(el) {
+  if (!el) return
+  el.dispatchEvent(new Event('input', { bubbles: true }))
+  el.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+function dispatchBlurEvent(el) {
+  if (!el) return
+  el.dispatchEvent(new Event('blur', { bubbles: true }))
+}
+
+function clearFieldValue(el) {
+  if (!el) return
+  const tag = String(el.tagName || '').toLowerCase()
+  const type = String(el.type || '').toLowerCase()
+  if (type === 'radio' || type === 'checkbox') {
+    el.checked = false
+    dispatchInputEvents(el)
+    return
+  }
+  if (tag === 'select') {
+    el.value = ''
+    dispatchInputEvents(el)
+    return
+  }
+  el.value = ''
+  dispatchInputEvents(el)
+}
+
+function forceClearRadioGroupSelection(fieldEl) {
+  const group = collectRadioGroup(fieldEl, fieldEl?.name || '')
+  if (!group.length) return false
+  let changed = false
+  for (const radio of group) {
+    if (radio.checked) changed = true
+    // Use click on a hidden sibling to deselect, then dispatch real events
+    radio.checked = false
+    radio.defaultChecked = false
+    radio.removeAttribute?.('checked')
+    radio.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    radio.dispatchEvent(new Event('change', { bubbles: true }))
+    radio.dispatchEvent(new Event('input', { bubbles: true }))
+    radio.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
+  }
+  const holder = getRadioGroupContainer(fieldEl) || fieldEl?.closest?.('fieldset, .form-group, .field')
+  if (holder) {
+    holder.dispatchEvent(new Event('input', { bubbles: true }))
+    holder.dispatchEvent(new Event('change', { bubbles: true }))
+    holder.dispatchEvent(new Event('blur', { bubbles: true }))
+  }
+  // Also try clicking any visible "deselect" affordance Angular renders
+  const container = getRadioGroupContainer(fieldEl)
+  if (container) {
+    const checked = container.querySelector('input[type="radio"]:checked')
+    if (checked) {
+      checked.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      checked.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+  }
+  return changed
+}
+
+function getRadioGroupContainer(fieldEl) {
+  const group = collectRadioGroup(fieldEl, fieldEl?.name || '')
+  const first = group[0] || fieldEl || null
+  if (!first?.closest) return null
+  return first.closest('formly-wrapper-form-field, formly-field, fieldset, [role="radiogroup"], .form-group, .field')
+}
+
+async function ensureRadioGroupUnselected(fieldEl, attempts = 5) {
+  for (let i = 0; i < attempts; i += 1) {
+    forceClearRadioGroupSelection(fieldEl)
+    await wait(120)
+    const group = collectRadioGroup(fieldEl, fieldEl?.name || '')
+    if (!group.some(r => Boolean(r.checked))) return true
+  }
+  return false
+}
+
+function cssEscapeSafe(value) {
+  try {
+    return CSS.escape(String(value || ''))
+  } catch {
+    return String(value || '').replace(/"/g, '\\"')
+  }
+}
+
+/** True when the control sits in a field row whose own text (not a giant parent step) includes the label. Stops "Live in Rwanda" resolving to First Name. */
+function nearControlMatchesSearchLabel(el, normLabel) {
+  if (!el || !normLabel) return false
+  const fieldWrap =
+    el.closest('formly-wrapper-form-field') ||
+    el.closest('formly-field') ||
+    el.closest('.form-group, .field')
+  if (!fieldWrap) return false
+  let chunk = String(fieldWrap.textContent || '').slice(0, 2000)
+  const prev = fieldWrap.previousElementSibling
+  if (prev && prev.textContent && prev.textContent.length < 500) {
+    const prevTag = String(prev.tagName || '').toLowerCase()
+    const prevCls = String(prev.className || '')
+    if (prevTag === 'label' || /label|legend|form-label|question/i.test(prevCls)) {
+      chunk = `${String(prev.textContent || '')} ${chunk}`
+    }
+  }
+  const near = normalizeLabelText(`${getLabelText(el)} ${chunk}`)
+  return near.includes(normLabel)
+}
+
+function detectFieldKind(el) {
+  if (!el) return 'unknown'
+  const tag = String(el.tagName || '').toLowerCase()
+  const type = String(el.type || '').toLowerCase()
+  const placeholder = normalizeLabelText(el.getAttribute?.('placeholder') || '')
+  if (type === 'radio') return 'radio'
+  if (type === 'file') return 'file'
+  if (tag === 'select') return 'select'
+  if (el.closest('ng-select, .ng-select') || tag === 'ng-select' || el.getAttribute?.('role') === 'combobox') return 'ng-select'
+  if (
+    el.closest(
+      'irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]'
+    ) ||
+    type === 'date' ||
+    placeholder.includes('date')
+  ) {
+    return 'date'
+  }
+  if (tag === 'textarea') return 'textarea'
+  return 'input'
+}
+
+function getLocalFieldTextBlobForScoring(el) {
+  if (!el?.closest) return ''
+  const wrap = el.closest(
+    'formly-wrapper-form-field, formly-field, mat-form-field, .mat-mdc-form-field, fieldset, .form-group, .field'
+  )
+  let chunk = String(wrap?.textContent || '').slice(0, 2400)
+  const prev = wrap?.previousElementSibling
+  if (prev && String(prev.textContent || '').length < 450) {
+    const prevTag = String(prev.tagName || '').toLowerCase()
+    if (prevTag === 'label' || /label|question|legend|form-label/i.test(String(prev.className || ''))) {
+      chunk = `${String(prev.textContent || '')} ${chunk}`
+    }
+  }
+  return normalizeLabelText(`${getLabelText(el)} ${chunk}`)
+}
+
+function minAcceptScoreForDeclaredField(scoreKey) {
+  const S = QA_ENGINE.matching.minAcceptScores
+  const words = significantLabelWords(sanitizeSearchLabel(scoreKey))
+  if (words.length >= 3) return S.threeOrMoreWords
+  if (words.length === 2) return S.twoWords
+  if (words.length === 1) return words[0].length > 6 ? S.oneLongWord : S.oneShortWord
+  return S.fallback
+}
+
+/** How well `el` matches the test case's declared field (label + optional field_name + hint). */
+function scoreFieldTargetCandidate(el, declaredLabelNorm, fieldName, contextHint) {
+  if (!el) return -1e9
+  const blob = getLocalFieldTextBlobForScoring(el)
+  const norm = sanitizeSearchLabel(declaredLabelNorm)
+  const words = significantLabelWords(norm)
+  let s = 0
+  const fn = String(fieldName || '').trim()
+  if (fn) {
+    const wrap = el.closest('formly-field, formly-wrapper-form-field')
+    const key = parseFormlyFieldIdKey(wrap?.id || '')
+    const fnC = fn.toLowerCase().replace(/[^a-z0-9]+/g, '')
+    const keyC = String(key).toLowerCase().replace(/[^a-z0-9]+/g, '')
+    if (fnC && keyC && (keyC === fnC || keyC.includes(fnC) || fnC.includes(keyC))) s += 130
+    const nm = String(el.getAttribute?.('name') || el.name || '').toLowerCase()
+    const fid = String(el.id || '').toLowerCase()
+    if (fnC && (nm.includes(fnC) || fid.includes(fnC))) s += 60
+  }
+  for (const w of words) {
+    if (!w) continue
+    if (blob.includes(w)) s += w.length >= 5 ? 16 : w.length >= 4 ? 12 : 7
+  }
+  if (norm && nearControlMatchesSearchLabel(el, norm)) s += 42
+  if (words.length >= 2) {
+    const allHit = words.every(w => blob.includes(w))
+    if (allHit) s += 48
+    else s -= 22
+  }
+  const stop = new Set([
+    'test',
+    'field',
+    'required',
+    'conditional',
+    'display',
+    'validation',
+    'format',
+    'check',
+    'leave',
+    'enter',
+    'when',
+    'select',
+    'empty',
+    'with',
+    'valid',
+    'values'
+  ])
+  for (const hw of significantLabelWords(sanitizeSearchLabel(String(contextHint || '').slice(0, 260)))) {
+    if (hw.length < 4 || stop.has(hw)) continue
+    if (blob.includes(hw)) s += 5
+  }
+  const wrapLen = String(el.closest('formly-field, formly-wrapper-form-field')?.textContent || '').length
+  if (wrapLen > 5500) s -= 14
+  else if (wrapLen > 0 && wrapLen < 900) s += 6
+  return s
+}
+
+function pickBestFieldTargetFromCandidates(cands, declaredLabelNorm, fieldName, contextHint) {
+  if (!cands.length) return { element: null, kind: 'unknown' }
+  const hint = String(contextHint || '')
+  const scored = cands
+    .map(c => ({
+      ...c,
+      score: scoreFieldTargetCandidate(c.element, declaredLabelNorm, fieldName, hint)
+    }))
+    .sort((a, b) => b.score - a.score)
+  const best = scored[0]
+  const minS = minAcceptScoreForDeclaredField(declaredLabelNorm)
+  if (best.score < minS) {
+    if (best.score < 8) return { element: null, kind: 'unknown' }
+    if (scored.length >= 2 && best.score - scored[1].score < 6) return { element: null, kind: 'unknown' }
+  }
+  if (scored.length >= 2 && best.score - scored[1].score < 8 && scored[1].score >= minS - 4) {
+    const n = sanitizeSearchLabel(declaredLabelNorm)
+    const aNear = nearControlMatchesSearchLabel(best.element, n)
+    const bNear = nearControlMatchesSearchLabel(scored[1].element, n)
+    if (aNear && !bNear) return { element: best.element, kind: best.kind }
+    if (!aNear && bNear) return { element: scored[1].element, kind: scored[1].kind }
+    if (best.score < minS + 12) return { element: null, kind: 'unknown' }
+  }
+  return { element: best.element, kind: best.kind }
+}
+
+/** Every control that plausibly matches `normLabel` (substring / label walk), before global ranking. */
+function gatherFieldTargetsByNorm(normLabel, nameText) {
+  const out = []
+  const seen = new Set()
+  const push = (el, kind) => {
+    if (!el || seen.has(el)) return
+    seen.add(el)
+    out.push({ element: el, kind: kind || detectFieldKind(el) })
+  }
+
+  if (!normLabel) return out
+
+  const labels = Array.from(document.querySelectorAll('label'))
+  for (const labelEl of labels) {
+    const lNorm = normalizeLabelText(labelEl.textContent)
+    if (!lNorm.includes(normLabel)) continue
+    const forId = String(labelEl.getAttribute('for') || '').trim()
+    if (forId) {
+      const byFor = document.getElementById(forId)
+      if (byFor) push(byFor, detectFieldKind(byFor))
+    }
+    const nested = labelEl.querySelector('input, select, textarea, ng-select, .ng-select, div[role="combobox"]')
+    if (nested) push(nested, detectFieldKind(nested))
+    const sib = labelEl.nextElementSibling
+    if (sib?.matches?.('input, select, textarea, ng-select, .ng-select, div[role="combobox"]')) {
+      push(sib, detectFieldKind(sib))
+    }
+  }
+
+  const containerSelector = 'formly-field, formly-wrapper-form-field, irembogov'
+  const innerSelector =
+    'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"], irembogov-custom-date-picker input, irembogov-irembo-date-picker input'
+  const containerCandidates = Array.from(document.querySelectorAll(containerSelector))
+    .filter(container => normLabel && normalizeLabelText(container.textContent).includes(normLabel))
+    .sort(
+      (a, b) =>
+        normalizeLabelText(a.textContent).length - normalizeLabelText(b.textContent).length
+    )
+  for (const container of containerCandidates) {
+    const inners = Array.from(container.querySelectorAll(innerSelector))
+    for (const inner of inners) {
+      if (nearControlMatchesSearchLabel(inner, normLabel)) push(inner, detectFieldKind(inner))
+    }
+  }
+
+  const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
+  for (const radio of radios) {
+    const near = normalizeLabelText(getRadioContextText(radio))
+    if (normLabel && near.includes(normLabel)) push(radio, 'radio')
+  }
+
+  const dateComps = Array.from(
+    document.querySelectorAll(
+      'irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]'
+    )
+  )
+  for (const comp of dateComps) {
+    const near = normalizeLabelText(`${comp.textContent || ''} ${comp.closest('formly-field, formly-wrapper-form-field, .form-group, .field')?.textContent || ''}`)
+    if (normLabel && near.includes(normLabel)) {
+      const input = comp.querySelector('input')
+      if (input) push(input, 'date')
+    }
+  }
+
+  const ngSelects = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+  for (const ngs of ngSelects) {
+    const near = normalizeLabelText(`${ngs.textContent || ''} ${ngs.closest('formly-field, formly-wrapper-form-field, .form-group, .field')?.textContent || ''}`)
+    if (normLabel && near.includes(normLabel)) push(ngs, 'ng-select')
+  }
+
+  const controls = Array.from(document.querySelectorAll('input, textarea, select'))
+  for (const control of controls) {
+    let cur = control
+    for (let depth = 0; depth < 5 && cur; depth += 1) {
+      const lbl = cur.querySelector?.('label')
+      const txt = normalizeLabelText(`${lbl?.textContent || ''} ${cur.textContent || ''}`)
+      if (normLabel && txt.includes(normLabel)) {
+        push(control, detectFieldKind(control))
+        break
+      }
+      cur = cur.parentElement
+    }
+  }
+
+  if (nameText) {
+    const byName = document.querySelector(
+      `input[name="${cssEscapeSafe(nameText)}"], select[name="${cssEscapeSafe(nameText)}"], textarea[name="${cssEscapeSafe(nameText)}"], #${cssEscapeSafe(nameText)}`
+    )
+    if (byName) push(byName, detectFieldKind(byName))
+  }
+
+  return out
+}
+
+function buildSearchTermsForField(fieldLabel, hint) {
+  const primary = sanitizeSearchLabel(fieldLabel)
+  const terms = []
+  const add = t => {
+    const s = sanitizeSearchLabel(t)
+    if (!s || terms.includes(s)) return
+    if (s.length < 4 && s !== primary) return
+    terms.push(s)
+  }
+  add(primary)
+  for (const t of expandLabelSearchTerms(fieldLabel, hint)) add(t)
+  return terms
+}
+
+function resolveFieldTarget(fieldLabel, fieldName, contextHint = '') {
+  const nameText = String(fieldName || '').trim()
+  const hint = `${nameText} ${String(contextHint || '')}`.trim()
+  const declared = sanitizeSearchLabel(fieldLabel)
+
+  const byKey = resolveFieldTargetByFormlyKey(nameText)
+  if (byKey.element) {
+    const ks = scoreFieldTargetCandidate(byKey.element, declared, nameText, hint)
+    if (ks >= 55 || (ks >= 28 && nearControlMatchesSearchLabel(byKey.element, declared))) {
+      return byKey
+    }
+  }
+
+  const locCascade = resolveLocationCascadeChild(fieldLabel, hint)
+  if (locCascade.element) return locCascade
+
+  const natCascade = resolveNationalityCascadeChild(fieldLabel)
+  if (natCascade.element) return natCascade
+
+  const merged = []
+  const seen = new Set()
+  const pushUnique = (el, kind) => {
+    if (!el || seen.has(el)) return
+    seen.add(el)
+    merged.push({ element: el, kind })
+  }
+
+  if (byKey.element) pushUnique(byKey.element, byKey.kind)
+
+  for (const normLabel of buildSearchTermsForField(fieldLabel, hint)) {
+    for (const { element, kind } of gatherFieldTargetsByNorm(normLabel, nameText)) {
+      pushUnique(element, kind)
+    }
+  }
+
+  return pickBestFieldTargetFromCandidates(merged, declared, nameText, hint)
+}
+
+function getControlContainer(el) {
+  if (!el) return null
+  return el.closest('formly-wrapper-form-field, formly-field, .form-group, .field, .ng-star-inserted')
+}
+
+function getRadioContextText(radio) {
+  if (!radio) return ''
+  const own = getLabelText(radio)
+  const container = getControlContainer(radio)
+  const fieldset = radio.closest('fieldset')
+  const legend = fieldset?.querySelector('legend')
+  let nearHeading = ''
+  const holder = fieldset || container
+  if (holder) {
+    const prev = holder.previousElementSibling
+    if (prev && prev.textContent && prev.textContent.length < 300) {
+      const cls = String(prev.className || '')
+      const tag = String(prev.tagName || '').toLowerCase()
+      if (tag === 'label' || tag === 'legend' || /label|legend|question|title|header/i.test(cls)) {
+        nearHeading = String(prev.textContent || '')
+      }
+    }
+  }
+  return `${own} ${legend?.textContent || ''} ${fieldset?.textContent || ''} ${container?.textContent || ''} ${nearHeading}`
+}
+
+function findRadiosForLabel(fieldLabel) {
+  const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
+  for (const norm of expandLabelSearchTerms(fieldLabel)) {
+    if (!norm) continue
+    const matched = radios.filter(radio => {
+      const name = String(radio.name || '').trim()
+      const sameNameGroupText = name
+        ? Array.from(document.querySelectorAll(`input[type="radio"][name="${cssEscapeSafe(name)}"]`))
+            .map(r => getRadioContextText(r))
+            .join(' ')
+        : ''
+      const near = `${getRadioContextText(radio)} ${sameNameGroupText}`
+      return normalizeLabelText(near).includes(norm)
+    })
+    if (matched.length > 0) return matched
+  }
+  return []
+}
+
+function findNgSelectForLabel(fieldLabel) {
+  const comps = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+
+  // For cascade-step labels (district/sector/cell/village/province) all dropdowns
+  // share one wrapper, so container/wrapper text contains every step name and
+  // generic text matching always returns the first ng-select (District). Match
+  // on each dropdown's own placeholder, which is unique per level.
+  const cascadeStep = locationStepFromFieldLabel(fieldLabel)
+  if (cascadeStep) {
+    const stepRe = new RegExp(`\\b${cascadeStep}\\b`, 'i')
+    for (const comp of comps) {
+      const placeholder =
+        comp.querySelector?.('.ng-placeholder')?.textContent ||
+        comp.querySelector?.('input[placeholder]')?.getAttribute('placeholder') ||
+        comp.getAttribute?.('placeholder') || ''
+      if (stepRe.test(normalizeLabelText(placeholder))) return comp
+    }
+    return null
+  }
+
+  for (const norm of expandLabelSearchTerms(fieldLabel)) {
+    if (!norm) continue
+    for (const comp of comps) {
+      const near = `${comp.textContent || ''} ${getControlContainer(comp)?.textContent || ''}`
+      if (normalizeLabelText(near).includes(norm)) return comp
+    }
+  }
+  return null
+}
+
+function findDateInputForLabel(fieldLabel) {
+  const dateComponents = Array.from(
+    document.querySelectorAll(
+      'irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]'
+    )
+  )
+  for (const norm of expandLabelSearchTerms(fieldLabel)) {
+    if (!norm) continue
+    const needsBirth = norm.includes('birth')
+    for (const comp of dateComponents) {
+      const near = `${comp.textContent || ''} ${getControlContainer(comp)?.textContent || ''}`
+      const nearNorm = normalizeLabelText(near)
+      if (!nearNorm.includes(norm) && !(needsBirth && nearNorm.includes('birth'))) continue
+      if (needsBirth && !nearNorm.includes('birth')) continue
+      const input = comp.querySelector('input')
+      if (input) return input
+    }
+    const dateInputs = Array.from(document.querySelectorAll('input[type="date"], input[placeholder*="date" i]'))
+    for (const input of dateInputs) {
+      const near = `${getLabelText(input)} ${getControlContainer(input)?.textContent || ''}`
+      const nearNorm = normalizeLabelText(near)
+      if (!nearNorm.includes(norm) && !(needsBirth && nearNorm.includes('birth'))) continue
+      if (needsBirth && !nearNorm.includes('birth')) continue
+      return input
+    }
+  }
+  return null
+}
+
+function formatDateDmy(date) {
+  const d = String(date.getDate()).padStart(2, '0')
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const y = String(date.getFullYear())
+  return `${d}/${m}/${y}`
+}
+
+function getSafeDateFallbackValue() {
+  // Keep adult-safe default but avoid one fixed hardcoded date.
+  const d = new Date()
+  d.setFullYear(d.getFullYear() - 30)
+  return formatDateDmy(d)
+}
+
+function isPickerCellVisible(el) {
+  if (!el) return false
+  const style = window.getComputedStyle(el)
+  if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false
+  return el.getClientRects().length > 0
+}
+
+function isLikelyDobInput(inputEl) {
+  const blob = normalizeLabelText(
+    `${getLabelText(inputEl)} ${inputEl?.name || ''} ${inputEl?.id || ''} ${inputEl?.placeholder || ''} ${getControlContainer(inputEl)?.textContent || ''}`
+  )
+  return /\b(date of birth|dob|birth)\b/.test(blob)
+}
+
+function parseDateAny(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const dmy = raw.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/)
+  if (dmy) {
+    const d = Number(dmy[1])
+    const m = Number(dmy[2])
+    const y = Number(dmy[3])
+    const dt = new Date(y, m - 1, d)
+    if (dt && dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d) return dt
+  }
+  const ymd = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/)
+  if (ymd) {
+    const y = Number(ymd[1])
+    const m = Number(ymd[2])
+    const d = Number(ymd[3])
+    const dt = new Date(y, m - 1, d)
+    if (dt && dt.getFullYear() === y && dt.getMonth() === m - 1 && dt.getDate() === d) return dt
+  }
+  const dt = new Date(raw)
+  return Number.isNaN(dt.getTime()) ? null : dt
+}
+
+function isAdultDate(value, minAge = 18) {
+  const dt = parseDateAny(value)
+  if (!dt) return false
+  const cutoff = new Date()
+  cutoff.setFullYear(cutoff.getFullYear() - minAge)
+  return dt <= cutoff
+}
+
+function isCustomDatePickerInput(inputEl) {
+  return Boolean(
+    inputEl?.closest?.(
+      'irembogov-custom-date-picker, irembogov-irembo-date-picker'
+    )
+  )
+}
+
+async function setCustomDatePickerValue(inputEl, dateString) {
+  if (!inputEl) return false
+  const next = String(dateString || '').trim()
+  inputEl.click?.()
+  inputEl.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+  setInputValueNative(inputEl, next)
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+  inputEl.dispatchEvent(new Event('change', { bubbles: true }))
+  inputEl.dispatchEvent(new Event('blur', { bubbles: true }))
+  inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }))
+  inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
+  await wait(300)
+  return String(inputEl.value || '').trim() === next
+}
+
+async function clearCustomDatePickerValue(inputEl) {
+  if (!inputEl) return false
+  const host =
+    inputEl.closest('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+    inputEl.parentElement
+
+  // Step 1: focus and select-all then delete
+  inputEl.dispatchEvent(new FocusEvent('focus', { bubbles: true }))
+  inputEl.click?.()
+  await wait(80)
+  inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', ctrlKey: true, bubbles: true }))
+  await wait(40)
+  inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Delete', bubbles: true }))
+  inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Backspace', bubbles: true }))
+  await wait(40)
+
+  // Step 2: native value setter (bypasses Angular value accessor for the display input)
+  const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+  if (descriptor?.set) descriptor.set.call(inputEl, '')
+  else inputEl.value = ''
+
+  // Step 3: fire full Angular event sequence
+  inputEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }))
+  inputEl.dispatchEvent(new Event('change', { bubbles: true }))
+  inputEl.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
+  inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Backspace', bubbles: true }))
+
+  // Step 4: clear all related inputs inside the host (day/month/year splits)
+  const related = Array.from(host?.querySelectorAll?.('input') || [])
+  for (const inp of related) {
+    if (descriptor?.set) descriptor.set.call(inp, '')
+    else inp.value = ''
+    inp.removeAttribute?.('value')
+    inp.dispatchEvent(new Event('input', { bubbles: true }))
+    inp.dispatchEvent(new Event('change', { bubbles: true }))
+    inp.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
+  }
+
+  // Step 5: click outside to close any open picker panel
+  document.body?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await wait(350)
+
+  const allClear = String(inputEl.value || '').trim() === '' &&
+    related.every(inp => String(inp.value || '').trim() === '')
+  return allClear
+}
+
+function formatDateIso(date) {
+  const y = String(date.getFullYear())
+  const m = String(date.getMonth() + 1).padStart(2, '0')
+  const d = String(date.getDate()).padStart(2, '0')
+  return `${y}-${m}-${d}`
+}
+
+function setInputValueNative(input, value) {
+  if (!input) return
+  const descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+  if (descriptor?.set) {
+    descriptor.set.call(input, String(value || ''))
+  } else {
+    input.value = String(value || '')
+  }
+}
+
+function commitDateValueToControl(inputEl, host, displayValue) {
+  const parsed = parseDateAny(displayValue)
+  const display = String(displayValue || '')
+  const iso = parsed ? formatDateIso(parsed) : ''
+  const scope = host || inputEl?.parentElement || inputEl
+  const related = Array.from(scope?.querySelectorAll?.('input') || [])
+  const targets = related.length ? related : [inputEl]
+  for (const inp of targets) {
+    if (!inp) continue
+    const isHidden = String(inp.type || '').toLowerCase() === 'hidden'
+    const next = isHidden && iso ? iso : display
+    setInputValueNative(inp, next)
+    inp.setAttribute?.('value', next)
+    dispatchInputEvents(inp)
+    inp.dispatchEvent(new Event('keyup', { bubbles: true }))
+    inp.dispatchEvent(new Event('focusout', { bubbles: true }))
+    dispatchBlurEvent(inp)
+  }
+  if (inputEl && inputEl !== targets[0]) {
+    setInputValueNative(inputEl, display)
+    inputEl.setAttribute?.('value', display)
+    dispatchInputEvents(inputEl)
+    dispatchBlurEvent(inputEl)
+  }
+}
+
+async function setDateValuePreferPicker(inputEl, fallbackValue = '') {
+  if (!inputEl) return false
+  const safeFallback = fallbackValue || getSafeDateFallbackValue()
+  const dobInput = isLikelyDobInput(inputEl)
+  scrollTestTargetIntoView(inputEl)
+  inputEl.focus?.()
+  inputEl.click?.()
+  dispatchInputEvents(inputEl)
+  await wait(220)
+
+  const host =
+    inputEl.closest('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+    inputEl.parentElement
+  const trigger =
+    host?.querySelector?.(
+      'button, [role="button"], .calendar, .calendar-icon, [class*="calendar"], [aria-label*="calendar" i], [title*="calendar" i]'
+    ) || null
+  if (trigger) {
+    trigger.click?.()
+    await wait(180)
+  } else {
+    inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+    await wait(120)
+  }
+
+  const daySelectors = QA_ENGINE.selectors.datePickerDayCells
+  const dayCells = Array.from(document.querySelectorAll(daySelectors.join(', '))).filter(isPickerCellVisible)
+  const pickable = dayCells.find(cell => {
+    const t = String(cell.textContent || '').trim()
+    if (!/^\d{1,2}$/.test(t)) return false
+    const cls = String(cell.className || '')
+    const disabled = cell.getAttribute?.('aria-disabled') === 'true' || cell.hasAttribute?.('disabled')
+    return !disabled && !/disabled|off|outside|muted|other-month/i.test(cls)
+  })
+  if (pickable) {
+    const clickTarget = pickable.querySelector?.('button, [role="button"]') || pickable
+    clickTarget.click?.()
+    await wait(260)
+    if (String(inputEl.value || '').trim()) {
+      if (dobInput && !isAdultDate(inputEl.value, 18)) {
+        commitDateValueToControl(inputEl, host, safeFallback)
+      } else {
+        commitDateValueToControl(inputEl, host, String(inputEl.value || '').trim())
+      }
+      document.body?.click?.()
+      await wait(120)
+      return true
+    }
+  }
+
+  commitDateValueToControl(inputEl, host, safeFallback)
+  document.body?.click?.()
+  return Boolean(String(inputEl.value || '').trim())
+}
+
+// Alias to the (remote-tunable) engine config; applyQaEngineConfig mutates the
+// array in place, so this alias always reflects the latest backend settings.
+const LOCATION_CASCADE_STEPS = QA_ENGINE.locationCascadeSteps
+
+/** Earliest location keyword in the field wrapper reading order (district before sector, …). */
+function primaryLocationStepForControl(el) {
+  if (!el) return ''
+
+  // Check this element's own placeholder first — most reliable for cascade dropdowns
+  // where all levels share one wrapper (container text contains all level names).
+  const placeholder =
+    el.querySelector?.('.ng-placeholder')?.textContent ||
+    el.querySelector?.('input[placeholder]')?.getAttribute('placeholder') ||
+    el.getAttribute?.('placeholder') || ''
+  const placeholderNorm = normalizeLabelText(placeholder)
+  for (const w of LOCATION_CASCADE_STEPS) {
+    if (new RegExp(`\\b${w}\\b`, 'i').test(placeholderNorm)) return w
+  }
+
+  // Fallback: check the wrapper text
+  if (!el?.closest) return ''
+  const wrap = el.closest('formly-field, formly-wrapper-form-field') || getControlContainer(el)
+  const lower = String(wrap?.textContent || '').slice(0, 800).toLowerCase()
+  let bestPos = 1e9
+  let best = ''
+  for (const w of LOCATION_CASCADE_STEPS) {
+    const re = new RegExp(`\\b${w}\\b`, 'i')
+    const idx = lower.search(re)
+    if (idx >= 0 && idx < bestPos) {
+      bestPos = idx
+      best = w
+    }
+  }
+  return best
+}
+
+function primaryLocationTierIndex(el) {
+  const step = primaryLocationStepForControl(el)
+  const idx = LOCATION_CASCADE_STEPS.indexOf(step)
+  return idx >= 0 ? idx : 999
+}
+
+/** True when this ng-select/combobox sits in a district/sector/cell/village (or province) cascade row. */
+function isLocationCascadeSelectRoot(root) {
+  if (!root) return false
+  const step = primaryLocationStepForControl(root)
+  return Boolean(step && LOCATION_CASCADE_STEPS.includes(step))
+}
+
+/**
+ * Next unfilled step in the location chain only (lowest tier first), up to the tier under test.
+ * Does not touch unrelated dropdowns (nationality, etc.).
+ */
+function pickNextLocationCascadeDropdown(fieldLabel) {
+  const wantStep = locationStepFromFieldLabel(fieldLabel)
+  const maxTier = wantStep && LOCATION_CASCADE_STEPS.includes(wantStep)
+    ? LOCATION_CASCADE_STEPS.indexOf(wantStep)
+    : LOCATION_CASCADE_STEPS.length - 1
+
+  const ranked = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]'))
+    .filter(el => isVisible(el) && ngSelectRootAppearsUnselected(el))
+    .map(el => {
+      const step = primaryLocationStepForControl(el)
+      const tier =
+        step && LOCATION_CASCADE_STEPS.includes(step) ? LOCATION_CASCADE_STEPS.indexOf(step) : 999
+      return {
+        el,
+        tier,
+        top: Number(el.getBoundingClientRect?.().top ?? 0)
+      }
+    })
+    .filter(x => x.tier < 999 && x.tier <= maxTier)
+    .sort((a, b) => a.tier - b.tier || a.top - b.top)
+
+  return ranked[0]?.el || null
+}
+
+/** Which location tier this test targets (e.g. "Sector" → sector). */
+function locationStepFromFieldLabel(fieldLabel) {
+  const lower = normalizeText(String(fieldLabel || ''))
+  let bestPos = 1e9
+  let best = ''
+  for (const w of LOCATION_CASCADE_STEPS) {
+    const re = new RegExp(`\\b${w}\\b`, 'i')
+    const idx = lower.search(re)
+    if (idx >= 0 && idx < bestPos) {
+      bestPos = idx
+      best = w
+    }
+  }
+  return best
+}
+
+/** True when resolved control is the intended cascade row (not an earlier dropdown). */
+function resolvedTargetMatchesLocationStep(fieldLabel, target) {
+  const want = locationStepFromFieldLabel(fieldLabel)
+  if (!want) return true
+  const el = target?.element
+  if (!el) return false
+  const got = primaryLocationStepForControl(el)
+  if (!got) return false
+  return got.toLowerCase() === want.toLowerCase()
+}
+
+async function resolveTargetWithTypeHints(fieldLabel, fieldName, options = {}) {
+  let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
+    return target
+  }
+
+  const hintedRadios = findRadiosForLabel(fieldLabel)
+  if (hintedRadios.length > 0) return { element: hintedRadios[0], kind: 'radio' }
+
+  const hintedDate = findDateInputForLabel(fieldLabel)
+  if (hintedDate) return { element: hintedDate, kind: 'date' }
+
+  const hintedNg = findNgSelectForLabel(fieldLabel)
+  if (
+    hintedNg &&
+    resolvedTargetMatchesLocationStep(fieldLabel, { element: hintedNg, kind: 'ng-select' })
+  ) {
+    return { element: hintedNg, kind: 'ng-select' }
+  }
+
+  const byCascadeChain = await resolveWithCascadeChain(fieldLabel, fieldName, options)
+  if (byCascadeChain.element && resolvedTargetMatchesLocationStep(fieldLabel, byCascadeChain)) {
+    return byCascadeChain
+  }
+  if (target.element && resolvedTargetMatchesLocationStep(fieldLabel, target)) {
+    return target
+  }
+  if (byCascadeChain.element) return byCascadeChain
+  return target
+}
+
+async function resolveWithCascadeChain(fieldLabel, fieldName, options = {}) {
+  let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
+    return target
+  }
+
+  const maxDepth = Number(options?.maxCascadeDepth || 14)
+  let lastSuccessfulSelect = false
+
+  for (let i = 0; i < maxDepth; i += 1) {
+    const next = pickNextLocationCascadeDropdown(fieldLabel)
+    if (!next) break
+
+    scrollTestTargetIntoView(next)
+    await wait(80)
+
+    // Wait for this dropdown to be enabled (not disabled/loading)
+    let enabledAndReady = false
+    for (let readyCheck = 0; readyCheck < 20; readyCheck += 1) {
+      const isDisabled =
+        next.hasAttribute('disabled') ||
+        next.getAttribute('aria-disabled') === 'true' ||
+        next.classList.contains('ng-select-disabled') ||
+        String(next.getAttribute('class') || '').includes('disabled')
+      const hasPlaceholder = Boolean(
+        next.querySelector('.ng-placeholder') &&
+        isVisible(next.querySelector('.ng-placeholder'))
+      )
+      const alreadySelected = !ngSelectRootAppearsUnselected(next)
+      if ((!isDisabled && hasPlaceholder) || alreadySelected) {
+        enabledAndReady = true
+        break
+      }
+      await wait(300)
+    }
+
+    if (!enabledAndReady) {
+      // Dropdown never became ready — chain is stuck
+      break
+    }
+
+    // Skip if already has a selection
+    if (!ngSelectRootAppearsUnselected(next)) {
+      target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
+      if (
+        target.element &&
+        isVisible(target.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, target)
+      ) {
+        return target
+      }
+      continue
+    }
+
+    lastSuccessfulSelect = await selectFirstNonEmptyNgSelect(next)
+
+    if (!lastSuccessfulSelect) {
+      // Options never loaded for this level — stop here,
+      // don't try deeper levels that depend on this one
+      break
+    }
+
+    // After selecting, wait for the next level to unlock
+    await wait(500)
+
+    target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options)
+    if (
+      target.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
+      return target
+    }
+  }
+
+  return target
+}
+
+function dropdownAppearsUnselected(el) {
+  const tag = String(el?.tagName || '').toLowerCase()
+  if (tag === 'select') {
+    const value = String(el.value || '').trim()
+    return !value
+  }
+  const root = el.closest?.('ng-select, .ng-select, [role="combobox"]') || el
+  const placeholderVisible = Array.from(root.querySelectorAll('.ng-placeholder')).some(isVisible)
+  if (placeholderVisible) return true
+  const valueContainer = root.querySelector('.ng-value-container')
+  const hasValue = Boolean(valueContainer && normalizeLabelText(valueContainer.textContent || ''))
+  return !hasValue
+}
+
+function pickVisibleCascadeDropdowns() {
+  const nodes = Array.from(
+    document.querySelectorAll('ng-select, .ng-select, div[role="combobox"], select')
+  ).filter(el => isVisible(el) && dropdownAppearsUnselected(el))
+  return nodes.sort((a, b) => {
+    const ta = Number(a.getBoundingClientRect?.().top ?? 0)
+    const tb = Number(b.getBoundingClientRect?.().top ?? 0)
+    return ta - tb
+  })
+}
+
+async function resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, contextHint = '') {
+  for (let iteration = 0; iteration < 10; iteration += 1) {
+    const target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+      allowContinue: false,
+      contextHint
+    })
+    if (
+      target?.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
+      return target
+    }
+
+    const nextLoc = pickNextLocationCascadeDropdown(fieldLabel)
+    if (nextLoc) {
+      scrollTestTargetIntoView(nextLoc)
+      await wait(45)
+      await selectFirstNonEmptyNgSelect(nextLoc)
+      await wait(500)
+      const checkLoc = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+        allowContinue: false,
+        contextHint
+      })
+      if (
+        checkLoc?.element &&
+        isVisible(checkLoc.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, checkLoc)
+      ) {
+        return checkLoc
+      }
+      continue
+    }
+
+    const dropdowns = pickVisibleCascadeDropdowns()
+      .filter(dd => !isLocationCascadeSelectRoot(dd))
+      .map(el => ({ el, tier: primaryLocationTierIndex(el), top: Number(el.getBoundingClientRect?.().top ?? 0) }))
+      .sort((a, b) => a.tier - b.tier || a.top - b.top)
+      .map(x => x.el)
+    const dd = dropdowns[0]
+    if (!dd) continue
+    const tag = String(dd.tagName || '').toLowerCase()
+    if (tag === 'select') {
+      const opts = Array.from(dd.options || [])
+      const nonEmpty = opts.find(opt => String(opt.value || '').trim())
+      if (nonEmpty) {
+        dd.value = nonEmpty.value
+        dispatchInputEvents(dd)
+      }
+    } else {
+      await selectFirstNonEmptyNgSelect(dd)
+    }
+    await wait(500)
+    const check = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+      allowContinue: false,
+      contextHint
+    })
+    if (
+      check?.element &&
+      isVisible(check.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, check)
+    ) {
+      return check
+    }
+  }
+  return { element: null, kind: 'unknown' }
+}
+
+function stripConditionalClause(label) {
+  return String(label || '')
+    .replace(/\s+if\s+.+$/i, '')
+    .replace(/\s+when\s+.+$/i, '')
+    .replace(/\s+\(if\s+.+\)$/i, '')
+    .trim()
+}
+
+function collectRadioGroup(fieldEl, fieldName) {
+  const name = String(fieldEl?.name || fieldName || '').trim()
+  if (name) {
+    const byName = Array.from(document.querySelectorAll(`input[type="radio"][name="${cssEscapeSafe(name)}"]`))
+    if (byName.length) return byName
+  }
+  if (fieldEl?.id) {
+    const maybeSame = Array.from(document.querySelectorAll(`input[type="radio"]#${cssEscapeSafe(fieldEl.id)}`))
+    if (maybeSame.length) return maybeSame
+  }
+  const container = fieldEl?.closest?.('formly-wrapper-form-field, formly-field, fieldset, .form-group, .field')
+  if (container) {
+    const local = Array.from(container.querySelectorAll('input[type="radio"]'))
+    if (local.length) return local
+  }
+  return fieldEl && fieldEl.type === 'radio' ? [fieldEl] : []
+}
+
+function findContinueButton() {
+  const allButtons = Array.from(document.querySelectorAll('button'))
+  const exactContinue = allButtons.find(btn => String(btn.textContent || '').trim() === 'Continue')
+  if (exactContinue) return exactContinue
+  const exactNext = allButtons.find(btn => String(btn.textContent || '').trim() === 'Next')
+  if (exactNext) return exactNext
+  const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]')
+  if (submitBtn) return submitBtn
+  return allButtons.find(btn => /continue|next/i.test(String(btn.textContent || '').trim())) || null
+}
+
+/** Format-validation: only messages tied to the target field container (directly below / in same wrapper). */
+function pickMatchedMessageForFormatValidation(entries, expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
+  const expectedNorm = normalizeLabelText(String(expectedResult || ''))
+  const whatToTestNorm = normalizeLabelText(String(whatToTest || ''))
+  const targetNorm = sanitizeSearchLabel(targetLabel)
+  const targetEl = targetField?.element
+
+  const scoped = (entries || []).filter(entry => {
+    if (!entry?.text || !targetEl || !entry?.element) return false
+    return isMessageDomDescendantOfTargetFieldContainer(entry.element, targetEl)
+  })
+
+  if (scoped.length === 0) {
+    return { matched: '', belowField: false }
+  }
+
+  for (const entry of scoped) {
+    const norm = normalizeLabelText(entry.text)
+    if (!norm) continue
+    if (expectedNorm && (norm === expectedNorm || norm.includes(expectedNorm) || expectedNorm.includes(norm))) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (messageContainsThreeConsecutiveWordsFromExpected(norm, expectedNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (messageContainsTwoConsecutiveWordsFromExpected(norm, expectedNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (dobAgeFormatMessageMatch(targetNorm, expectedNorm, whatToTestNorm, norm)) {
+      return { matched: entry.text, belowField: true }
+    }
+    if (formatValidationLooseMatch(norm, expectedNorm, whatToTestNorm, targetNorm)) {
+      return { matched: entry.text, belowField: true }
+    }
+  }
+
+  return { matched: '', belowField: true }
+}
+
+async function clickContinueAndReadFieldScopedFormatError(
+  expectedResult,
+  targetLabel = '',
+  targetField = null,
+  whatToTest = '',
+  valueHostEl = null
+) {
+  const button = findContinueButton()
+  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  const urlBefore = String(location.href || '')
+  const anchorEl = valueHostEl || targetField?.element || null
+  const sectionEl = anchorEl?.closest?.(
+    'formly-group, formly-field, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field'
+  ) || null
+  scrollTestTargetIntoView(button)
+  await wait(280)
+  button.click()
+  const entries = await getVisibleValidationEntriesWithRetry()
+  const probeField = valueHostEl
+    ? { element: valueHostEl, kind: targetField?.kind }
+    : targetField
+  const { matched, belowField } = pickMatchedMessageForFormatValidation(
+    entries,
+    expectedResult,
+    targetLabel,
+    probeField,
+    whatToTest
+  )
+  const sectionAdvanced = detectFormAdvanced(urlBefore, sectionEl)
+  return {
+    ok: true,
+    matched,
+    belowField,
+    sectionAdvanced,
+    messages: entries.map(e => e.text)
+  }
+}
+
+async function clickContinueAndReadErrors(expectedResult, targetLabel = '', targetField = null, whatToTest = '') {
+  const button = findContinueButton()
+  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  // Snapshot so we can detect an unintended section advance — e.g. when the
+  // field we cleared / set-invalid didn't actually block submit and Continue
+  // moved the form on. detectFormAdvanced checks both URL change and whether
+  // the captured section element is no longer visible.
+  const urlBefore = String(location.href || '')
+  const sectionEl = targetField?.closest?.(
+    'formly-group, formly-field, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field'
+  ) || null
+  scrollTestTargetIntoView(button)
+  await wait(280)
+  button.click()
+  const entries = await getVisibleValidationEntriesWithRetry()
+  const matched = pickMatchedMessage(entries, expectedResult, targetLabel, targetField, whatToTest)
+  const sectionAdvanced = detectFormAdvanced(urlBefore, sectionEl)
+  return { ok: true, messages: entries.map(e => e.text), matched, sectionAdvanced }
+}
+
+function getInvalidValueForFormat(tc) {
+  const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+
+  // Age / DOB minimum (e.g. "must make applicant above 18 years old") → too-young date.
+  const isAgeRule =
+    /\bdate of birth\b|\bdob\b|\bage\b/.test(text) ||
+    /\babove\s+18\b|18\s*years?\s*old|minimum\s+(?:age\s+)?18|must\s+make\s+applicant\s+above/i.test(text) ||
+    /\d{1,3}\s*(?:years?|yrs?)\s*(?:or older|and above|old|of age)/.test(text) ||
+    /(?:older than|at least|minimum|min\.?|over)\s*\d{1,3}\s*(?:years?|yrs?)/.test(text) ||
+    /\b\d{1,3}\s*(?:or older|and above|or above)\b/.test(text)
+  if (isAgeRule) {
+    // Parse the age threshold N from the rule text — NO fixed assumption. A DOB that makes
+    // the applicant age N-1 (one year under) violates "above/at least N". If no number is
+    // present, fall back to age 0 (today), which violates any positive minimum without
+    // inventing a threshold. Date is relative to TODAY, formatted DD/MM/YYYY (the form's order).
+    const nMatch =
+      text.match(/(?:above|over|older\s+than|at\s+least|min(?:imum)?\.?|>=?)\s*(\d{1,3})\s*(?:years?|yrs?)?/) ||
+      text.match(/(\d{1,3})\s*(?:years?|yrs?)\s*(?:or\s+older|and\s+above|or\s+above|old|of\s+age)/) ||
+      text.match(/\b(\d{1,3})\s*(?:years?|yrs?)\b/)
+    const n = nMatch ? Number(nMatch[1]) : 0
+    const yearsBack = n > 0 ? Math.max(0, n - 1) : 0
+    const d = new Date()
+    d.setFullYear(d.getFullYear() - yearsBack)
+    return formatDateDmy(d)
+  }
+
+  // Exact digit length (e.g. "ID Number must be 16 digits") → too few digits.
+  const exactDigits =
+    text.match(/(?:must\s+be|exactly|length\s+of)\s*(\d+)\s*digits?/) ||
+    text.match(/(\d+)\s*digits?\s*(?:long|only|exact|required)/) ||
+    text.match(/\b(\d+)\s*-?\s*digit\b/)
+  if (exactDigits) {
+    const n = Number(exactDigits[1])
+    if (Number.isFinite(n) && n > 1) {
+      return '1'.repeat(Math.max(1, Math.min(5, n - 1)))
+    }
+  }
+
+  // "maximum N characters" → a string longer than N.
+  const maxChars = text.match(/(?:max(?:imum)?|no more than|at most|up to|not exceed(?:ing)?)\s*(\d+)\s*(?:characters?|chars?|letters?|digits?)/)
+  if (maxChars) return 'A'.repeat(Number(maxChars[1]) + 5)
+
+  // "letters only" / "no numbers" → enter digits.
+  if (/letters?\s*only|alphabetic|alphabetical|only\s*letters?|no\s*(?:numbers?|digits?)/.test(text)) return QA_ENGINE.invalidValues.lettersOnlyViolation
+
+  // "numbers only" / "no letters" → enter letters.
+  if (/numbers?\s*only|numeric\s*only|digits?\s*only|only\s*(?:numbers?|digits?)|no\s*letters?/.test(text)) return QA_ENGINE.invalidValues.numbersOnlyViolation
+
+  // "N digits" (e.g. "must be 10 digits") → too short.
+  const digitCount = text.match(/(\d+)\s*digits?/)
+  if (digitCount) {
+    const n = Number(digitCount[1])
+    return '1'.repeat(Math.max(1, Math.min(3, n - 1)))
+  }
+
+  // Email.
+  if (/valid\s*email|email\s*format|e-?mail/.test(text)) return QA_ENGINE.invalidValues.email
+
+  // Phone.
+  if (/phone|mobile|tel(?:ephone)?/.test(text)) return QA_ENGINE.invalidValues.phone
+
+  // Fallback — letters + numbers + symbols to break most rules.
+  return QA_ENGINE.invalidValues.fallback
+}
+
+function findClickToUploadElementNear(root) {
+  if (!root) return null
+  const roots = [root]
+  const parent = root.parentElement
+  if (parent) roots.push(parent)
+  const formly = root.closest?.('formly-field, formly-wrapper-form-field')
+  if (formly) roots.push(formly)
+  for (const r of roots) {
+    const candidates = Array.from(
+      r.querySelectorAll('button, a, div, span, label, p, [role="button"], [class*="upload"]')
+    )
+    for (const el of candidates) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase()
+      if (
+        t.includes('click to upload') ||
+        t.includes('click here to upload') ||
+        t.includes('drag and drop') ||
+        t === 'upload' ||
+        /\bupload\b/.test(t) && t.length < 40
+      ) {
+        return el
+      }
+    }
+  }
+  return null
+}
+
+async function openAttachmentUploadModal(attachmentInput) {
+  const container = getAttachmentContainer(attachmentInput)
+  const trigger = findClickToUploadElementNear(container)
+  if (!trigger) return false
+  scrollTestTargetIntoView(trigger)
+  await wait(120)
+  trigger.click()
+  await wait(220)
+  return true
+}
+
+// Alias to the (remote-tunable) engine config — compiled RegExp objects,
+// refreshed in place when a remote config is applied.
+const UPLOAD_SOURCE_MENU_PATTERNS = QA_ENGINE.uploadSourceMenuPatterns
+
+function findVisibleUploadModals() {
+  const selectors = [
+    'ngb-modal-window',
+    'mat-dialog-container',
+    '.cdk-overlay-pane',
+    '.modal.show',
+    '.modal-dialog',
+    '[role="dialog"]',
+    '.modal',
+    '[class*="modal"]',
+    '[class*="popup"]'
+  ].join(', ')
+  return Array.from(document.querySelectorAll(selectors)).filter(el => {
+    if (!isVisible(el)) return false
+    const rect = el.getBoundingClientRect()
+    return rect.width > 80 && rect.height > 80
+  })
+}
+
+function elementMatchesUploadSource(el, sourceKey) {
+  const patterns = UPLOAD_SOURCE_MENU_PATTERNS[sourceKey]
+  if (!patterns) return false
+  const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+  if (!t || t.length > 140) return false
+  return patterns.some(p => p.test(t))
+}
+
+function findUploadSourceOptionEl(searchRoot, sourceKey) {
+  const root = searchRoot || document.body
+  const candidates = Array.from(
+    root.querySelectorAll(
+      'button, a, div, span, p, li, [role="button"], [role="menuitem"], label, .card, [class*="option"], [class*="choice"]'
+    )
+  )
+  let best = null
+  let bestLen = Infinity
+  for (const el of candidates) {
+    if (!isVisible(el)) continue
+    if (!elementMatchesUploadSource(el, sourceKey)) continue
+    const len = String(el.textContent || '').trim().length
+    if (len < bestLen) {
+      bestLen = len
+      best = el
+    }
+  }
+  return best
+}
+
+function modalHasUploadSourceMenu(modal) {
+  return Object.keys(UPLOAD_SOURCE_MENU_PATTERNS).some(key => Boolean(findUploadSourceOptionEl(modal, key)))
+}
+
+async function waitForUploadSourceModal(timeoutMs = 4500) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    for (const modal of findVisibleUploadModals()) {
+      if (modalHasUploadSourceMenu(modal)) return modal
+    }
+    await wait(120)
+  }
+  return null
+}
+
+async function clickUploadSourceOption(sourceKey, modalHint = null) {
+  const roots = []
+  if (modalHint) roots.push(modalHint)
+  for (const m of findVisibleUploadModals()) roots.push(m)
+  roots.push(document.body)
+  const seen = new Set()
+  for (const root of roots) {
+    if (!root || seen.has(root)) continue
+    seen.add(root)
+    const option = findUploadSourceOptionEl(root, sourceKey)
+    if (!option) continue
+    scrollTestTargetIntoView(option)
+    await wait(80)
+    option.click()
+    await wait(380)
+    return true
+  }
+  return false
+}
+
+function isUploadSourceMenuLabel(text) {
+  const t = String(text || '').toLowerCase()
+  return (
+    t.includes('previous uploaded') ||
+    t.includes('my certificates') ||
+    t.includes('upload from device') ||
+    t.includes('from device')
+  )
+}
+
+async function pickFirstPreviousUploadedDocument() {
+  await wait(280)
+  const modals = findVisibleUploadModals()
+  const roots = modals.length ? modals : [document.body]
+  for (const root of roots) {
+    const candidates = Array.from(
+      root.querySelectorAll(
+        'button, a, [role="button"], li, tr, .list-group-item, [class*="document"], [class*="file-item"], [class*="row"], label, [class*="card"]'
+      )
+    ).filter(el => {
+      if (!isVisible(el)) return false
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      if (!t || t.length < 4 || t.length > 220) return false
+      if (isUploadSourceMenuLabel(t)) return false
+      if (/^(cancel|close|back|ok|done|select|confirm)$/i.test(t)) return false
+      return true
+    })
+    for (const el of candidates) {
+      scrollTestTargetIntoView(el)
+      await wait(80)
+      el.click()
+      await wait(420)
+      return true
+    }
+  }
+  return false
+}
+
+function findActiveFileInput(attachmentInput) {
+  for (const modal of findVisibleUploadModals()) {
+    const inp = modal.querySelector('input[type="file"]')
+    if (inp && !inp.disabled && !inp.readOnly) return inp
+  }
+  const all = Array.from(document.querySelectorAll('input[type="file"]')).filter(el => !el.disabled && !el.readOnly)
+  if (attachmentInput && all.includes(attachmentInput)) return attachmentInput
+  if (all.length === 1) return all[0]
+  return attachmentInput || all[0] || null
+}
+
+function resolveUploadSourcePreference(kind, tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (kind === 'invalid_format' || kind === 'size_limit') return 'device'
+  if (/previous\s+uploaded|existing\s+document|from\s+library|previously\s+uploaded/.test(text)) return 'previous'
+  if (kind === 'required') return 'none'
+  return 'auto'
+}
+
+/**
+ * Irembo upload flow: Click to upload → modal (Previous uploaded documents /
+ * My certificates / Upload from device) → pick source → optional file inject.
+ */
+async function prepareAttachmentUpload(attachmentInput, kind, tc) {
+  const preference = resolveUploadSourcePreference(kind, tc)
+
+  if (preference === 'none') {
+    const fileInput = findActiveFileInput(attachmentInput)
+    if (fileInput) {
+      fileInput.value = ''
+      fileInput.dispatchEvent(new Event('input', { bubbles: true }))
+      fileInput.dispatchEvent(new Event('change', { bubbles: true }))
+    }
+    return { ok: true, source: 'none', fileInput }
+  }
+
+  const opened = await openAttachmentUploadModal(attachmentInput)
+  const modal = opened ? await waitForUploadSourceModal() : null
+
+  if (!modal) {
+    return { ok: true, source: 'direct', fileInput: findActiveFileInput(attachmentInput) }
+  }
+
+  if (preference === 'device') {
+    const picked = await clickUploadSourceOption('device', modal)
+    return { ok: picked, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+  }
+
+  if (preference === 'previous') {
+    if (await clickUploadSourceOption('previous', modal)) {
+      const docPicked = await pickFirstPreviousUploadedDocument()
+      if (docPicked) {
+        return { ok: true, source: 'previous', fileInput: findActiveFileInput(attachmentInput) }
+      }
+    }
+    if (await clickUploadSourceOption('certificates', modal)) {
+      const docPicked = await pickFirstPreviousUploadedDocument()
+      if (docPicked) {
+        return { ok: true, source: 'certificates', fileInput: findActiveFileInput(attachmentInput) }
+      }
+    }
+    if (await clickUploadSourceOption('device', modal)) {
+      return { ok: true, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+    }
+    return { ok: false, source: 'previous', fileInput: null }
+  }
+
+  // auto: prefer library documents, then certificates, then device injection
+  if (await clickUploadSourceOption('previous', modal)) {
+    if (await pickFirstPreviousUploadedDocument()) {
+      return { ok: true, source: 'previous', fileInput: findActiveFileInput(attachmentInput) }
+    }
+  }
+  if (await clickUploadSourceOption('certificates', modal)) {
+    if (await pickFirstPreviousUploadedDocument()) {
+      return { ok: true, source: 'certificates', fileInput: findActiveFileInput(attachmentInput) }
+    }
+  }
+  const deviceOk = await clickUploadSourceOption('device', modal)
+  return { ok: deviceOk, source: 'device', fileInput: findActiveFileInput(attachmentInput) }
+}
+
+/** @deprecated Use prepareAttachmentUpload */
+async function prepareAttachmentFieldForTest(attachmentInput) {
+  await openAttachmentUploadModal(attachmentInput)
+}
+
+function probeAttachmentFieldVisible(tc) {
+  const testType = String(tc?.test_type || '').trim()
+  const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+  const fieldLabel = sanitizeSearchLabel(
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+  )
+  const fieldName = String(tc?.field_name || '').trim()
+
+  if (testType === 'label_check') {
+    const pm = String(tc?.expected_result || '').match(/;\s*parent\s*:\s*([^;=]+?)\s*=/i)
+    if (pm) {
+      const parent = resolveConditionalParentField({ parentLabel: pm[1].trim(), triggerValue: '' })
+      if (!parent || !isVisible(parent)) return false
+    }
+  } else if (isConditionalFieldTestType(testType)) {
+    try {
+      const spec = parseConditionalSpec(tc)
+      if (spec?.parentLabel) {
+        const parent = resolveConditionalParentField(spec)
+        if (!parent || !isVisible(parent)) return false
+      }
+    } catch {
+      return false
+    }
+  }
+
+  const attachmentInput = findAttachmentFieldElementByLabel(fieldLabel, fieldName)
+  if (!attachmentInput) return false
+  const container = getAttachmentContainer(attachmentInput)
+  if (container && isVisible(container)) return true
+  return Boolean(findClickToUploadElementNear(container || attachmentInput))
+}
+
+/** Block names (e.g. "Attachments") may appear as h2/h3 inside a wizard step, not as the step title. */
+function isSectionNamePresentOnPage(sectionName) {
+  const target = sanitizeSearchLabel(sectionName)
+  if (!target) return false
+
+  const headingSel =
+    'h1.section-title, h1, h2, h3, h4, .section-title, .step-title, .wizard-title, [class*="block-title"], [class*="group-title"]'
+  for (const h of document.querySelectorAll(headingSel)) {
+    if (!isVisible(h)) continue
+    const txt = sanitizeSearchLabel(String(h.textContent || ''))
+    if (!txt) continue
+    if (txt === target || txt.includes(target) || target.includes(txt)) return true
+  }
+
+  if (/attachment|upload|document/i.test(target)) {
+    for (const el of document.querySelectorAll('formly-field, formly-wrapper-form-field, [class*="upload"], [class*="attachment"]')) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').toLowerCase()
+      if (t.includes('click to upload') || t.includes('click here to upload')) return true
+    }
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]')).filter(
+      el => !el.disabled && !el.readOnly
+    )
+    if (fileInputs.length > 0) return true
+  }
+
+  return false
+}
+
+function isAttachmentSectionReachableByParents(testCases = []) {
+  for (const tc of Array.isArray(testCases) ? testCases : []) {
+    const wtt = String(tc?.what_to_test || '')
+    const parentMatch =
+      wtt.match(/(?:selecting|select)\s+['"][^'"]+['"]\s+on\s+(.+?)\s+field/i) ||
+      wtt.match(/on\s+(.+?)\s+field\s+and\s+(?:leaving|checking)/i)
+    if (!parentMatch) continue
+    const parentLabel = sanitizeSearchLabel(parentMatch[1])
+    if (!parentLabel) continue
+    const ng = findNgSelectForLabel(parentLabel)
+    if (ng && isVisible(ng)) return true
+    const radios = findRadiosForLabel(parentLabel)
+    if (radios.length > 0 && isVisible(radios[0])) return true
+    const needle = parentLabel.toLowerCase()
+    for (const input of document.querySelectorAll('input, select, textarea, ng-select')) {
+      if (!isVisible(input)) continue
+      const wrap = input.closest('formly-field, formly-wrapper-form-field')
+      const labelEl = wrap?.querySelector('label, .form-label, formly-label, mat-label')
+      const text = normalizeLabelText(`${getLabelText(input)} ${labelEl?.textContent || ''}`)
+      if (text === needle || text.includes(needle)) return true
+    }
+  }
+  return false
+}
+
+function isSectionReachableOnPage(sectionName, testCases = []) {
+  if (isSectionNamePresentOnPage(sectionName)) return true
+  if (/attachment|upload/i.test(String(sectionName || '')) && isAttachmentSectionReachableByParents(testCases)) {
+    return true
+  }
+  for (const tc of Array.isArray(testCases) ? testCases : []) {
+    if (probeFieldVisibility(tc)) return true
+  }
+  return false
+}
+
+function detectAttachmentCaseKind(tc) {
+  const text = `${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''}`.toLowerCase()
+  if (text.includes('larger than') || text.includes('500kb') || text.includes('size') || text.includes('oversize')) return 'size_limit'
+  if (text.includes('wrong format') || text.includes('invalid format') || text.includes('allowed file format') || text.includes('file format')) return 'invalid_format'
+  return 'required'
+}
+
+const ATTACHMENT_CONTAINER_SELECTOR =
+  'formly-field, formly-wrapper-form-field, mat-form-field, .mat-mdc-form-field, .form-group, .field, .upload, [class*="upload"], [class*="attachment"], [class*="file"], .mb-3'
+
+/** Nearest wrapper around a (usually hidden) file input that carries the visible label/dropzone. */
+function getAttachmentContainer(el) {
+  return el?.closest?.(ATTACHMENT_CONTAINER_SELECTOR) || el?.parentElement || el
+}
+
+function findAttachmentFieldElementByLabel(fieldLabel, fieldName) {
+  const normLabel = sanitizeSearchLabel(fieldLabel)
+  const normName = String(fieldName || '').trim().toLowerCase()
+  // Irembo/Angular file inputs are almost always visually hidden (display:none / opacity:0 /
+  // zero-size) behind a styled dropzone or button, so we must NOT require the input itself to
+  // be visible — that previously filtered out every candidate and made attachments "not found".
+  // We instead keep every functional file input and prefer the one whose container is visible
+  // and whose surrounding text matches the field label.
+  const all = Array.from(document.querySelectorAll('input[type="file"]'))
+    .filter(el => !el.disabled && !el.readOnly)
+  if (all.length === 0) return null
+  if (all.length === 1) return all[0]
+  let best = null
+  let bestScore = -1e9
+  for (const el of all) {
+    const container = getAttachmentContainer(el)
+    const blob = normalizeLabelText(
+      `${getLabelText(el)} ${el.id || ''} ${el.getAttribute('name') || ''} ${el.getAttribute('formcontrolname') || ''} ${getLocalFieldTextBlobForScoring(el)} ${String(container?.textContent || '').slice(0, 240)}`
+    )
+    let score = 0
+    // Prefer the input the user can actually see (its wrapper is on screen).
+    if (container && isVisible(container)) score += 25
+    if (normName) {
+      if (String(el.getAttribute('name') || '').toLowerCase().includes(normName)) score += 90
+      if (String(el.id || '').toLowerCase().includes(normName)) score += 70
+      if (String(el.getAttribute('formcontrolname') || '').toLowerCase().includes(normName)) score += 60
+      if (blob.includes(normName)) score += 30
+    }
+    if (normLabel) {
+      if (blob.includes(normLabel)) score += 120
+      const words = significantLabelWords(normLabel)
+      for (const w of words) if (blob.includes(w)) score += 16
+    }
+    if (container && findClickToUploadElementNear(container)) score += 40
+    if (score > bestScore) {
+      bestScore = score
+      best = el
+    }
+  }
+  return best
+}
+
+function makeValidAttachmentTestFile() {
+  const pdfBlob = new Blob(['%PDF-1.4\n% QA Helper valid attachment fixture'], { type: 'application/pdf' })
+  return new File([pdfBlob], 'valid-test.pdf', { type: 'application/pdf' })
+}
+
+function makeAttachmentTestFile(kind) {
+  if (kind === 'invalid_format') {
+    const txtBlob = new Blob(['qa helper invalid format fixture'], { type: 'text/plain' })
+    return new File([txtBlob], 'invalid-format.txt', { type: 'text/plain' })
+  }
+  if (kind === 'size_limit') {
+    const bytes = new Uint8Array(520 * 1024)
+    bytes.fill(65)
+    const pdfBlob = new Blob([bytes], { type: 'application/pdf' })
+    return new File([pdfBlob], 'oversized.pdf', { type: 'application/pdf' })
+  }
+  return null
+}
+
+function setFileInputValue(inputEl, file) {
+  if (!inputEl || !file) return false
+  try {
+    const dt = new DataTransfer()
+    dt.items.add(file)
+    inputEl.files = dt.files
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }))
+    inputEl.dispatchEvent(new Event('change', { bubbles: true }))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function getLikelyValidValueForAutoFill(tc) {
+  const text = normalizeLabelText(`${tc?.name || ''} ${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.field_label || ''}`)
+  if (/\b(national id|nin|citizen application|application number|id number)\b/.test(text)) return reusableIdValueForRun
+  if (text.includes('national id') || text.includes('16 digits')) return '1111171111111111'
+  if (/\bnin\b/.test(text) || text.includes('10 digits')) return '1234567890'
+  if (text.includes('citizen application') || text.includes('8 digits')) return '12345678'
+  if (text.includes('phone')) return '0781234567'
+  if (text.includes('email')) return 'autofill@example.com'
+  return '1234567890'
+}
+
+function isIdLikeLabelText(text) {
+  const n = normalizeLabelText(text)
+  return /\b(id number|id no\.?|national\s*id|nin\b|application number|citizen application|rwanda\s*national|rwanational|identity\s*(number)?|identification(\s*number)?)\b/.test(
+    n
+  )
+}
+
+function idLikeStructuralHints(control) {
+  if (!control) return false
+  const fc = String(control.getAttribute?.('formcontrolname') || '')
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+  const nm = String(control.name || control.id || '')
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '')
+  const hay = `${fc} ${nm}`
+  return /\b(idnumber|nationalid|nin|national_id|idno|citizenid|citizenapplication|applicationnumber)\b/.test(
+    hay
+  )
+}
+
+function isIdLikeControl(control) {
+  if (!control) return false
+  if (idLikeStructuralHints(control)) return true
+  const probe = `${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''} ${control?.getAttribute?.('aria-label') || ''} ${control?.getAttribute?.('formcontrolname') || ''}`
+  if (isIdLikeLabelText(probe)) return true
+  const blob = String(getLocalFieldTextBlobForScoring(control) || '').slice(0, 1400)
+  return isIdLikeLabelText(blob)
+}
+
+function seedReusableIdFromPageIfTyped() {
+  if (reusableIdValueForRun) return
+  const candidates = Array.from(document.querySelectorAll('input:not([type="hidden"]), textarea')).filter(
+    el => isVisible(el) && !el.disabled && !el.readOnly && isIdLikeControl(el)
+  )
+  for (const el of candidates) {
+    const v = String(el.value || '').trim()
+    if (!v) continue
+    reusableIdValueForRun = v
+    return
+  }
+}
+
+function readControlValue(el) {
+  if (!el) return ''
+  const kind = detectFieldKind(el)
+  if (kind === 'radio') {
+    const group = collectRadioGroup(el, el.name || '')
+    const checked = group.find(r => r.checked)
+    return checked ? normalizeLabelText(checked.value || getLabelText(checked) || '') : ''
+  }
+  if (kind === 'ng-select') {
+    const root = el.closest('ng-select, .ng-select, [role="combobox"]') || el
+    const valueTxt = root.querySelector('.ng-value')?.textContent || root.textContent || ''
+    return normalizeLabelText(valueTxt)
+  }
+  const tag = String(el.tagName || '').toLowerCase()
+  if (tag === 'select') {
+    const opt = el.options?.[el.selectedIndex]
+    return normalizeLabelText(opt?.textContent || opt?.value || '')
+  }
+  if (tag === 'input' || tag === 'textarea') return normalizeLabelText(el.value || '')
+  return normalizeLabelText(el.textContent || '')
+}
+
+function extractExpectedAutoFillTargetLabels(tc) {
+  const sourceLabel = normalizeLabelText(tc?.field_label || '')
+  const text = `${tc?.expected_result || ''} ${tc?.what_to_test || ''}`
+  const out = new Set()
+  const quoted = text.match(/"([^"]+)"/g) || []
+  for (const q of quoted) {
+    const raw = q.replace(/^"|"$/g, '').trim()
+    const norm = sanitizeSearchLabel(raw)
+    if (norm && norm !== sourceLabel) out.add(norm)
+  }
+  const fieldMentions = text.matchAll(/([A-Za-z][A-Za-z0-9\s/-]{1,80}?)\s+field\b/gi)
+  for (const m of fieldMentions) {
+    const raw = String(m[1] || '').trim()
+    if (!raw) continue
+    const norm = sanitizeSearchLabel(raw)
+    if (norm && norm !== sourceLabel && !/\b(source|trigger|valid value|auto[-\s]?fill)\b/i.test(norm)) out.add(norm)
+  }
+  return [...out]
+}
+
+function resolveTargetsByLabels(labels) {
+  const hits = []
+  for (const l of labels) {
+    const t = resolveFieldTarget(l, '')
+    if (t?.element) hits.push({ label: l, ...t })
+  }
+  return hits
+}
+
+function snapshotVisibleControls() {
+  const controls = Array.from(document.querySelectorAll(
+    'input:not([type="hidden"]), textarea, select, ng-select, .ng-select, div[role="combobox"]'
+  )).filter(isVisible)
+  return controls.map(el => ({ el, value: readControlValue(el) }))
+}
+
+function countChangedControls(before) {
+  let changed = 0
+  for (const b of before) {
+    const now = readControlValue(b.el)
+    if (!b.value && now) changed += 1
+  }
+  return changed
+}
+
+function isLikelyWidgetTriggerControl(control, kind) {
+  const type = String(control?.type || '').toLowerCase()
+  if (kind === 'ng-select' || kind === 'date' || type === 'date') return false
+  return isIdLikeControl(control)
+}
+
+async function waitForWidgetSideEffects(beforeSnapshot, timeoutMs = 2800, minChanged = 1) {
+  const step = 250
+  const tries = Math.ceil(timeoutMs / step)
+  for (let i = 0; i < tries; i += 1) {
+    const changed = countChangedControls(beforeSnapshot)
+    if (changed >= minChanged) return true
+    await wait(step)
+  }
+  return false
+}
+
+async function waitForAutoFillTargets(targets, beforeSnapshot, timeoutMs = 2800) {
+  const step = 250
+  const tries = Math.ceil(timeoutMs / step)
+  for (let i = 0; i < tries; i += 1) {
+    let ready = 0
+    for (const t of targets) {
+      if (readControlValue(t.element)) ready += 1
+    }
+    if (targets.length > 0 && ready === targets.length) return true
+    if (targets.length === 0 && countChangedControls(beforeSnapshot) >= 1) return true
+    await wait(step)
+  }
+  return false
+}
+
+async function setInputLikeValueManually(control, value) {
+  const text = String(value ?? '')
+  if (typeof control?.focus === 'function') control.focus()
+  control.click?.()
+  await wait(40)
+  control.value = ''
+  dispatchInputEvents(control)
+  for (const ch of text) {
+    control.value = String(control.value || '') + ch
+    control.dispatchEvent(new Event('input', { bubbles: true }))
+    await wait(12)
+  }
+  dispatchInputEvents(control)
+  dispatchBlurEvent(control)
+}
+
+async function runWidgetAutoFillTest(tc, fieldLabel, fieldName) {
+  const source = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+    contextHint: String(tc?.name || '')
+  })
+  if (!source?.element) {
+    return { passed: false, message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page` }
+  }
+  const src = source.element
+  if (src.disabled || src.readOnly) {
+    return { passed: false, message: 'Auto-fill source field is disabled/readOnly' }
+  }
+
+  const targetLabels = extractExpectedAutoFillTargetLabels(tc)
+  const targetFields = resolveTargetsByLabels(targetLabels)
+  const before = snapshotVisibleControls()
+  const val = getLikelyValidValueForAutoFill(tc)
+
+  if (source.kind === 'ng-select') {
+    await selectFirstNonEmptyNgSelect(src)
+  } else if (source.kind === 'date') {
+    const input = findDateInputForLabel(fieldLabel) || src
+    await setDateValuePreferPicker(input, getSafeDateFallbackValue())
+  } else {
+    await setInputLikeValueManually(src, val)
+  }
+
+  const ok = await waitForAutoFillTargets(targetFields, before, 6000)
+  if (!ok) {
+    if (targetFields.length > 0) {
+      const missing = targetFields.filter(t => !readControlValue(t.element)).map(t => t.label)
+      return { passed: false, message: `Auto-fill did not populate expected fields: ${missing.join(', ')}` }
+    }
+    return { passed: false, message: 'Auto-fill not detected after entering valid source value' }
+  }
+  return { passed: true, message: 'Auto-fill populated destination fields as expected.' }
+}
+
+async function clearNgSelectValue(selectRoot) {
+  if (!selectRoot) return
+  const root = selectRoot.closest('ng-select, .ng-select, [role="combobox"]') || selectRoot
+
+  // Attempt 1: use ng-select's own clear button
+  const clearBtn = root.querySelector('.ng-clear-wrapper, .ng-value-icon.left, button[aria-label*="clear" i], [title*="clear" i]')
+  if (clearBtn && isVisible(clearBtn)) {
+    clearBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    clearBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await wait(150)
+    if (!ngSelectRootAppearsUnselected(root)) {
+      // try again
+      clearBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(100)
+    }
+    if (ngSelectRootAppearsUnselected(root)) return
+  }
+
+  // Attempt 2: open dropdown then press Escape to reset
+  root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await wait(160)
+  const filterInput = root.querySelector('input[type="text"], input:not([type="hidden"])')
+  if (filterInput) {
+    filterInput.focus()
+    filterInput.value = ''
+    filterInput.dispatchEvent(new Event('input', { bubbles: true }))
+  }
+  const escTarget = filterInput || root.querySelector('input') || root
+  escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  await wait(100)
+
+  // Attempt 3: fire Angular-compatible change event on the host with null value
+  root.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: null }))
+  root.dispatchEvent(new Event('input', { bubbles: true }))
+
+  // Attempt 4: find and trigger the internal Angular writeValue by dispatching on the ng-select host element
+  const ngSelectHost = root.closest('ng-select') || root
+  ngSelectHost.dispatchEvent(new CustomEvent('ngModelChange', { bubbles: true, detail: null }))
+  ngSelectHost.dispatchEvent(new Event('change', { bubbles: true }))
+
+  await wait(80)
+}
+
+async function selectFirstNonEmptyNgSelect(selectRoot) {
+  if (!selectRoot) return false
+  const root = selectRoot.closest('ng-select, .ng-select, [role="combobox"]') || selectRoot
+  const before = readControlValue(root)
+
+  // Open the dropdown — use native .click() on the inner .ng-select-container
+  // because ng-select v3+ binds its open handler there, not on the wrapper.
+  // Synthetic dispatchEvent on the wrapper is silently ignored by some Irembo
+  // dropdowns, leaving the panel closed and the 6s option poll wasted.
+  const opener = root.querySelector('.ng-select-container, [role="combobox"]') || root
+  if (typeof opener.click === 'function') opener.click()
+  else root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  await wait(120)
+
+  // Poll for options to appear — up to 6 seconds total for slow API responses
+  const optionSelectors = QA_ENGINE.selectors.ngSelectOptions
+  let visibleOptions = []
+  const maxWaitMs = QA_ENGINE.timeouts.ngSelectOptionsMaxWaitMs
+  const stepMs = QA_ENGINE.timeouts.ngSelectOptionsStepMs
+  const tries = Math.ceil(maxWaitMs / stepMs)
+
+  for (let attempt = 0; attempt < tries; attempt += 1) {
+    // Collect all visible non-placeholder options
+    visibleOptions = Array.from(
+      document.querySelectorAll(optionSelectors.join(', '))
+    ).filter(el => {
+      if (!isVisible(el)) return false
+      const txt = normalizeLabelText(el.textContent || '')
+      return txt && !/^(select|choose|loading|\.\.\.)\b/i.test(txt)
+    })
+
+    // Also check scoped options inside the field's own container
+    if (visibleOptions.length === 0) {
+      const scope =
+        root.closest('formly-field, formly-wrapper-form-field, .form-group, .field') ||
+        root.parentElement ||
+        document
+      visibleOptions = Array.from(
+        scope.querySelectorAll('.ng-option, [role="option"]')
+      ).filter(el => {
+        if (!isVisible(el)) return false
+        const txt = normalizeLabelText(el.textContent || '')
+        return txt && !/^(select|choose|loading|\.\.\.)\b/i.test(txt)
+      })
+    }
+
+    if (visibleOptions.length > 0) break
+
+    // If dropdown closed itself (no panel visible), re-open it
+    const panelOpen = document.querySelector(
+      '.ng-dropdown-panel, [role="listbox"]'
+    )
+    if (!panelOpen || !isVisible(panelOpen)) {
+      const reopener = root.querySelector('.ng-select-container, [role="combobox"]') || root
+      if (typeof reopener.click === 'function') reopener.click()
+      else root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(120)
+    }
+
+    await wait(stepMs)
+  }
+
+  let result = false
+  if (visibleOptions.length === 0) {
+    // Close dropdown cleanly and report failure
+    const escTarget = root.querySelector('input') || root
+    escTarget.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+    )
+    result = false
+  } else {
+    // Pick the first real option
+    const option = visibleOptions[0]
+    option.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }))
+    option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await wait(200)
+
+    // Confirm something was actually selected
+    const after = readControlValue(root)
+    result =
+      normalizeLabelText(after) !== normalizeLabelText(before) &&
+      Boolean(normalizeLabelText(after))
+  }
+
+  return result
+}
+
+async function selectIdTypeOptionByNeedle(idTypeTarget, needleNorm) {
+  if (!idTypeTarget?.element || !needleNorm) return
+  const el = idTypeTarget.element
+  if (idTypeTarget.kind === 'ng-select') {
+    const root = el.closest('ng-select, .ng-select') || el
+    root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await wait(220)
+    const option = Array.from(document.querySelectorAll('.ng-option, [role="option"]')).find(opt => {
+      const t = normalizeLabelText(opt.textContent)
+      if (needleNorm.includes('national')) return t.includes('national id')
+      if (needleNorm.includes('nin')) return /\bnin\b/.test(t) || t === 'nin'
+      if (needleNorm.includes('citizen')) return t.includes('citizen') && t.includes('application')
+      return t.includes(needleNorm)
+    })
+    if (option) option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+  } else if (String(el.tagName || '').toLowerCase() === 'select') {
+    const option = Array.from(el.options || []).find(opt => {
+      const t = normalizeLabelText(opt.textContent)
+      if (needleNorm.includes('national')) return t.includes('national id')
+      if (needleNorm.includes('nin')) return /\bnin\b/.test(t)
+      if (needleNorm.includes('citizen')) return t.includes('citizen')
+      return false
+    })
+    if (option) {
+      el.value = option.value
+      dispatchInputEvents(el)
+    }
+  }
+  await wait(700)
+}
+
+/** Sets ID Type from test wording so conditional ID Number / DOB age widgets appear (National ID, NIN, Citizen Application Number). */
+async function maybePrepareIdTypeFromWhatToTest(tc) {
+  const what = String(tc?.what_to_test || '')
+  const name = String(tc?.name || '')
+  const combined = normalizeLabelText(`${name} ${what} ${tc?.expected_result || ''}`)
+  if (!/id type|id number|national id|\bnin\b|citizen application|date of birth/i.test(combined)) return
+
+  let needle = ''
+  if (/national id/i.test(what) || /national id/i.test(name)) needle = 'national id'
+  else if (/\bnin\b/i.test(what) || /\bnin\b/i.test(name)) needle = 'nin'
+  else if (/citizen application/i.test(what) || /citizen application/i.test(name)) needle = 'citizen application'
+  else if (/id type\s+set\s+to/i.test(what)) {
+    if (/national id/i.test(what)) needle = 'national id'
+    else if (/\bnin\b/i.test(what)) needle = 'nin'
+    else if (/citizen application/i.test(what)) needle = 'citizen application'
+  } else if (/date of birth.*(national|nin|id type)/i.test(combined)) {
+    needle = /\bnin\b/i.test(combined) ? 'nin' : 'national id'
+  } else if (/id number/i.test(combined)) needle = 'national id'
+
+  if (!needle) return
+
+  const idType = resolveFieldTarget('id type', 'idType')
+  await selectIdTypeOptionByNeedle(idType, needle)
+
+  if (!combined.includes('id number') || needle !== 'national id') return
+}
+
+async function expandCollapsedSectionsOnce() {
+  if (hasExpandedSectionsForRun) return
+  const nodes = new Set()
+  const direct = Array.from(document.querySelectorAll('button.accordion-button.collapsed, div.accordion-item button, button[aria-expanded="false"]'))
+  for (const el of direct) nodes.add(el)
+
+  const clickable = Array.from(document.querySelectorAll('button, div[role="button"], div'))
+  for (const el of clickable) {
+    const txt = normalizeLabelText(el.textContent)
+    const hasChevronIcon = Boolean(el.querySelector('i[class*="chevron"], i[class*="arrow"], i[class*="caret"], svg[class*="chevron"], svg[class*="arrow"]'))
+    const hasArrowChar = /▾|▸|▼|▶/.test(String(el.textContent || ''))
+    const nearHeading = Boolean(el.closest('h1,h2,h3,h4,h5,.accordion-item,.section,.card,.panel'))
+    if ((hasChevronIcon || hasArrowChar || /expand|show more|details/.test(txt)) && nearHeading) {
+      nodes.add(el)
+    }
+  }
+
+  for (const el of nodes) {
+    if (!isVisible(el)) continue
+    const expanded = String(el.getAttribute?.('aria-expanded') || '').toLowerCase()
+    const collapsedCls = el.classList?.contains('collapsed')
+    if (expanded === 'false' || collapsedCls || el.matches('button.accordion-button.collapsed, div.accordion-item button')) {
+      try {
+        el.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+        await wait(800)
+      } catch {
+        // Ignore and continue to next section candidate.
+      }
+    }
+  }
+  hasExpandedSectionsForRun = true
+}
+
+async function expandCollapsedSectionsNow() {
+  const nodes = Array.from(document.querySelectorAll('button.accordion-button.collapsed, div.accordion-item button, button[aria-expanded="false"]'))
+  for (const el of nodes) {
+    if (!isVisible(el)) continue
+    try {
+      el.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(800)
+    } catch {
+      // Ignore and continue.
+    }
+  }
+}
+
+async function resolveVisibleTargetWithNavigation(fieldLabel, fieldName, options = {}) {
+  const allowContinue = options.allowContinue !== false
+  const ch = String(options.contextHint || '')
+  let target = resolveFieldTarget(fieldLabel, fieldName, ch)
+  if (target.element && isVisible(target.element)) return target
+
+  const continueBtn = allowContinue ? findContinueButton() : null
+  if (allowContinue && continueBtn) {
+    scrollTestTargetIntoView(continueBtn)
+    await wait(260)
+    continueBtn.click()
+    await wait(580)
+    target = resolveFieldTarget(fieldLabel, fieldName, ch)
+    if (target.element && isVisible(target.element)) return target
+  }
+
+  await expandCollapsedSectionsNow()
+  target = resolveFieldTarget(fieldLabel, fieldName, ch)
+  return target
+}
+
+async function resolveWithPrefillAcrossSections(fieldLabel, fieldName, contextHint = '', maxSteps = 4, fillOptions = {}) {
+  let target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+    allowContinue: false,
+    contextHint
+  })
+  if (target.element && isVisible(target.element)) return target
+
+  for (let i = 0; i < maxSteps; i += 1) {
+    await fillAllFieldsWithValidValues(null, fillOptions)
+    const btn = findContinueButton()
+    if (!btn) break
+    scrollTestTargetIntoView(btn)
+    await wait(280)
+    btn.click()
+    await wait(650)
+    target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+      allowContinue: false,
+      contextHint
+    })
+    if (target.element && isVisible(target.element)) return target
+  }
+  return target
+}
+
+/** Uses conditionalParentKey.js (same logic as the background worker). */
+function parseConditionalSpec(tc) {
+  const text = `${tc?.what_to_test || ''} ${tc?.expected_result || ''} ${tc?.name || ''}`
+
+  function trimParent(s) {
+    return String(s || '').trim().replace(/\?+$/, '').trim()
+  }
+
+  function normTrigger(raw) {
+    const l = String(raw || '').trim().toLowerCase()
+    if (l === 'yes') return 'Yes'
+    if (l === 'no') return 'No'
+    return String(raw || '').trim()
+  }
+
+  const m1 = text.match(/selecting\s+['"]([^'"]+)['"]\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*,|\s*then\b|\s*$)/i)
+  if (m1) return { parentLabel: trimParent(m1[2]), triggerValue: normTrigger(m1[1]) }
+
+  const m2 = text.match(/after\s+selecting\s+(yes|no)\s+(?:for|on)\s+(.+?)(?:\s*$|\s+and\b|\s+field\b)/i)
+  if (m2) return { parentLabel: trimParent(m2[2]), triggerValue: normTrigger(m2[1]) }
+
+  const m3 = text.match(/when\s+(.+?)\s+is\s+(yes|no)\b/i)
+  if (m3) return { parentLabel: trimParent(m3[1]), triggerValue: normTrigger(m3[2]) }
+
+  const m4 = text.match(/select\s*['"]?\s*(yes|no)\s*['"]?\s+on\s+(.+?)(?:\s+field\b|\s+and\b|\s*$)/i)
+  if (m4) return { parentLabel: trimParent(m4[2]), triggerValue: normTrigger(m4[1]) }
+
+  const m5 = text.match(/when\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m5) return { parentLabel: trimParent(m5[1]), triggerValue: normTrigger(String(m5[2] || '').trim()) }
+
+  const m6 = text.match(/if\s+(.+?)\s+(?:is|=)\s+["']?([^"'.;,\n]+)["']?/i)
+  if (m6) return { parentLabel: trimParent(m6[1]), triggerValue: normTrigger(String(m6[2] || '').trim()) }
+
+  return { parentLabel: '', triggerValue: '' }
+}
+
+function parentSetupKeyFromTc(tc) {
+  const spec = parseConditionalSpec(tc)
+  const p = sanitizeSearchLabel(String(spec.parentLabel || '').trim().replace(/\?+$/, '').trim())
+  const t = normalizeText(spec.triggerValue)
+  if (!p || !t) return ''
+  return `${p}::${t}`
+}
+
+function resolveConditionalParentField(spec) {
+  if (!spec?.parentLabel) return null
+  const exact = resolveFieldTarget(spec.parentLabel, '')
+  if (exact.element) return exact.element
+  const needle = sanitizeSearchLabel(spec.parentLabel)
+  if (needle) {
+    const radios = Array.from(document.querySelectorAll('input[type="radio"]'))
+    const group = radios.find(r =>
+      normalizeLabelText(
+        `${getLabelText(r)} ${r.closest('formly-field, formly-wrapper-form-field, .form-group, .field')?.textContent || ''}`
+      ).includes(needle)
+    )
+    if (group) return group
+  }
+  return null
+}
+
+async function resolveTargetAfterCondition(fieldLabel, fieldName, options = {}) {
+  const rwandaYesLocation = Boolean(options.rwandaYesLocation)
+  const navOpts = { allowContinue: false, contextHint: String(options.contextHint || '') }
+  let target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+  if (!target.element) {
+    const hintedRadios = findRadiosForLabel(fieldLabel)
+    if (hintedRadios.length > 0) target = { element: hintedRadios[0], kind: 'radio' }
+    const hintedDate = findDateInputForLabel(fieldLabel)
+    if (!target.element && hintedDate) target = { element: hintedDate, kind: 'date' }
+    const hintedNg = findNgSelectForLabel(fieldLabel)
+    if (!target.element && hintedNg) target = { element: hintedNg, kind: 'ng-select' }
+  }
+  if (
+    target.element &&
+    isVisible(target.element) &&
+    resolvedTargetMatchesLocationStep(fieldLabel, target)
+  ) {
+    return target
+  }
+  if (rwandaYesLocation) {
+    const cascaded = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+    if (
+      cascaded.element &&
+      isVisible(cascaded.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, cascaded)
+    ) {
+      return cascaded
+    }
+    for (let step = 0; step < 3; step += 1) {
+      const btn = findContinueButton()
+      if (btn) {
+        scrollTestTargetIntoView(btn)
+        await wait(160)
+        btn.click()
+        await wait(300)
+      }
+      target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+      if (!target.element) {
+        const hintedNg = findNgSelectForLabel(fieldLabel)
+        if (hintedNg) target = { element: hintedNg, kind: 'ng-select' }
+      }
+      if (
+        target.element &&
+        isVisible(target.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, target)
+      ) {
+        return target
+      }
+      const again = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+      if (
+        again.element &&
+        isVisible(again.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, again)
+      ) {
+        return again
+      }
+    }
+  }
+  for (let i = 0; i < 4; i += 1) {
+    await wait(i < 3 ? 150 : 280)
+    target = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+    if (
+      target.element &&
+      isVisible(target.element) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, target)
+    ) {
+      return target
+    }
+    const hintedRadios = findRadiosForLabel(fieldLabel)
+    if (hintedRadios.length > 0 && isVisible(hintedRadios[0])) {
+      return { element: hintedRadios[0], kind: 'radio' }
+    }
+    const hintedDate = findDateInputForLabel(fieldLabel)
+    if (hintedDate && isVisible(hintedDate)) {
+      return { element: hintedDate, kind: 'date' }
+    }
+    const hintedNg = findNgSelectForLabel(fieldLabel)
+    if (
+      hintedNg &&
+      isVisible(hintedNg) &&
+      resolvedTargetMatchesLocationStep(fieldLabel, { element: hintedNg, kind: 'ng-select' })
+    ) {
+      return { element: hintedNg, kind: 'ng-select' }
+    }
+  }
+  const byCascade = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+  if (byCascade.element && isVisible(byCascade.element)) return byCascade
+  return target
+}
+
+/** Smallest wrappers whose visible text mentions the parent label (any form). */
+function findScopesForParentLabel(parentLabel) {
+  const needle = sanitizeSearchLabel(parentLabel)
+  if (!needle) return []
+  return Array.from(document.querySelectorAll('formly-wrapper-form-field, formly-field'))
+    .filter(w => normalizeLabelText(w.textContent).includes(needle))
+    .sort(
+      (a, b) =>
+        normalizeLabelText(a.textContent).length - normalizeLabelText(b.textContent).length
+    )
+}
+
+function applyBinaryYesNoInScopes(scopes, triggerValue) {
+  const lower = normalizeText(triggerValue)
+  if (lower !== 'yes' && lower !== 'no') return false
+  for (const scope of scopes) {
+    const radios = Array.from(scope.querySelectorAll('input[type="radio"]'))
+    const match = radios.find(r => {
+      const val = normalizeText(r.value)
+      const lab = normalizeText(getLabelText(r) || r.closest('label')?.textContent || '')
+      return (
+        val === lower ||
+        lab === lower ||
+        (lower && (val.includes(lower) || lab.includes(lower)))
+      )
+    })
+    if (match) {
+      match.click()
+      dispatchInputEvents(match)
+      return true
+    }
+    const candidates = scope.querySelectorAll(
+      'label, button, .mat-mdc-radio-touch-target, mat-radio-button, .mat-mdc-radio-button, [role="radio"]'
+    )
+    for (const el of candidates) {
+      if (!isVisible(el)) continue
+      const raw = String(el.textContent || '').trim()
+      const parts = raw.split(/\s+/).filter(Boolean)
+      if (parts.length > 5) continue
+      const head = normalizeText(parts[0] || '')
+      if (head === lower) {
+        el.click()
+        dispatchInputEvents(el)
+        return true
+      }
+    }
+  }
+  return false
+}
+
+function applyRadioChoiceInScopes(scopes, triggerValue) {
+  const want = normalizeLabelText(triggerValue)
+  if (!want) return false
+  for (const scope of scopes) {
+    const radios = Array.from(scope.querySelectorAll('input[type="radio"]'))
+    const match = radios.find(r => {
+      const lab = normalizeLabelText(getLabelText(r) || r.closest('label')?.textContent || '')
+      const val = normalizeLabelText(String(r.value || ''))
+      return lab.includes(want) || val.includes(want) || want.includes(lab)
+    })
+    if (match) {
+      match.click()
+      dispatchInputEvents(match)
+      return true
+    }
+  }
+  return false
+}
+
+/** When native change() on the resolved parent fails (Material / custom templates). */
+function applyConditionalDomFallback(parentLabel, triggerValue) {
+  const scopes = findScopesForParentLabel(parentLabel)
+  if (scopes.length === 0) return false
+  const lower = normalizeText(triggerValue)
+  if (lower === 'yes' || lower === 'no') return applyBinaryYesNoInScopes(scopes, triggerValue)
+  return applyRadioChoiceInScopes(scopes, triggerValue)
+}
+
+function setParentConditionalValue(parentField, triggerValue) {
+  if (!parentField) return false
+  const lowerTrigger = normalizeText(triggerValue)
+  if (parentField.type === 'radio') {
+    const radios = collectRadioGroup(parentField, parentField.name)
+    const match = radios.find(r => {
+      const val = normalizeText(r.value)
+      const label = normalizeText(getLabelText(r) || r.closest('label')?.textContent)
+      return lowerTrigger && (val === lowerTrigger || label === lowerTrigger || val.includes(lowerTrigger) || label.includes(lowerTrigger))
+    })
+    if (!match) return false
+    match.click()
+    dispatchInputEvents(match)
+    return true
+  }
+  if (parentField.tagName.toLowerCase() === 'select') {
+    const options = Array.from(parentField.options || [])
+    const match = options.find(opt => {
+      const v = normalizeText(opt.value)
+      const t = normalizeText(opt.textContent)
+      return lowerTrigger && (v.includes(lowerTrigger) || t.includes(lowerTrigger))
+    }) || options.find(opt => String(opt.value || '').trim())
+    if (!match) return false
+    parentField.value = match.value
+    dispatchInputEvents(parentField)
+    return true
+  }
+  parentField.value = triggerValue || 'Yes'
+  dispatchInputEvents(parentField)
+  return true
+}
+
+function normalizeStepFieldLabel(raw) {
+  return String(raw || '')
+    .replace(/\s+field\s*$/i, '')
+    .replace(/^["']|["']$/g, '')
+    .trim()
+}
+
+function normalizeStepValue(raw) {
+  return String(raw || '')
+    .replace(/^["']|["']$/g, '')
+    .trim()
+}
+
+async function applyAnySelectionStep(fieldLabel, stepText) {
+  const target = resolveFieldTarget(fieldLabel, '', stepText)
+  if (!target?.element) return false
+  const kind = target.kind || detectFieldKind(target.element)
+  if (kind === 'ng-select') {
+    // Already has a value — skip immediately, no wait. Saves a small amount
+    // per cascade step but more importantly makes the intent obvious:
+    // "filled cascade tier = do nothing".
+    if (!ngSelectRootAppearsUnselected(target.element)) {
+      return true
+    }
+    await selectFirstNonEmptyNgSelect(target.element)
+    await wait(700)
+    return true
+  }
+  if (kind === 'radio') {
+    const group = collectRadioGroup(target.element, target.element?.name || '')
+    if (group.length > 0) {
+      group[0].click()
+      dispatchInputEvents(group[0])
+      await wait(260)
+      return true
+    }
+    return false
+  }
+  const tag = String(target.element.tagName || '').toLowerCase()
+  if (kind === 'select' || tag === 'select') {
+    const options = Array.from(target.element.options || [])
+    const nonEmpty = options.find(opt => String(opt.value || '').trim())
+    if (nonEmpty) {
+      target.element.value = nonEmpty.value
+      dispatchInputEvents(target.element)
+      await wait(260)
+      return true
+    }
+  }
+  return false
+}
+
+async function applyValueSelectionStep(fieldLabel, triggerValue, stepText) {
+  const target = resolveFieldTarget(fieldLabel, '', stepText)
+  const lowerTrigger = normalizeText(triggerValue)
+  if (target?.element) {
+    const kind = target.kind || detectFieldKind(target.element)
+    if (kind === 'ng-select') {
+      const root = target.element.closest('ng-select, .ng-select, [role="combobox"]') || target.element
+      root.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      await wait(180)
+      const option = Array.from(document.querySelectorAll('.ng-option, [role="option"]')).find(el => {
+        const txt = normalizeLabelText(el.textContent || '')
+        return lowerTrigger && (txt === lowerTrigger || txt.includes(lowerTrigger))
+      })
+      if (option) {
+        option.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+        await wait(420)
+        return true
+      }
+    }
+    if (kind === 'radio') {
+      const group = collectRadioGroup(target.element, target.element?.name || '')
+      const match = group.find(r => {
+        const val = normalizeText(r.value || '')
+        const lab = normalizeText(getLabelText(r) || r.closest('label')?.textContent || '')
+        return lowerTrigger && (val === lowerTrigger || lab === lowerTrigger || val.includes(lowerTrigger) || lab.includes(lowerTrigger))
+      })
+      if (match) {
+        // Skip the click + 420ms wait when the correct radio is already selected.
+        // Re-clicking an already-checked radio is a no-op for the value but still
+        // fires Angular change events through Formly, which can re-evaluate every
+        // dependent field's visibility expression and churn cascade ng-selects —
+        // costing several seconds per parseAndExecuteSteps call. Mirrors the
+        // .checked signal that isParentRadioAlreadySet uses in executeTestCase.
+        if (match.checked) return true
+        match.click()
+        dispatchInputEvents(match)
+        await wait(420)
+        return true
+      }
+    }
+    const tag = String(target.element.tagName || '').toLowerCase()
+    if (kind === 'select' || tag === 'select') {
+      const options = Array.from(target.element.options || [])
+      const match = options.find(opt => {
+        const v = normalizeText(opt.value || '')
+        const t = normalizeText(opt.textContent || '')
+        return lowerTrigger && (v === lowerTrigger || t === lowerTrigger || v.includes(lowerTrigger) || t.includes(lowerTrigger))
+      })
+      if (match) {
+        target.element.value = match.value
+        dispatchInputEvents(target.element)
+        await wait(420)
+        return true
+      }
+    }
+  }
+  const fallback = applyConditionalDomFallback(fieldLabel, triggerValue)
+  if (fallback) await wait(1000)
+  return fallback
+}
+
+async function parseAndExecuteSteps(whatToTest) {
+  const text = String(whatToTest || '').trim()
+  if (!text) return true
+  const steps = text
+    .split(/\b(?:then|after that|next)\b|,\s*then\b/i)
+    .map(s => s.trim())
+    .filter(Boolean)
+  for (const rawStep of steps) {
+    const step = rawStep.replace(/^[,;:\s-]+/, '').trim()
+    if (!step) continue
+
+    // Matches "select any option on X" and "select any valid option on X"
+    const anyOn = step.match(/\bselect\s+any\s+(?:valid\s+)?option\s+on\s+(?:the\s+)?(.+?)(?:\s+field\b|\s*$)/i)
+    if (anyOn?.[1]) {
+      const fieldLabel = normalizeStepFieldLabel(anyOn[1])
+      await applyAnySelectionStep(fieldLabel, step)
+      continue
+    }
+
+    const anyField = step.match(/\bselect\s+any\s+(.+?)(?:\s+field\b|\s*$)/i)
+    if (anyField?.[1]) {
+      // Strip noise like "valid option on" that bleeds in from unmatched steps
+      const raw = normalizeStepFieldLabel(anyField[1])
+      const fieldLabel = raw
+        .replace(/^valid\s+option\s+on\s+/i, '')
+        .replace(/^option\s+on\s+/i, '')
+        .trim()
+      if (fieldLabel) await applyAnySelectionStep(fieldLabel, step)
+      continue
+    }
+
+    const valueOnFor = step.match(/\bselect\s+(.+?)\s+(?:on|for)\s+(.+?)(?:\s+field\b|\s*$)/i)
+    if (valueOnFor?.[1] && valueOnFor?.[2]) {
+      const triggerValue = normalizeStepValue(valueOnFor[1])
+      const fieldLabel = normalizeStepFieldLabel(valueOnFor[2])
+      if (fieldLabel && triggerValue) {
+        await applyValueSelectionStep(fieldLabel, triggerValue, step)
+      }
+    }
+  }
+  return true
+}
+
+function ngSelectRootAppearsUnselected(root) {
+  const el = root.closest?.('ng-select, .ng-select, [role="combobox"]') || root
+  if (!el) return true
+  const valueBlock = el.querySelector('.ng-value')
+  if (!valueBlock) return true
+  const t = normalizeLabelText(valueBlock.textContent || '')
+  return !t || /^(select|choose)\b/i.test(t)
+}
+
+function getSafeDefaultInputValue(control, kind) {
+  const type = String(control?.type || '').toLowerCase()
+  const label = normalizeLabelText(`${getLabelText(control)} ${control?.name || ''} ${control?.id || ''} ${control?.placeholder || ''}`)
+  if (type === 'email' || /\bemail\b/.test(label)) return QA_ENGINE.validValues.email
+  if (type === 'tel' || /\b(phone|mobile|tel)\b/.test(label)) return QA_ENGINE.validValues.phone
+  if (kind === 'date' || type === 'date') return getSafeDateFallbackValue()
+  if (/\b(date of birth|dob)\b/.test(label)) return getSafeDateFallbackValue()
+  if (/\bdate\b/.test(label)) return getSafeDateFallbackValue()
+  if (isIdLikeControl(control) && String(reusableIdValueForRun || '').trim()) return reusableIdValueForRun
+  if (type === 'number' || /\b(age|number|amount|count|qty|quantity)\b/.test(label)) return QA_ENGINE.validValues.number
+  if (/\b(first name|lastname|last name|surname|name)\b/.test(label)) return QA_ENGINE.validValues.name
+  if (/\b(id number|id no|national id|nin|application number|citizen application)\b/.test(label)) return reusableIdValueForRun
+  if (type === 'url' || /\b(url|website|site)\b/.test(label)) return QA_ENGINE.validValues.url
+  return QA_ENGINE.validValues.fallback
+}
+
+/**
+ * The currently-visible section + a predicate for "does this element belong to it".
+ * Uses the SAME detection as getCurrentSectionName / the [QA section] log (first
+ * visible h1.section-title). A control belongs to the current section if it sits
+ * AFTER the current heading and BEFORE the next section heading (visible or not)
+ * in document order — so an Angular form holding every step in the DOM at once is
+ * still split per section. No hardcoded names. Falls back to whole-form when the
+ * form has no section-title headings.
+ */
+function getCurrentSectionScope() {
+  const current = visibleSectionHeadings()[0] || null
+  if (!current) return { sectionName: '', inSection: () => true }
+  const sectionName = String(current.textContent || '').trim()
+  let next = null
+  for (const h of document.querySelectorAll('h1.section-title')) {
+    if (current.compareDocumentPosition(h) & Node.DOCUMENT_POSITION_FOLLOWING) { next = h; break }
+  }
+  const inSection = (el) => {
+    if (!el) return false
+    if (!(current.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false
+    if (next && (next.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING)) return false
+    return true
+  }
+  return { sectionName, inSection }
+}
+
+async function fillAllFieldsWithValidValues(targetToSkip = null, options = {}) {
+  const widgetWaitMs = Math.min(8000, Math.max(200, Number(options.widgetWaitMs) || 2400))
+  const manualLike = options.manualLike !== false
+  const fillEvenIfPopulated = options.fillEvenIfPopulated === true
+  /** When testing a location cascade field, do not bulk-fill district/sector/cell/village ng-selects — the cascade resolver fills them in order. */
+  const deferCascadeChains = options.deferCascadeChains === true
+  const extraSkips = Array.isArray(options.skipControls) ? options.skipControls.filter(Boolean) : []
+  const sectionScope = getCurrentSectionScope()
+  const allControls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
+  const controls = allControls.filter(sectionScope.inSection)
+  console.log('[QA fill] ENTER — section:', JSON.stringify(sectionScope.sectionName), '— controls:', controls.length, `(of ${allControls.length} on page)`) // TEMP DIAGNOSTIC
+  const handledRadioGroups = new Set()
+  const handledNgSelectRoots = new Set()
+  const skipEl = targetToSkip?.element || null
+  const skipKind = targetToSkip?.kind || ''
+  const skipRadioName = skipKind === 'radio' ? String(skipEl?.name || '').trim() : ''
+  const skipRadioContainer = skipKind === 'radio' && skipEl ? getRadioGroupContainer(skipEl) : null
+  const excludePredicate = (control) => {
+    for (const extra of extraSkips) {
+      if (control === extra || control.contains?.(extra) || extra.contains?.(control)) return true
+    }
+    if (!skipEl) return false
+    if (control === skipEl || control.contains?.(skipEl) || skipEl.contains?.(control)) return true
+    if (skipKind === 'radio' && detectFieldKind(control) === 'radio') {
+      const sameName = Boolean(skipRadioName && String(control.name || '').trim() === skipRadioName)
+      const sameContainer = Boolean(skipRadioContainer && skipRadioContainer.contains(control))
+      if (sameName || sameContainer) return true
+    }
+    return false
+  }
+  for (const control of controls) {
+    if (!isVisible(control)) continue
+    if (excludePredicate(control)) continue
+    const kind = detectFieldKind(control)
+    if (kind === 'radio') {
+      const name = String(control.name || '').trim()
+      const inSkipContainer = Boolean(skipRadioContainer && skipRadioContainer.contains(control))
+      if ((skipRadioName && name && name === skipRadioName) || inSkipContainer) continue
+      const key = name || `${getLabelText(control)}`
+      if (handledRadioGroups.has(key)) continue
+      const group = collectRadioGroup(control, name)
+      if (group.length > 0) {
+        group[0].click()
+        dispatchInputEvents(group[0])
+      }
+      handledRadioGroups.add(key)
+      continue
+    }
+    if (kind === 'ng-select') {
+      const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
+      const lcPh = String(root.querySelector?.('.ng-placeholder')?.textContent || '').trim() // TEMP DIAGNOSTIC
+      const lcDisabled = root.hasAttribute?.('disabled') || root.getAttribute?.('aria-disabled') === 'true' || root.classList?.contains('ng-select-disabled') === true // TEMP DIAGNOSTIC
+      console.log('[QA fill] ng-select ph=', JSON.stringify(lcPh), '| disabled=', lcDisabled, '| isLocationCascade=', isLocationCascadeSelectRoot(root), '| appearsUnselected=', ngSelectRootAppearsUnselected(root), '| deferCascadeChains=', deferCascadeChains) // TEMP DIAGNOSTIC
+      if (deferCascadeChains && isLocationCascadeSelectRoot(root)) {
+        console.log('[QA fill]   → SKIP: deferred location cascade', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      if (handledNgSelectRoots.has(root)) {
+        console.log('[QA fill]   → SKIP: already handled this pass', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      if (!fillEvenIfPopulated && !ngSelectRootAppearsUnselected(root)) {
+        console.log('[QA fill]   → SKIP: appears already filled (ngSelectRootAppearsUnselected=false)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      // Skip disabled ng-selects — most commonly cascade children whose parent
+      // hasn't been selected yet. Calling selectFirstNonEmptyNgSelect on them
+      // polls 6s for options that won't load until the parent fires, burning
+      // ~18s/pass on a 3-tier cascade. They get retried on the next pass once
+      // the parent is filled. Not added to handledNgSelectRoots so the retry
+      // can happen.
+      // Use classList (exact-class match) and explicit attribute checks; a
+      // substring scan for "disabled" can over-match unrelated class names.
+      const isDisabled =
+        root.hasAttribute?.('disabled') ||
+        root.getAttribute?.('aria-disabled') === 'true' ||
+        root.classList?.contains('ng-select-disabled') === true
+      if (isDisabled) {
+        console.log('[QA fill]   → SKIP: disabled (cascade child? retried next pass)', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+        continue
+      }
+      handledNgSelectRoots.add(root)
+      console.log('[QA fill]   → FILL:', JSON.stringify(lcPh)) // TEMP DIAGNOSTIC
+      await selectFirstNonEmptyNgSelect(root)
+      continue
+    }
+    if (kind === 'select') {
+      if (control.disabled || control.readOnly) continue
+      if (!fillEvenIfPopulated && String(control.value || '').trim()) continue
+      const options = Array.from(control.options || [])
+      const nonEmpty = options.find(opt => String(opt.value || '').trim())
+      if (nonEmpty) {
+        control.value = nonEmpty.value
+        dispatchInputEvents(control)
+      }
+      continue
+    }
+    if (control.disabled || control.readOnly) continue
+    const type = String(control.type || '').toLowerCase()
+    const beforeWidget = isLikelyWidgetTriggerControl(control, kind) ? snapshotVisibleControls() : null
+    if (type === 'checkbox') {
+      control.checked = true
+    } else if (isIdLikeControl(control)) {
+      const currentId = String(control.value || '').trim()
+      const wantId = String(reusableIdValueForRun || '').trim()
+      if (!reusableIdValueForRun && currentId) {
+        reusableIdValueForRun = currentId
+      } else if (wantId && (fillEvenIfPopulated || !currentId || currentId !== wantId)) {
+        if (manualLike) await setInputLikeValueManually(control, reusableIdValueForRun)
+        else control.value = reusableIdValueForRun
+      }
+    } else {
+      const hasValue = String(control.value || '').trim().length > 0
+      if (!fillEvenIfPopulated && hasValue) {
+        // Keep existing user value as-is.
+      } else if (
+        manualLike &&
+        (type === 'text' ||
+          type === 'email' ||
+          type === 'tel' ||
+          type === 'number' ||
+          type === 'url' ||
+          type === 'search' ||
+          kind === 'textarea' ||
+          type === 'password')
+      ) {
+        await setInputLikeValueManually(control, getSafeDefaultInputValue(control, kind))
+      } else {
+        control.value = getSafeDefaultInputValue(control, kind)
+      }
+    }
+    dispatchInputEvents(control)
+    dispatchBlurEvent(control)
+    if (beforeWidget) {
+      await waitForWidgetSideEffects(beforeWidget, widgetWaitMs, 1)
+    }
+  }
+
+  const datePickerHosts = Array.from(
+    document.querySelectorAll('irembogov-custom-date-picker, irembogov-irembo-date-picker')
+  ).filter(sectionScope.inSection)
+  for (const comp of datePickerHosts) {
+    if (!isVisible(comp)) continue
+    if (excludePredicate(comp)) continue
+    const inp = comp.querySelector('input:not([type="hidden"])')
+    if (!inp || inp.disabled || inp.readOnly) continue
+    await setDateValuePreferPicker(inp, getSafeDateFallbackValue())
+    await wait(200)
+  }
+
+  const ngRoots = Array.from(document.querySelectorAll('ng-select, .ng-select, div[role="combobox"]')).filter(sectionScope.inSection)
+  for (const root of ngRoots) {
+    if (!isVisible(root)) continue
+    if (excludePredicate(root)) continue
+    if (deferCascadeChains && isLocationCascadeSelectRoot(root)) continue
+    if (!ngSelectRootAppearsUnselected(root)) continue
+    await selectFirstNonEmptyNgSelect(root)
+    await wait(200)
+  }
+
+  const natWraps = Array.from(document.querySelectorAll('formly-field, formly-wrapper-form-field')).filter(w => {
+    if (!sectionScope.inSection(w)) return false
+    const k = parseFormlyFieldIdKey(w.id)
+    return k && k.toLowerCase() === 'nationality'
+  })
+  for (const nw of natWraps) {
+    if (skipEl && nw.contains(skipEl)) continue
+    for (let round = 0; round < 8; round += 1) {
+      const open = Array.from(nw.querySelectorAll('ng-select, .ng-select, div[role="combobox"]')).filter(
+        el => isVisible(el) && ngSelectRootAppearsUnselected(el)
+      )
+      if (open.length === 0) break
+      for (const el of open) {
+        if (excludePredicate(el)) continue
+        await selectFirstNonEmptyNgSelect(el)
+        await wait(420)
+      }
+    }
+  }
+
+  await wait(120)
+}
+
+function countVisibleEmptyFillableControls() {
+  const controls = Array.from(document.querySelectorAll('input, select, textarea, ng-select, .ng-select, div[role="combobox"]'))
+  const handledRadioGroups = new Set()
+  const handledNgSelectRoots = new Set()
+  let missing = 0
+
+  for (const control of controls) {
+    if (!isVisible(control)) continue
+    const kind = detectFieldKind(control)
+
+    if (kind === 'radio') {
+      const name = String(control.name || '').trim()
+      const key = name || getLabelText(control) || String(control.id || '')
+      if (!key || handledRadioGroups.has(key)) continue
+      handledRadioGroups.add(key)
+      const group = collectRadioGroup(control, name)
+      const anyChecked = group.some(r => r.checked)
+      if (!anyChecked) missing += 1
+      continue
+    }
+
+    if (kind === 'ng-select') {
+      const root = control.closest('ng-select, .ng-select, [role="combobox"]') || control
+      if (handledNgSelectRoots.has(root)) continue
+      handledNgSelectRoots.add(root)
+      if (ngSelectRootAppearsUnselected(root)) missing += 1
+      continue
+    }
+
+    if (kind === 'select') {
+      if (control.disabled || control.readOnly) continue
+      if (!String(control.value || '').trim()) missing += 1
+      continue
+    }
+
+    if (control.disabled || control.readOnly) continue
+    const type = String(control.type || '').toLowerCase()
+    if (type === 'hidden' || type === 'file') continue
+    if (type === 'checkbox') {
+      if (!control.checked) missing += 1
+      continue
+    }
+    if (!String(control.value || '').trim()) missing += 1
+  }
+
+  return missing
+}
+
+async function ensureAllVisibleFieldsFilledForSubmit(fillOptions, maxPasses = 4) {
+  let remaining = Infinity
+  let passes = 0
+  for (let i = 0; i < maxPasses; i += 1) {
+    await fillAllFieldsWithValidValues(null, fillOptions)
+    await wait(180)
+    remaining = countVisibleEmptyFillableControls()
+    passes = i + 1
+    if (remaining === 0) break
+  }
+  return { passes, remaining }
+}
+
+/** successful_submit: fill current step, then Continue/Next so later wizard fields mount, repeat (cap), final fill.
+ *
+ * Short-circuits on URL change after every Continue click — once the form has
+ * advanced to a new page (final submit, or wizard navigation), the test is
+ * already a pass; no point burning more fill cycles. */
+async function runSuccessfulSubmitFillSequence(fillOptions, maxWizardSteps = 3) {
+  let lastRemaining = -1
+  let noProgressRounds = 0
+  const urlAtStart = String(location.href || '')
+  for (let step = 0; step < maxWizardSteps; step += 1) {
+    const { remaining } = await ensureAllVisibleFieldsFilledForSubmit(fillOptions, 3)
+    console.log('[QA-submit] wizard step', step + 1, 'remaining empty fields:', remaining)
+    if (remaining === lastRemaining && remaining > 0) noProgressRounds += 1
+    else noProgressRounds = 0
+    lastRemaining = remaining
+    if (noProgressRounds >= 2) break
+
+    const btn = findContinueButton()
+    if (!btn) break
+    scrollTestTargetIntoView(btn)
+    await wait(280)
+    btn.click()
+    await wait(450)
+
+    // Stop the moment Continue actually advanced the form.
+    if (String(location.href || '') !== urlAtStart) return
+  }
+  await ensureAllVisibleFieldsFilledForSubmit(fillOptions, 3)
+}
+
+function collectDiscoveryRequiredErrors() {
+  const texts = []
+  const seen = new Set()
+  for (const entry of getVisibleValidationEntries()) {
+    const txt = String(entry?.text || '').trim()
+    if (!txt || seen.has(txt)) continue
+    seen.add(txt)
+    texts.push(txt)
+  }
+  return texts
+}
+
+/**
+ * Map a run-start discovery line to this required_field case (label + expected + what_to_test).
+ * Used to annotate passes and to rescue when Step C cannot see the message in the field container.
+ */
+function matchDiscoveryLineForRequiredCase(tc, fieldLabel) {
+  if (!Array.isArray(discoveredRequiredErrors) || discoveredRequiredErrors.length === 0) return ''
+  const targetNorm = sanitizeSearchLabel(fieldLabel)
+  const expNorm = normalizeLabelText(String(tc?.expected_result || ''))
+  const whatNorm = normalizeLabelText(String(tc?.what_to_test || ''))
+  for (const raw of discoveredRequiredErrors) {
+    const line = String(raw || '').trim()
+    if (!line) continue
+    const norm = normalizeLabelText(line)
+    if (looksAggregatedDiscoveryLine(norm)) continue
+    if (!labelStrongMatch(norm, targetNorm)) continue
+    const one = [{ element: null, text: line }]
+    if (pickMatchedMessage(one, tc?.expected_result, fieldLabel, null, String(tc?.what_to_test || ''))) {
+      return line
+    }
+    if (
+      expNorm &&
+      (messageContainsTwoConsecutiveWordsFromExpected(norm, expNorm) ||
+        messageContainsThreeConsecutiveWordsFromExpected(norm, expNorm))
+    ) {
+      return line
+    }
+    if (formatValidationLooseMatch(norm, expNorm, whatNorm, targetNorm)) return line
+  }
+  return ''
+}
+
+async function clickContinueWithoutValidationRead() {
+  const button = findContinueButton()
+  if (!button) return { ok: false, error: 'Continue/Next button not found on page' }
+  scrollTestTargetIntoView(button)
+  await wait(280)
+  button.click()
+  return { ok: true }
+}
+
+async function requiredFieldRunPreflightStepAB() {
+  throwIfCancelled()
+  // Only click Continue if the form has visible empty fields. With state
+  // carrying across tests (skipFormResetAfter: true) and the preflight
+  // re-triggered on every primeAfterNavigation, a fully-filled form would
+  // let preflight Continue advance the page unintentionally — losing the
+  // section the bucketer thinks it's on. Skip the click in that case; we
+  // still capture whatever validation entries are currently visible.
+  if (countVisibleEmptyFillableControls() === 0) {
+    discoveredRequiredErrors = collectDiscoveryRequiredErrors()
+    return
+  }
+  await clickContinueWithoutValidationRead()
+  await wait(500)
+  discoveredRequiredErrors = collectDiscoveryRequiredErrors()
+  await wait(80)
+}
+
+function requiredFieldContainerMsgSel() {
+  return QA_ENGINE.selectors.requiredFieldContainerMsg.join(', ')
+}
+
+function getRequiredFieldValidationRoots(targetEl) {
+  const roots = new Set()
+  if (!targetEl?.closest) return []
+  const r1 = getTargetFieldValidationRoot(targetEl)
+  const r2 = getRadioGroupContainer(targetEl)
+  const mat = targetEl.closest(
+    'mat-form-field, .mat-mdc-form-field, .mat-form-field, .mdc-text-field, .mat-mdc-text-field-wrapper'
+  )
+  if (r1) roots.add(r1)
+  if (r2) roots.add(r2)
+  if (mat) roots.add(mat)
+  if (roots.size === 0) {
+    const p = targetEl.parentElement
+    if (p) roots.add(p)
+  }
+  return Array.from(roots).filter(Boolean)
+}
+
+function getRequiredFieldValidationInContainer(targetEl) {
+  if (!targetEl) return []
+  const roots = getRequiredFieldValidationRoots(targetEl)
+  const out = []
+  const seen = new Set()
+  for (const root of roots) {
+    if (!root?.querySelectorAll) continue
+    for (const el of root.querySelectorAll(requiredFieldContainerMsgSel())) {
+      if (!isVisible(el)) continue
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      if (!t || seen.has(t)) continue
+      seen.add(t)
+      out.push({ element: el, text: t })
+    }
+  }
+  return out
+}
+
+function detectFormAdvanced(urlBefore, sectionEl) {
+  if (String(location.href || '') !== String(urlBefore || '')) return true
+  if (sectionEl && document.contains(sectionEl) && !isVisible(sectionEl)) return true
+  return false
+}
+
+// Proxy for "the Angular model went valid" after a programmatic date restore: the field
+// must hold a value AND Angular must NOT mark the control invalid (ng-invalid on the input
+// or anywhere in its formly wrapper). If this returns false, the cheap commit didn't take
+// and the caller must fall back to the calendar re-drive.
+function isDatePickerModelValid(inputEl, host) {
+  if (!inputEl) return false
+  if (!String(inputEl.value || '').trim()) return false
+  const scope = host || inputEl.closest?.('formly-field, formly-wrapper-form-field') || inputEl.parentElement || inputEl
+  if (inputEl.classList?.contains('ng-invalid')) return false
+  if (scope?.classList?.contains?.('ng-invalid')) return false
+  if (scope?.querySelector?.('.ng-invalid')) return false
+  return true
+}
+
+async function refillTargetFieldToValidValue(target, kind, fieldLabel) {
+  if (!target) return
+  if (kind === 'radio') {
+    const group = collectRadioGroup(target, target?.name || '')
+    if (group[0]) {
+      group[0].click()
+      dispatchInputEvents(group[0])
+    }
+    return
+  }
+  if (kind === 'date') {
+    const dateInput = findDateInputForLabel(fieldLabel) || target
+    if (isCustomDatePickerInput(dateInput)) {
+      // Cheap restore first: write the display value AND the hidden ISO model input + fire the
+      // full event sequence synchronously (~0ms), instead of re-driving the calendar (~700ms).
+      // Then VERIFY the Angular model actually went valid — a programmatic set is sometimes
+      // ignored by custom pickers (visible field looks valid, model stays ng-invalid, and the
+      // next Continue is still blocked). If it didn't validate, fall back to the reliable
+      // calendar re-drive. Correct first, fast second.
+      const host =
+        dateInput.closest('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+        dateInput.parentElement
+      commitDateValueToControl(dateInput, host, getSafeDateFallbackValue())
+      await wait(80) // let Angular re-run validation on the fired events before checking
+      if (!isDatePickerModelValid(dateInput, host)) {
+        console.log('[QA-format] cheap date refill left model invalid — falling back to calendar re-drive') // TEMP DIAGNOSTIC
+        await setDateValuePreferPicker(dateInput, getSafeDateFallbackValue())
+      }
+    } else {
+      dateInput.value = getSafeDateFallbackValue()
+      dispatchInputEvents(dateInput)
+      dispatchBlurEvent(dateInput)
+    }
+    return
+  }
+  if (kind === 'ng-select') {
+    const ng =
+      target.closest?.('ng-select, .ng-select, [role="combobox"]') ||
+      target
+    await selectFirstNonEmptyNgSelect(ng)
+    return
+  }
+  const tag = String(target.tagName || '').toLowerCase()
+  if (kind === 'select' || tag === 'select') {
+    const options = Array.from(target.options || [])
+    const nonEmpty = options.find(opt => String(opt.value || '').trim())
+    if (nonEmpty) {
+      target.value = nonEmpty.value
+      dispatchInputEvents(target)
+    }
+    return
+  }
+  const type = String(target.type || '').toLowerCase()
+  if (type === 'checkbox') {
+    target.checked = true
+    dispatchInputEvents(target)
+    return
+  }
+  if (isIdLikeControl(target) && String(reusableIdValueForRun || '').trim()) {
+    await setInputLikeValueManually(target, reusableIdValueForRun)
+    return
+  }
+  target.value = getSafeDefaultInputValue(target, kind)
+  dispatchInputEvents(target)
+  dispatchBlurEvent(target)
+}
+
+function appendRunStartMappingNote(message, preflightLine) {
+  const base = String(message || '').trim()
+  if (!preflightLine) return base
+  return base
+}
+
+async function executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, field) {
+  if (target.kind !== 'radio' && (field.disabled || field.readOnly)) {
+    return { skipped: true, reason: 'field is disabled — auto-filled by widget' }
+  }
+
+  const preflightLine = matchDiscoveryLineForRequiredCase(tc, fieldLabel)
+
+  const urlBefore = String(location.href || '')
+  const sectionEl = field?.closest?.(
+    'formly-group, .card, .wizard-step, .step-content, .modal-body, formly-wrapper-form-field, formly-field'
+  )
+
+  if (target.kind === 'radio') {
+    const group = collectRadioGroup(field, field?.name || '')
+    if (group.length > 0) {
+      await ensureRadioGroupUnselected(field, 6)
+    }
+  } else if (target.kind === 'date') {
+    const dateInput = findDateInputForLabel(fieldLabel) || field
+    if (isCustomDatePickerInput(dateInput)) {
+      await clearCustomDatePickerValue(dateInput)
+    } else {
+      dateInput.value = ''
+      dispatchInputEvents(dateInput)
+      dispatchBlurEvent(dateInput)
+    }
+  } else if (target.kind === 'ng-select') {
+    const ng = findNgSelectForLabel(fieldLabel) || field
+    await clearNgSelectValue(ng)
+  } else if (target.kind === 'select') {
+    field.value = ''
+    dispatchInputEvents(field)
+    dispatchBlurEvent(field)
+  } else {
+    field.value = ''
+    dispatchInputEvents(field)
+    dispatchBlurEvent(field)
+  }
+
+  await wait(200)
+  const clicked = await clickContinueWithoutValidationRead()
+  if (!clicked.ok) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(120)
+    return { passed: false, message: clicked.error, skipFullResetAfter: true }
+  }
+  await wait(700)
+
+  if (detectFormAdvanced(urlBefore, sectionEl)) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(120)
+    return {
+      passed: false,
+      message: 'Form advanced — field was not properly cleared',
+      skipFullResetAfter: true
+    }
+  }
+
+  let containerEntries = getRequiredFieldValidationInContainer(field)
+  if (containerEntries.length === 0) {
+    await wait(450)
+    containerEntries = getRequiredFieldValidationInContainer(field)
+  }
+  if (containerEntries.length > 0) {
+    const matched = pickMatchedMessage(
+      containerEntries,
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || '')
+    )
+    let rawDom = matched
+    if (!rawDom) {
+      const best = containerEntries.find(e => {
+        const n = normalizeLabelText(e.text)
+        return !looksAggregatedDiscoveryLine(n) && labelStrongMatch(n, sanitizeSearchLabel(fieldLabel))
+      })
+      rawDom = best ? best.text : ''
+    }
+    if (!rawDom && containerEntries.length === 1) rawDom = containerEntries[0].text
+    const domNorm = normalizeLabelText(rawDom || '')
+    const runNote =
+      rawDom && !looksAggregatedDiscoveryLine(domNorm)
+        ? String(rawDom).trim()
+        : rawDom
+          ? String(rawDom).trim().slice(0, 280)
+          : 'Passed: validation shown for empty field'
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(120)
+    return {
+      passed: true,
+      message: appendRunStartMappingNote(
+        String(runNote || 'Passed: validation shown for empty field').slice(0, 800),
+        preflightLine
+      ),
+      skipFullResetAfter: true,
+      ...(preflightLine ? { preflightMapped: true } : {})
+    }
+  }
+
+  const allVis = getVisibleValidationEntries()
+  const targetNorm = sanitizeSearchLabel(fieldLabel)
+  const scoped = allVis.filter(e => {
+    const norm = normalizeLabelText(e.text)
+    if (!norm) return false
+    return (
+      isMessageDomDescendantOfTargetFieldContainer(e.element, field) ||
+      labelStrongMatch(norm, targetNorm)
+    )
+  })
+  const pool = scoped.length > 0 ? scoped : allVis
+  const looseMatched = pickMatchedMessage(
+    pool,
+    tc?.expected_result,
+    fieldLabel,
+    target,
+    String(tc?.what_to_test || '')
+  )
+  if (looseMatched) {
+    const looseNorm = normalizeLabelText(looseMatched || '')
+    const note =
+      looseMatched && !looksAggregatedDiscoveryLine(looseNorm)
+        ? String(looseMatched).trim()
+          : String(looseMatched || '').trim().slice(0, 280) || 'Passed: validation matched for empty field'
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(120)
+    return {
+      passed: true,
+      message: appendRunStartMappingNote(
+        String(note || 'Passed: validation matched for empty field').slice(0, 800),
+        preflightLine
+      ),
+      skipFullResetAfter: true,
+      ...(preflightLine ? { preflightMapped: true } : {})
+    }
+  }
+
+  if (preflightLine) {
+    await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    await wait(120)
+    const shown = String(preflightLine || '').trim()
+    return {
+      passed: true,
+      message: shown
+        ? shown.slice(0, 800)
+        : 'Passed: required validation for this field was already shown during run-start preflight.',
+      skipFullResetAfter: true,
+      preflightMapped: true
+    }
+  }
+
+  await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+  await wait(120)
+  const hint =
+    discoveredRequiredErrors.length > 0
+      ? ` Run-start discovery had ${discoveredRequiredErrors.length} message(s): ${discoveredRequiredErrors.slice(0, 4).join(' | ')}`
+      : ''
+  const kindLabel = target?.kind || 'unknown'
+  return {
+    passed: false,
+    message: `Failed: "${fieldLabel}" (${kindLabel}) — field was cleared and Continue clicked but no matching validation message appeared. This usually means the field did not register as empty in Angular's model.${hint}`.slice(0, 900),
+    skipFullResetAfter: true
+  }
+}
+
+function isConditionalFieldTestType(tt) {
+  return tt === 'conditional_field' || tt === 'conditional_required' || tt === 'conditional_display'
+}
+
+function expectsConditionalFieldHidden(tc) {
+  return /not displayed|not visible|hidden|does not appear|not shown|displayed\s*:\s*no|is displayed\s*:\s*no/i.test(
+    String(tc?.expected_result || tc?.what_to_test || '')
+  )
+}
+
+function shouldStripConditionalClauseForFieldLabel(testType) {
+  return testType === 'conditional_display' || testType === 'conditional_field'
+}
+
+function isParentRadioAlreadySet(parentField, triggerValue) {
+  if (!parentField || parentField.type !== 'radio') return false
+  const lowerTrigger = normalizeText(triggerValue)
+  const radios = collectRadioGroup(parentField, parentField.name || '')
+  const match = radios.find(r => {
+    const val = normalizeText(r.value)
+    const label = normalizeText(getLabelText(r) || r.closest('label')?.textContent || '')
+    return val === lowerTrigger || label === lowerTrigger || val.includes(lowerTrigger) || label.includes(lowerTrigger)
+  })
+  return Boolean(match?.checked)
+}
+
+// [Phase 2] Tracks the parent a conditional label_check set, so it can be reset
+// to empty once the label_check batch for that parent ends.
+let pendingConditionalLabelParent = null
+
+/** Reset a conditional parent field (radio / ng-select / input) back to empty. */
+async function clearConditionalParent(p) {
+  if (!p?.label) return
+  const field = resolveConditionalParentField({ parentLabel: p.label, triggerValue: '' })
+  if (!field) return
+  if (String(field.type || '').toLowerCase() === 'radio') {
+    forceClearRadioGroupSelection(field)
+  } else {
+    const root = field.closest?.('ng-select, .ng-select, [role="combobox"]')
+    if (root) await clearNgSelectValue(root)
+    else clearFieldValue(field)
+  }
+}
+
+/** Read ng-select placeholder text without opening the dropdown. */
+function readNgSelectPlaceholderClosed(root) {
+  if (!root) return ''
+  // Climb to the TRUE ng-select root FIRST. The caller often hands us the INNER .ng-input /
+  // [role="combobox"] div — .ng-placeholder is NOT inside that; it's a sibling in
+  // .ng-value-container one level UP inside <ng-select>. Searching from the .ng-input alone
+  // misses it, so resolve the ancestor <ng-select>/.ng-select and search from there.
+  const selectRoot = root.closest?.('ng-select, .ng-select') || root
+  const container = selectRoot.matches?.('.ng-select-container, [role="combobox"]')
+    ? selectRoot
+    : (selectRoot.querySelector('.ng-select-container, [role="combobox"]') || selectRoot)
+  const combobox = (selectRoot.matches?.('[role="combobox"]') ? selectRoot : null) || selectRoot.querySelector('[role="combobox"]')
+  const innerInput = container.querySelector('input') || selectRoot.querySelector('input')
+  // Try every source ng-select uses, first non-empty wins, all readable without opening:
+  //   1. .ng-value-container .ng-placeholder text (canonical spot; sibling of .ng-input),
+  //   2. any .ng-placeholder text under the ng-select,
+  //   3. the <ng-select placeholder="…"> attribute (its [placeholder] binding lands here),
+  //   4. the inner search input's placeholder attribute,
+  //   5. aria-placeholder on the combobox / container.
+  const candidates = [
+    selectRoot.querySelector('.ng-value-container .ng-placeholder')?.textContent,
+    selectRoot.querySelector('.ng-placeholder')?.textContent,
+    container.querySelector('.ng-placeholder')?.textContent,
+    selectRoot.getAttribute?.('placeholder'),
+    innerInput?.getAttribute?.('placeholder'),
+    combobox?.getAttribute?.('aria-placeholder'),
+    container.getAttribute?.('aria-placeholder')
+  ]
+  for (const c of candidates) {
+    const v = String(c || '').trim()
+    if (v) return v
+  }
+  return ''
+}
+
+// Read a date field's placeholder from the INNER display <input>, not the wrapper. For a
+// custom irembogov date picker, the resolved lcField is the host/component, whose own
+// getAttribute('placeholder') is empty — the placeholder (e.g. "DD/MM/YYYY") lives on the
+// inner input. Falls back to the host's own placeholder for native <input type="date">.
+function readDatePickerPlaceholder(lcField, fieldLabel) {
+  const host =
+    lcField?.closest?.('irembogov-custom-date-picker, irembogov-irembo-date-picker, [class*="custom-datepicker"], [class*="datepicker"]') ||
+    lcField
+  const inner =
+    findDateInputForLabel(fieldLabel) ||
+    host?.querySelector?.('input') ||
+    (String(lcField?.tagName || '').toLowerCase() === 'input' ? lcField : null)
+  return String(
+    inner?.getAttribute?.('placeholder') || inner?.placeholder ||
+    lcField?.getAttribute?.('placeholder') || lcField?.placeholder || ''
+  )
+}
+
+/** Section/block name = text of the nearest visible <h1 class="section-title"> that precedes this field. */
+/** Ordered visible <h1 class="section-title"> heading elements (document order).
+ *  Single source of truth for every place that reads section headings — the
+ *  navigator (getCurrentSectionName), label_check (getFieldSectionName), and the
+ *  structure capture all consume this, so the strings can never drift apart. */
+function visibleSectionHeadings() {
+  return Array.from(document.querySelectorAll('h1.section-title')).filter(isVisible)
+}
+
+function getFieldSectionName(el) {
+  if (!el) return ''
+  let best = ''
+  for (const t of visibleSectionHeadings()) {
+    // keep the last title that appears BEFORE el in document order
+    if (t.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      best = String(t.textContent || '').trim()
+    }
+  }
+  return best
+}
+
+/** Read the live form's section headings + visible fields for the CURRENT step.
+ *  Reuses the SAME helpers as the navigator (visibleSectionHeadings) and label_check
+ *  (getFieldSectionName, getFieldQuestionLabel), so every stored string is byte-identical
+ *  to what the runner reads. The wizard renders one step at a time, so this captures the
+ *  current step only — the server MERGES successive captures into the full structure. */
+function captureLiveFormStructure() {
+  const sections = visibleSectionHeadings()
+    .map((el, i) => ({ name: String(el.textContent || '').trim(), order: i }))
+    .filter(s => s.name)
+
+  // The navigable SECTION is the stepper step; the h1.section-title is the BLOCK — two
+  // different levels. Read the stepper ONCE (it's the same for every field on this step).
+  // If the stepper can't be read, section stays '' — we do NOT fall back to the h1, which
+  // would re-mislabel the block as the section.
+  const stepperSection = getActiveStepperSectionName() || ''
+
+  const controlSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+  const seen = new Set()
+  const fields = []
+  for (const el of document.querySelectorAll(controlSel)) {
+    if (!isVisible(el)) continue
+    const label = getFieldQuestionLabel(el)        // group label for radios; wrapper label for ng-select/date
+    if (!label) continue
+    const block = getFieldSectionName(el)           // nearest preceding visible h1.section-title IS the block
+    const section = stepperSection                  // navigable step from the stepper, NOT the h1
+    const key = `${label}::${section}::${block}`     // dedup radio group inputs + ng-select host/inner input
+    if (seen.has(key)) continue
+    seen.add(key)
+    fields.push({ label, section, block })
+  }
+  return { sections, fields }
+}
+
+async function executeTestCase(tc, runContext = {}) {
+  throwIfCancelled()
+  updateLiveRunIndicator(tc, null, 'Preparing')
+  seedReusableIdFromPageIfTyped()
+  const testType = String(tc?.test_type || '').trim()
+  const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+  const fieldLabel = sanitizeSearchLabel(
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+  )
+  const fieldName = String(tc?.field_name || '').trim()
+  let conditionalTrace = ''
+  let conditionalSetupKey = ''
+
+  await expandCollapsedSectionsOnce()
+
+  // [Phase 2] Once we leave the conditional label_check batch (the next test is
+  // no longer a label_check), reset the parent that label_check left set.
+  if (pendingConditionalLabelParent && testType !== 'label_check') {
+    await clearConditionalParent(pendingConditionalLabelParent)
+    pendingConditionalLabelParent = null
+  }
+
+  // label_check is read-only EXCEPT conditional fields, where it sets the parent
+  // to the trigger to reveal the child (and resets the parent after the last
+  // option). No preflight, no fill, no Continue.
+  if (testType === 'label_check') {
+    const exp = String(tc?.expected_result || '')
+    const norm = v => String(v || '').replace(/\*/g, '').replace(/\s+/g, ' ').trim()
+    const expectedLabel = norm(tc?.field_label)
+    const expectedPlaceholder = norm((exp.match(/;\s*placeholder\s*:\s*([^;]+)/i) || [])[1] || '')
+    // Section and block are stored as their own fields on the test case (two-level model).
+    // Fall back to the legacy "; section:" tag in expected_result only if tc.section is blank.
+    const expectedSection = norm(tc?.section) || norm((exp.match(/;\s*section\s*:\s*([^;]+)/i) || [])[1] || '')
+    const expectedBlock = norm(tc?.block)
+    const parentM = exp.match(/;\s*parent\s*:\s*([^;=]+?)\s*=\s*([^;]+?)\s*$/i)
+    const parentLabel = parentM ? norm(parentM[1]) : ''
+    const parentTrigger = parentM ? String(parentM[2]).trim() : ''
+
+    // Conditional: set the parent to this trigger so the child becomes visible.
+    if (parentLabel && parentTrigger) {
+      if (pendingConditionalLabelParent && pendingConditionalLabelParent.label !== parentLabel) {
+        await clearConditionalParent(pendingConditionalLabelParent)
+        pendingConditionalLabelParent = null
+      }
+      const parentField = resolveConditionalParentField({ parentLabel, triggerValue: parentTrigger })
+      if (!parentField || !isVisible(parentField)) {
+        return { skipped: true, reason: 'field not found or not visible' }
+      }
+      if (!isParentRadioAlreadySet(parentField, parentTrigger)) {
+        if (!setParentConditionalValue(parentField, parentTrigger)) applyConditionalDomFallback(parentLabel, parentTrigger)
+      }
+      pendingConditionalLabelParent = { label: parentLabel }
+      // Poll for the child to appear — same 5×200ms retry shape the conditional
+      // handlers use — instead of a single fixed wait that fails on slow fields.
+      let childAppeared = false
+      for (let i = 0; i < 10; i += 1) {
+        const probe = resolveFieldTarget(fieldLabel, fieldName)?.element
+        const vis = Boolean(probe && isVisible(probe))
+        console.log('[QA cond] label_check child poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+        if (vis) { childAppeared = true; scrollTestTargetIntoView(probe); break }
+        await wait(300)
+      }
+      if (!childAppeared) {
+        return { passed: false, message: 'conditional field did not appear after setting parent' }
+      }
+    }
+
+    const lcTarget = resolveFieldTarget(fieldLabel, fieldName)
+    const lcField = lcTarget?.element
+    if (!lcField || !isVisible(lcField)) {
+      return { skipped: true, reason: 'field not found or not visible' }
+    }
+    scrollTestTargetIntoView(lcField)
+    updateLiveRunIndicator(tc, lcField, 'Reading label')
+    if (!expectedLabel) {
+      return { skipped: true, reason: 'no expected label in SRD' }
+    }
+
+    // ng-select: read placeholder from the closed control first (.ng-placeholder is
+    // usually present in the DOM while closed). Only open + poll when that read is
+    // empty and we need to compare a placeholder. Escape closes if we opened.
+    const lcRoot = lcTarget.kind === 'ng-select'
+      ? (lcField.closest('ng-select, .ng-select, [role="combobox"]') || lcField)
+      : null
+    let lcOpened = false
+    let lcPlaceholderPolled = ''
+    let lcPolls = 0
+    if (lcRoot) {
+      lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
+      console.log('[QA lc-dd] closed read | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled)) // TEMP DIAGNOSTIC
+      if (!lcPlaceholderPolled && expectedPlaceholder) {
+        const opener = lcRoot.querySelector('.ng-select-container, [role="combobox"]') || lcRoot
+        if (typeof opener.click === 'function') {
+          opener.click()
+          lcOpened = true
+          for (lcPolls = 1; lcPolls <= 15; lcPolls += 1) {
+            await wait(100)
+            lcPlaceholderPolled = readNgSelectPlaceholderClosed(lcRoot)
+            if (lcPlaceholderPolled) break
+          }
+          console.log('[QA lc-dd] opened fallback | .ng-placeholder =', JSON.stringify(lcPlaceholderPolled), 'after', lcPolls, 'poll(s)') // TEMP DIAGNOSTIC
+        } else {
+          console.log('[QA lc-dd] opener has no click() — open fallback skipped') // TEMP DIAGNOSTIC
+        }
+      }
+      // Placeholder STILL empty after all four sources + open/poll — dump the resolved
+      // ng-select outerHTML so we can see which element/attribute actually holds the text.
+      if (!lcPlaceholderPolled) {
+        console.log('[QA lc-html]', String(lcRoot?.outerHTML || lcField?.outerHTML || '').slice(0, 2000)) // TEMP DIAGNOSTIC
+      }
+    }
+    try {
+      // Verify ALL FOUR attributes — label, placeholder, section, block — case-insensitively,
+      // collecting every real mismatch so the tester sees them together. Section and block are
+      // read LIVE from the DOM/stepper (no hardcoded names) and only checked when BOTH the
+      // expected value and the live reading are non-empty — a blank on either side is a missing
+      // value, not a defect, so it is noted in the pass message instead of failing the test.
+      const failures = []
+      const skipNotes = []
+
+      // 1) LABEL — case-INSENSITIVE (expectedLabel is guaranteed non-empty by the guard above).
+      const actualLabel = norm(getFieldQuestionLabel(lcField))
+      if (actualLabel.toLowerCase() !== expectedLabel.toLowerCase()) {
+        failures.push(`Expected label "${expectedLabel}" but found "${actualLabel || '(none)'}"`)
+      }
+      const labelCaseDiffers = actualLabel !== expectedLabel && actualLabel.toLowerCase() === expectedLabel.toLowerCase()
+
+      // 2) PLACEHOLDER — case-INSENSITIVE; skipped for radios. ng-select reads its own
+      //    .ng-placeholder text; plain inputs read the attribute/property.
+      let placeholderRead = ''
+      let placeholderChecked = false
+      let placeholderCaseDiffers = false
+      // Placeholder applies only to free-text-style controls. Skip types with NO placeholder
+      // concept — radio, file, and checkbox (checkbox falls through to kind 'input', so detect
+      // it by the element's type) — otherwise the read is always empty → false "(none)".
+      const lcType = String(lcField?.type || '').toLowerCase()
+      const placeholderApplies =
+        lcTarget.kind !== 'radio' && lcTarget.kind !== 'file' && lcType !== 'checkbox'
+      if (expectedPlaceholder && placeholderApplies) {
+        placeholderChecked = true
+        placeholderRead =
+          lcTarget.kind === 'ng-select'
+            ? norm(lcPlaceholderPolled)
+            : lcTarget.kind === 'date'
+              ? norm(readDatePickerPlaceholder(lcField, fieldLabel))
+              : norm(lcField.getAttribute?.('placeholder') || lcField.placeholder || '')
+        if (lcTarget.kind === 'ng-select') {
+          console.log('[QA lc-dd] placeholder read=', JSON.stringify(placeholderRead), '| expected=', JSON.stringify(expectedPlaceholder), '| matchCI=', placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase()) // TEMP DIAGNOSTIC
+        }
+        // TEMP DIAGNOSTIC — reveal invisible-character / whitespace / empty-read differences.
+        console.log('[QA lc-ph] expected=' + JSON.stringify(expectedPlaceholder) + ' (len ' + expectedPlaceholder.length + ') | actual=' + JSON.stringify(placeholderRead) + ' (len ' + placeholderRead.length + ') | kind=' + lcTarget.kind + ' | matchCI=' + (placeholderRead.toLowerCase() === expectedPlaceholder.toLowerCase())) // TEMP DIAGNOSTIC
+        if (expectedPlaceholder.length !== placeholderRead.length) {
+          console.log('[QA lc-ph] len differs — expected codes=[' + Array.from(expectedPlaceholder).map(c => c.charCodeAt(0)).join(',') + '] | actual codes=[' + Array.from(placeholderRead).map(c => c.charCodeAt(0)).join(',') + ']') // TEMP DIAGNOSTIC
+        }
+        if (placeholderRead.toLowerCase() !== expectedPlaceholder.toLowerCase()) {
+          failures.push(`Expected placeholder "${expectedPlaceholder}" but found "${placeholderRead || '(none)'}"`)
+        } else {
+          placeholderCaseDiffers = placeholderRead !== expectedPlaceholder
+        }
+      }
+
+      // 3) SECTION — case-INSENSITIVE. Live section = the stepper step label ONLY. We do NOT
+      //    fall back to getCurrentSectionName() here: on some forms the stepper reads empty and
+      //    that fallback returns the h1.section-title, which is the BLOCK, not the section —
+      //    comparing the expected section against a block produces false failures. If the
+      //    stepper is empty the live section is genuinely unavailable, so we SKIP (note) rather
+      //    than compare. Checked only when BOTH sides are non-empty.
+      console.log('[QA lc-sb] expectedSection=' + JSON.stringify(expectedSection) + ' | getActiveStepperSectionName=' + JSON.stringify(norm(getActiveStepperSectionName())) + ' | getCurrentSectionName=' + JSON.stringify(norm(getCurrentSectionName())) + ' | getFieldSectionName(h1)=' + JSON.stringify(norm(getFieldSectionName(lcField))) + ' | expectedBlock=' + JSON.stringify(expectedBlock)) // TEMP DIAGNOSTIC
+      const liveSection = norm(getActiveStepperSectionName())
+      let sectionVerified = false
+      if (expectedSection && liveSection) {
+        sectionVerified = true
+        if (liveSection.toLowerCase() !== expectedSection.toLowerCase()) {
+          failures.push(`Expected section "${expectedSection}" but field is under section "${liveSection}"`)
+        }
+      } else if (!expectedSection) {
+        skipNotes.push('section not verified — none specified in test case')
+      } else {
+        skipNotes.push('section not verified — live section unavailable')
+      }
+
+      // 4) BLOCK — case-INSENSITIVE. Live block = nearest h1.section-title (the block-level
+      //    heading). Checked only when BOTH sides are non-empty.
+      const liveBlock = norm(getFieldSectionName(lcField))
+      let blockVerified = false
+      if (expectedBlock && liveBlock) {
+        blockVerified = true
+        if (liveBlock.toLowerCase() !== expectedBlock.toLowerCase()) {
+          failures.push(`Expected block "${expectedBlock}" but field is under block "${liveBlock}"`)
+        }
+      } else if (!expectedBlock) {
+        skipNotes.push('block not verified — none specified in test case')
+      } else {
+        skipNotes.push('block not verified — no live block heading')
+      }
+
+      if (failures.length) {
+        return { passed: false, message: failures.join('; ') }
+      }
+
+      // Full pass — confirm every attribute that was actually verified.
+      const verifiedParts = [`Label "${actualLabel}"`]
+      if (placeholderChecked) verifiedParts.push(`placeholder "${placeholderRead}"`)
+      if (sectionVerified) verifiedParts.push(`section "${liveSection}"`)
+      if (blockVerified) verifiedParts.push(`block "${liveBlock}"`)
+      const caseNote = (labelCaseDiffers || placeholderCaseDiffers) ? ' — NOTE: only letter case differs, verify' : ''
+      const skipNote = skipNotes.length ? ` (${skipNotes.join('; ')})` : ''
+      return {
+        passed: true,
+        message: `${verifiedParts.join(', ')} — all correct${caseNote}${skipNote}`
+      }
+    } finally {
+      if (lcOpened) {
+        const escTarget = lcRoot.querySelector('input') || lcRoot
+        escTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+        console.log('[QA lc-dd] Escape dispatched to close dropdown') // TEMP DIAGNOSTIC
+      }
+    }
+  }
+
+  const deferWhatToTestSteps = isConditionalFieldTestType(testType)
+  if (!deferWhatToTestSteps) {
+    await parseAndExecuteSteps(tc?.what_to_test)
+  }
+  if (isConditionalFieldTestType(testType)) {
+    await wait(180)
+  }
+
+  if (runContext.isRunStart || runContext.primeAfterNavigation) {
+    requiredFieldRunPreflightDone = false
+    discoveredRequiredErrors = []
+    hasExpandedSectionsForRun = false
+  }
+  if (!requiredFieldRunPreflightDone && (runContext.isRunStart || testType === 'required_field')) {
+    await requiredFieldRunPreflightStepAB()
+    requiredFieldRunPreflightDone = true
+  }
+
+  const executableTypes = new Set([
+    'required_field',
+    'format_validation',
+    'conditional_field',
+    'conditional_required',
+    'conditional_display',
+    'successful_submit'
+  ])
+  await maybePrepareIdTypeFromWhatToTest(tc)
+  const ctxHint = [String(tc?.name || ''), String(tc?.what_to_test || '').slice(0, 320)]
+    .filter(Boolean)
+    .join(' | ')
+  const locCascadeHint = /\b(district|sector|cell|village|province|location)\b/i.test(
+    `${fieldLabel} ${fieldName} ${ctxHint}`
+  )
+  let target = testType === 'successful_submit'
+    ? { element: null, kind: 'unknown' }
+    : await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+        contextHint: ctxHint
+      })
+  if (
+    !target.element &&
+    ['required_field', 'format_validation'].includes(testType)
+  ) {
+    const spec = parseConditionalSpec(tc)
+    if (String(spec.parentLabel || '').trim() && String(spec.triggerValue || '').trim()) {
+      const recovered = applyConditionalDomFallback(spec.parentLabel, spec.triggerValue)
+      if (recovered) {
+        await wait(1000)
+        target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+          contextHint: ctxHint
+        })
+      }
+    }
+  }
+  const combinedProbe = normalizeLabelText(`${tc?.field_label || ''} ${tc?.name || ''} ${tc?.what_to_test || ''}`)
+  if (!target.element && /id number/i.test(combinedProbe)) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await wait(500)
+      target = await resolveTargetWithTypeHints(fieldLabel, fieldName, {
+        contextHint: ctxHint
+      })
+      if (target.element) break
+    }
+  }
+
+  if (isConditionalFieldTestType(testType)) {
+    const spec = parseConditionalSpec(tc)
+    const conditionalParentField = resolveConditionalParentField(spec)
+    const setupKey = parentSetupKeyFromTc(tc)
+    conditionalSetupKey = setupKey
+    // Skip re-clicking the parent if already in correct state.
+    // Re-clicking an already-selected radio on Angular forms re-triggers
+    // change detection which can reset the entire cascade chain.
+    const skipParentApply = isParentRadioAlreadySet(conditionalParentField, spec.triggerValue)
+    conditionalTrace = `Condition: ${String(spec.parentLabel || 'unknown').trim() || 'unknown'}=${String(spec.triggerValue || 'unknown').trim() || 'unknown'}${skipParentApply ? ' [same parent — batch]' : ''}`
+
+    if (!skipParentApply) {
+      if (!conditionalParentField) {
+        return {
+          passed: false,
+          message: `Parent field ${spec.parentLabel || 'unknown'} not found on page`,
+          parentSetupKey: setupKey
+        }
+      }
+      scrollTestTargetIntoView(conditionalParentField)
+      await wait(240)
+      let applied = setParentConditionalValue(conditionalParentField, spec.triggerValue)
+      if (!applied) applied = applyConditionalDomFallback(spec.parentLabel, spec.triggerValue)
+      if (!applied) {
+        return {
+          passed: false,
+          message: 'Could not set conditional parent field value',
+          parentSetupKey: setupKey
+        }
+      }
+      await wait(150)
+    } else {
+      await wait(70)
+    }
+    await parseAndExecuteSteps(tc?.what_to_test)
+    await wait(90)
+
+    const navOpts = { allowContinue: false, contextHint: ctxHint }
+    const locNorm = sanitizeSearchLabel(fieldLabel)
+    const rwandaYesLocation =
+      normalizeText(spec.triggerValue) === 'yes' && /\b(district|sector|cell|village)\b/.test(locNorm)
+
+    // Visibility-only conditional tests (Required: N/A, not "stays hidden") only need
+    // the field to be visible. parseAndExecuteSteps already applied the SRD prerequisites,
+    // so the cascade-fill trio below — resolveWithCascadeChain / resolveTargetAfterCondition
+    // / resolveConditionalRequiredWithCascadeLoop — is dead work here (those loops exist
+    // to make fields fillable, not visible) and is the main source of multi-minute hangs.
+    const isVisibilityOnlyTest =
+      /required\s*:\s*n\/a/i.test(String(tc?.expected_result || '')) &&
+      !expectsConditionalFieldHidden(tc)
+
+    if (isVisibilityOnlyTest) {
+      let probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
+      for (let i = 0; i < 10; i += 1) {
+        const vis = Boolean(
+          probed?.element &&
+          isVisible(probed.element) &&
+          resolvedTargetMatchesLocationStep(fieldLabel, probed)
+        )
+        console.log('[QA cond] visibility poll', i + 1, '/10 — visible?', vis) // TEMP DIAGNOSTIC
+        if (vis) { scrollTestTargetIntoView(probed.element); break }
+        await wait(300)
+        probed = await resolveTargetWithTypeHints(fieldLabel, fieldName, { contextHint: ctxHint })
+      }
+      if (probed?.element && isVisible(probed.element)) target = probed
+    } else {
+      const settled = await resolveVisibleTargetWithNavigation(fieldLabel, fieldName, navOpts)
+      const quickReady =
+        settled.element &&
+        isVisible(settled.element) &&
+        resolvedTargetMatchesLocationStep(fieldLabel, settled)
+
+      if (quickReady) {
+        target = settled
+      } else {
+        const chainTarget = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+        if (chainTarget.element && isVisible(chainTarget.element)) {
+          target = chainTarget
+        }
+        const afterConditionTarget = await resolveTargetAfterCondition(fieldLabel, fieldName, {
+          rwandaYesLocation,
+          contextHint: ctxHint
+        })
+        if (afterConditionTarget.element && isVisible(afterConditionTarget.element)) {
+          target = afterConditionTarget
+        } else if (!target.element) {
+          target = await resolveWithCascadeChain(fieldLabel, fieldName, navOpts)
+        }
+      }
+    }
+    const expectsHiddenForCascade = expectsConditionalFieldHidden(tc)
+    if (
+      !expectsHiddenForCascade &&
+      !isVisibilityOnlyTest &&
+      (!target?.element || !isVisible(target.element))
+    ) {
+      const deep = await resolveConditionalRequiredWithCascadeLoop(fieldLabel, fieldName, ctxHint)
+      if (deep?.element && isVisible(deep.element)) target = deep
+      else {
+        return {
+          passed: false,
+          message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found after cascade chain resolution`,
+          parentSetupKey: setupKey
+        }
+      }
+    }
+    conditionalTrace = `${conditionalTrace}; cascade_target=${target?.element ? 'found' : 'missing'}`
+    // Keep conditional flow cascade-driven; global prefill here can override location-chain choices.
+  } else if (
+    executableTypes.has(testType) &&
+    !isConditionalFieldTestType(testType) &&
+    !(testType === 'required_field' && requiredFieldRunPreflightDone)
+  ) {
+    await fillAllFieldsWithValidValues(target, {
+      manualLike: true,
+      deferCascadeChains: locCascadeHint
+    })
+  }
+
+  let field = target.element
+  const isConditionalType = isConditionalFieldTestType(testType)
+  const sameConditionalBatch =
+    isConditionalType &&
+    Boolean(conditionalSetupKey) &&
+    String(runContext.previousParentSetupKey || '') === String(conditionalSetupKey)
+  // User preference: only successful_submit should be allowed to auto-continue sections.
+  const allowAutoContinueForTargetResolution = testType === 'successful_submit'
+  const shouldRunSectionPrefillFallback =
+    allowAutoContinueForTargetResolution &&
+    ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display', 'label_check'].includes(testType) &&
+    !(sameConditionalBatch && isConditionalType)
+  if (!field && shouldRunSectionPrefillFallback) {
+    const expectsHiddenPrefill = expectsConditionalFieldHidden(tc)
+    const prefillMax =
+      isConditionalFieldTestType(testType) && expectsHiddenPrefill ? 2 : locCascadeHint ? 3 : 4
+    const prefillFill =
+      isConditionalFieldTestType(testType) && expectsHiddenPrefill
+        ? { widgetWaitMs: 1200 }
+        : locCascadeHint
+          ? { widgetWaitMs: 1600 }
+          : {}
+    const bySectionAdvance = await resolveWithPrefillAcrossSections(
+      fieldLabel,
+      fieldName,
+      ctxHint,
+      prefillMax,
+      prefillFill
+    )
+    if (bySectionAdvance.element && isVisible(bySectionAdvance.element)) {
+      target = bySectionAdvance
+      field = target.element
+    }
+  }
+  if (!field && isConditionalFieldTestType(testType) && expectsConditionalFieldHidden(tc)) {
+    return {
+      passed: true,
+      message: `Conditional field not in DOM or not resolved (treated as hidden when parent is No).${conditionalTrace ? ` ${conditionalTrace}` : ''}`.slice(0, 900),
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
+  }
+  if (!field && ['required_field', 'format_validation', 'conditional_field', 'conditional_required', 'conditional_display'].includes(testType)) {
+    return {
+      passed: false,
+      message: `Field ${fieldLabel || fieldName || tc?.name || 'unknown'} not found on page`,
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
+  }
+
+  if (field) {
+    scrollTestTargetIntoView(field)
+    await wait(260)
+    updateLiveRunIndicator(tc, field, 'Testing field')
+  }
+
+  if (testType === 'required_field') {
+    return executeRequiredFieldStepC(tc, fieldLabel, fieldName, target, field)
+  }
+
+  if (testType === 'format_validation') {
+    if (field.disabled || field.readOnly) {
+      return { skipped: true, reason: 'field is disabled — auto-filled by widget' }
+    }
+    // Fix 4: format validation is not meaningful for dropdowns — there is no free text to make "invalid".
+    if (target.kind === 'ng-select' || target.kind === 'select') {
+      return { skipped: true, reason: 'format validation not applicable to dropdown fields' }
+    }
+    // Checkboxes/radios have no free-text "format" to violate — they are checked/selected, not
+    // typed into. Writing an invalid STRING to a checkbox (setInputValueNative below) triggers a
+    // spurious "invalid (pattern)" that blocks Continue. Skip them, like dropdowns.
+    const fieldType = String(field?.type || '').toLowerCase()
+    if (fieldType === 'checkbox' || fieldType === 'radio' || target.kind === 'radio') {
+      return { skipped: true, reason: 'format validation not applicable to checkbox/radio fields' }
+    }
+
+    const invalid = getInvalidValueForFormat(tc)
+    let valueHost = field
+    if (target.kind === 'date') {
+      const dateInput = findDateInputForLabel(fieldLabel) || field
+      valueHost = dateInput
+      if (isCustomDatePickerInput(dateInput)) {
+        await setCustomDatePickerValue(dateInput, invalid)
+      } else {
+        setInputValueNative(dateInput, invalid)
+        dispatchInputEvents(dateInput)
+        dispatchBlurEvent(dateInput)
+      }
+    } else {
+      setInputValueNative(field, invalid)
+      dispatchInputEvents(field)
+      dispatchBlurEvent(field)
+    }
+
+    // Fix 2: read the value back; if Angular silently rejected it, skip instead of giving a misleading result.
+    await wait(60)
+    const afterVal = String(valueHost?.value || '').trim()
+    if (!afterVal) {
+      console.warn('[QA-format] invalid value not accepted by field:', fieldLabel, '| tried:', invalid)
+      return { skipped: true, reason: 'invalid value was not accepted by field — Angular may have rejected it' }
+    }
+
+    const clicked = await clickContinueAndReadFieldScopedFormatError(
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || ''),
+      valueHost
+    )
+    if (!clicked.ok) return { passed: false, message: clicked.error }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — invalid value did not block Continue.`
+      }
+    }
+    if (!clicked.belowField || !clicked.matched) {
+      return {
+        passed: false,
+        message: 'No error appeared below the field'
+      }
+    }
+    // Clean up: restore a valid value so the invalid value used to trigger
+    // format validation doesn't poison subsequent tests (especially
+    // successful_submit, which would otherwise be blocked by this field).
+    try {
+      await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+    } catch {
+      // Refill failure is non-fatal — the test result is already determined.
+    }
+    return {
+      passed: true,
+      message: String(clicked.matched || '').trim(),
+      skipFullResetAfter: true
+    }
+  }
+
+  if (isConditionalFieldTestType(testType)) {
+    const expectsHidden = expectsConditionalFieldHidden(tc)
+    const visible = isVisible(field)
+
+    if (expectsHidden) {
+      const passed = !visible
+      return {
+        passed,
+        message: passed
+          ? `Conditional field stayed hidden as expected.${conditionalTrace ? ` ${conditionalTrace}` : ''}`
+          : `Conditional field appeared but was expected hidden.${conditionalTrace ? ` ${conditionalTrace}` : ''}`,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+
+    if (!visible) {
+      return {
+        passed: false,
+        message: `Conditional field did not become visible.${conditionalTrace ? ` ${conditionalTrace}` : ''}`.slice(0, 900),
+      }
+    }
+
+    // Visibility-only check — "Displayed: Yes; Required: N/A"
+    // No need to clear the field and check required validation
+    const isVisibilityOnly = /required\s*:\s*n\/a/i.test(String(tc?.expected_result || ''))
+    if (isVisibilityOnly) {
+      await refillTargetFieldToValidValue(field, target.kind, fieldLabel)
+      await wait(150)
+      return {
+        passed: true,
+        message: `Field is visible as expected.${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.trim(),
+        skipFullResetAfter: true,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+
+    if (target.kind === 'ng-select') {
+      await clearNgSelectValue(field)
+    } else if (target.kind === 'date') {
+      const dateInput = findDateInputForLabel(fieldLabel) || field
+      dateInput.value = ''
+      dispatchInputEvents(dateInput)
+      dispatchBlurEvent(dateInput)
+    } else {
+      field.value = ''
+      dispatchInputEvents(field)
+      dispatchBlurEvent(field)
+    }
+    const clicked = await clickContinueAndReadErrors(
+      tc?.expected_result,
+      fieldLabel,
+      target,
+      String(tc?.what_to_test || '')
+    )
+    if (!clicked.ok) {
+      return {
+        passed: false,
+        message: clicked.error,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing "${fieldLabel || tc?.name || 'field'}" — field did not block submit. Subsequent tests on this section are unreliable.`,
+        ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+      }
+    }
+    const visibleAfter = await getVisibleValidationEntriesWithRetry({ quick: true })
+    const strict = pickMatchedMessageForConditionalRequired(
+      visibleAfter,
+      tc?.expected_result,
+      fieldLabel,
+      target
+    )
+    const passed = Boolean(strict)
+    const visOk = 'Field shown and is required.'
+    const domStrict = String(strict || '').trim()
+    const passNote =
+      domStrict && !looksAggregatedDiscoveryLine(normalizeLabelText(domStrict))
+        ? domStrict
+        : domStrict
+          ? domStrict.slice(0, 280)
+          : ''
+    const firstVisible = visibleAfter.length ? String(visibleAfter[0].text || '').trim() : ''
+    if (target.kind === 'ng-select') {
+      const ng = field.closest?.('ng-select, .ng-select, [role="combobox"]') || field
+      await selectFirstNonEmptyNgSelect(ng)
+      await wait(800)
+    } else if (target.kind === 'select' || String(field?.tagName || '').toLowerCase() === 'select') {
+      const selectEl = field
+      const option = Array.from(selectEl?.options || []).find(opt => {
+        if (!opt || opt.disabled) return false
+        const value = String(opt.value || '').trim()
+        const txt = normalizeLabelText(opt.textContent || '')
+        if (!value) return false
+        return txt && !/select|choose/.test(txt)
+      })
+      if (option) {
+        selectEl.value = option.value
+        dispatchInputEvents(selectEl)
+        dispatchBlurEvent(selectEl)
+        await wait(90)
+      }
+    }
+    return {
+      passed,
+      message: passed
+        ? `${visOk} ${passNote || 'Validation matched.'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.trim()
+        : `${visOk} Required validation did not match: ${firstVisible || domStrict || 'no matching message'}${conditionalTrace ? ` | ${conditionalTrace}` : ''}`.slice(0, 900),
+      skipFullResetAfter: passed,
+      ...(conditionalSetupKey ? { parentSetupKey: conditionalSetupKey } : {})
+    }
+  }
+
+  if (testType === 'successful_submit') {
+    const submitFillOpts = {
+      manualLike: true,
+      fillEvenIfPopulated: false,
+      widgetWaitMs: 1200,
+      deferCascadeChains: false
+    }
+    const urlBefore = String(location.href || '')
+    await runSuccessfulSubmitFillSequence(submitFillOpts)
+    await wait(400)
+    const urlAfter = String(location.href || '')
+    if (urlAfter !== urlBefore) {
+      return {
+        passed: true,
+        message: `Form advanced: navigated from ${urlBefore} to ${urlAfter}`.slice(0, 500)
+      }
+    }
+    let entries = await getVisibleValidationEntriesWithRetry()
+    const messages = entries.map(e => String(e.text || '').trim()).filter(Boolean)
+    if (messages.length > 0) {
+      const meaningful = messages.filter(m => m.replace(/[\s*•·]/g, '').length > 1)
+      const summary = meaningful.length ? meaningful.join('; ') : messages.join('; ')
+      return { passed: false, message: summary.slice(0, 500) }
+    }
+    return {
+      passed: false,
+      message: 'Section did not advance after fill + Continue click — URL unchanged and no validation entries.'
+    }
+  }
+
+  if (testType === 'widget_auto_fill') {
+    return runWidgetAutoFillTest(tc, fieldLabel, fieldName)
+  }
+  if (testType === 'attachment') {
+    const attachmentInput =
+      (field && String(field.type || '').toLowerCase() === 'file' ? field : null) ||
+      (target?.element && String(target.element.type || '').toLowerCase() === 'file' ? target.element : null) ||
+      findAttachmentFieldElementByLabel(fieldLabel, fieldName)
+    if (!attachmentInput) {
+      return {
+        passed: false,
+        message: `Attachment input for "${fieldLabel || fieldName || tc?.name || 'unknown'}" not found on page. If this form uploads via a button that opens the OS file dialog (no <input type="file"> in the DOM), it cannot be automated by the extension.`
+      }
+    }
+
+    // The file input is usually hidden — scroll/annotate its visible wrapper (dropzone/button) instead.
+    const uploadAnchor = getAttachmentContainer(attachmentInput)
+    const visibleAnchor = uploadAnchor && isVisible(uploadAnchor) ? uploadAnchor : attachmentInput
+    scrollTestTargetIntoView(visibleAnchor)
+    await wait(260)
+    updateLiveRunIndicator(tc, visibleAnchor, 'Testing field')
+
+    const kind = detectAttachmentCaseKind(tc)
+    await fillAllFieldsWithValidValues({ element: attachmentInput, kind: 'input' })
+    await wait(180)
+
+    const uploadPrep = await prepareAttachmentUpload(attachmentInput, kind, tc)
+    const fileInput = uploadPrep.fileInput || attachmentInput
+
+    if (!uploadPrep.ok && kind !== 'required') {
+      return {
+        passed: false,
+        message:
+          uploadPrep.source === 'previous' || uploadPrep.source === 'certificates'
+            ? 'Could not select a document from the upload library (Previous uploaded documents / My certificates)'
+            : 'Could not complete attachment upload flow — upload source modal did not respond'
+      }
+    }
+
+    if (kind === 'invalid_format' || kind === 'size_limit') {
+      const fixture = makeAttachmentTestFile(kind)
+      const setOk = setFileInputValue(fileInput, fixture)
+      if (!setOk) {
+        return {
+          passed: false,
+          message: 'Could not set test file on attachment input after choosing Upload from device'
+        }
+      }
+      await wait(200)
+    } else if (uploadPrep.source === 'device' || uploadPrep.source === 'direct') {
+      const fixture = makeValidAttachmentTestFile()
+      setFileInputValue(fileInput, fixture)
+      await wait(180)
+    }
+    // previous / certificates: document picked from library — no file injection needed
+
+    const clicked = await clickContinueAndReadErrors(
+      tc?.expected_result,
+      fieldLabel || getLabelText(attachmentInput) || 'attachment',
+      { element: attachmentInput, kind: 'input' },
+      String(tc?.what_to_test || '')
+    )
+    if (!clicked.ok) return { passed: false, message: clicked.error }
+    if (clicked.sectionAdvanced) {
+      return {
+        passed: false,
+        message: `Form advanced unexpectedly when testing attachment "${fieldLabel || tc?.name || 'field'}" — file did not block submit. Subsequent tests on this section are unreliable.`
+      }
+    }
+    const matched = String(clicked.matched || '').trim()
+    return {
+      passed: Boolean(matched),
+      message: matched || `Attachment validation did not match expected result for ${fieldLabel || fieldName || tc?.name || 'attachment'}`
+    }
+  }
+  return { skipped: true, reason: `unsupported test type: ${testType}` }
+}
+
+async function requestFailureScreenshot() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'QA_HELPER_CAPTURE_VISIBLE_TAB' }, (response) => {
+      if (chrome.runtime.lastError) return resolve('')
+      resolve(String(response?.dataUrl || ''))
+    })
+  })
+}
+
+async function resetFormStateAfterTest(targetField) {
+  if (targetField?.element) {
+    const el = targetField.element
+    if (targetField.kind === 'radio') {
+      forceClearRadioGroupSelection(el)
+    } else if (targetField.kind === 'date') {
+      if (isCustomDatePickerInput(el)) {
+        await clearCustomDatePickerValue(el)
+      } else {
+        clearFieldValue(el)
+      }
+    } else if (targetField.kind === 'select') {
+      el.selectedIndex = 0
+      dispatchInputEvents(el)
+    } else if (targetField.kind === 'ng-select') {
+      await clearNgSelectValue(el)
+    } else {
+      clearFieldValue(el)
+    }
+    dispatchBlurEvent(el)
+  }
+
+  // Ensure date-picker model values do not leak into the next test.
+  const allCustomDateInputs = Array.from(
+    document.querySelectorAll('irembogov-custom-date-picker input, irembogov-irembo-date-picker input')
+  ).filter(isVisible)
+  for (const input of allCustomDateInputs) {
+    await clearCustomDatePickerValue(input)
+  }
+
+  await wait(80)
+}
+
+/**
+ * Read the CURRENT active SECTION (navigable step) label from the Irembo stepper.
+ * This is the TRUE section level — distinct from h1.section-title, which is the
+ * BLOCK sub-heading. Generic: finds the stepper, lists its steps, and picks the
+ * active one by common active-state signals (aria-current / aria-selected /
+ * active|current|selected class), with NO hardcoded step names. Returns '' when
+ * no stepper or active step is found.
+ *
+ * NOT wired into getCurrentSectionName/navigation yet — diagnostic only. The log
+ * dumps every step (tag/class/aria + active verdict) so we can confirm the active
+ * marker on the live form before keying the real fix off it.
+ */
+// Persistent across calls: step number → section label. The stepper nav lists a
+// numbered "N. Label" entry for every step EXCEPT the current one, so a step's own
+// label is never visible while it is current. We accumulate the pairs as the run
+// navigates, so each step's label is known once any OTHER step has been current.
+const stepperSectionMap = new Map()
+// Pathname the stepperSectionMap was built from. When the form/page changes the
+// accumulated step labels belong to the OLD form and must be dropped — otherwise
+// Form B shows Form A's sections. Enforced by the guard at the top of the reader.
+let lastStepperPathname = ''
+// The most recent NON-EMPTY section this reader resolved on the current form. When a
+// read momentarily can't resolve (DOM mid-transition → empty), we return this instead
+// of '' so the caller doesn't flicker down to the block-level h1 heading and break
+// sectionsMatch during navigation. Reset by the pathname guard when the form changes.
+let lastKnownStepperSection = ''
+
+function getActiveStepperSectionName() {
+  // 0) Stale-form guard: if we're on a different page than the map was built from,
+  //    the old numbered step labels are stale — clear BEFORE reading. This runs on
+  //    the FIRST section read of a new form (navigation reads the section before any
+  //    test case executes), so form-switch carry-over is fixed even though the
+  //    isRunStart reset in the RUN_TEST_CASE handler fires later.
+  let currentPath = ''
+  try { currentPath = String(window.location.pathname || '') } catch { currentPath = '' }
+  if (currentPath !== lastStepperPathname) {
+    if (stepperSectionMap.size) console.log('[QA stepper] pathname changed', JSON.stringify(lastStepperPathname), '→', JSON.stringify(currentPath), '— cleared stale stepperSectionMap') // TEMP DIAGNOSTIC
+    stepperSectionMap.clear()
+    lastKnownStepperSection = ''
+    lastStepperPathname = currentPath
+  }
+
+  // 1) Harvest visible "N. Label" stepper-nav entries (confirmed <h5> on Irembo;
+  //    broaden to any short numbered element only if no numbered <h5> exists, for
+  //    other forms). Store number → label (number stripped) in the persistent map.
+  const isNumbered = el => /^\d+\.\s+\S/.test(String(el.textContent || '').replace(/\s+/g, ' ').trim())
+  let labelEls = Array.from(document.querySelectorAll('h5')).filter(isVisible)
+  if (!labelEls.some(isNumbered)) {
+    labelEls = Array.from(document.querySelectorAll('*')).filter(el =>
+      isVisible(el) && isNumbered(el) &&
+      String(el.textContent || '').replace(/\s+/g, ' ').trim().length <= 60 &&
+      !Array.from(el.children).some(isNumbered))
+  }
+  for (const el of labelEls) {
+    const m = String(el.textContent || '').replace(/\s+/g, ' ').trim().match(/^(\d+)\.\s+(.+\S)$/)
+    if (m && m[2].length <= 60) stepperSectionMap.set(Number(m[1]), m[2].trim())
+  }
+
+  // 2) Current step number from the active "step_N collapse show" card: step_0 → 1,
+  //    step_1 → 2, … (the card index is 0-based; step numbers are 1-based).
+  const active = Array.from(document.querySelectorAll('[class*="step_"]')).find(el => {
+    const c = String(el.className || '')
+    return /\bstep_\d+\b/.test(c) && /\bcollapse\b/.test(c) && /\bshow\b/.test(c) && isVisible(el)
+  })
+  const mm = active && String(active.className).match(/\bstep_(\d+)\b/)
+  if (!mm) {
+    // Can't resolve this read (DOM mid-transition — no active step card). Fall back to
+    // the last section we DID resolve on this form so navigation doesn't flicker to the
+    // block heading. Empty only if nothing has ever resolved on this form yet.
+    console.log('[QA stepper] no active step_N collapse show card — using lastKnown', JSON.stringify(lastKnownStepperSection), '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+    return lastKnownStepperSection
+  }
+  const currentNumber = Number(mm[1]) + 1
+
+  // 3) The current step's label = the map entry for its number. It's '' on the very
+  //    first step (its label hasn't appeared in the nav yet) — caller then falls back
+  //    to the heading tiers (which fuzzy-match e.g. "Guidelines" ⊂ the block name).
+  const label = stepperSectionMap.get(currentNumber) || ''
+  console.log('[QA stepper] active step_' + mm[1], '→ step number', currentNumber,
+    '| section', JSON.stringify(label || '(unknown — not yet seen in nav)'),
+    '| lastKnown', JSON.stringify(lastKnownStepperSection),
+    '| map', JSON.stringify([...stepperSectionMap.entries()])) // TEMP DIAGNOSTIC
+  if (label) {
+    lastKnownStepperSection = label   // remember the good resolve for future empty reads
+    return label
+  }
+  // Couldn't resolve the label this read — return the last good section (empty only if
+  // nothing has ever resolved on this form yet, letting the caller fall through to tiers).
+  return lastKnownStepperSection
+}
+
+// Clear ALL module-level run state so a new run never inherits the previous run's
+// (or a previously-tested form's) data. Called on isRunStart from the RUN_TEST_CASE
+// handler, BEFORE reusableIdValueForRun is re-assigned from the message. The
+// stepperSectionMap is ALSO cleared on pathname change inside getActiveStepperSectionName
+// (which runs earlier, during first-section navigation) — that pathname guard is what
+// fixes "different form shows the previous form's sections"; this is the belt-and-
+// suspenders reset for same-URL reruns plus the execution-time state.
+async function resetRunStateForNewRun() {
+  stepperSectionMap.clear()
+  lastStepperPathname = ''
+  lastKnownStepperSection = ''
+  reusableIdValueForRun = ''
+  hasExpandedSectionsForRun = false
+  discoveredRequiredErrors = []
+  requiredFieldRunPreflightDone = false
+  if (pendingConditionalLabelParent) {
+    try { await clearConditionalParent(pendingConditionalLabelParent) } catch {}
+    pendingConditionalLabelParent = null
+  }
+  console.log('[QA reset] run-state cleared for new run — stepperSectionMap, reusableId, expand/preflight flags, discoveredRequiredErrors, pendingConditionalLabelParent') // TEMP DIAGNOSTIC
+}
+
+/** TEMP DIAGNOSTIC — read-only DOM dump of the active step card + any numbered
+ *  "N. Label" elements, to locate where the true section title lives. Used by no logic. */
+function dumpActiveStepCard() {
+  try {
+    const directText = el => {
+      let t = ''
+      for (const n of (el.childNodes || [])) if (n.nodeType === 3) t += n.textContent || ''
+      return t.replace(/\s+/g, ' ').trim()
+    }
+    const cards = Array.from(document.querySelectorAll('[class*="step_"]'))
+      .filter(el => /\bstep_\d+\b/.test(String(el.className || '')))
+    const active = cards.filter(isVisible).find(el => {
+      const c = String(el.className || '')
+      return /\bcollapse\b/.test(c) && /\bshow\b/.test(c)
+    })
+    if (!active) {
+      console.log('[QA dump] no active step_N collapse show card')
+    } else {
+      console.log('[QA dump] active card class=', JSON.stringify(active.className))
+      Array.from(active.querySelectorAll('*')).slice(0, 15).forEach((el, i) => console.log(
+        `[QA dump]  ${i}:`, el.tagName,
+        '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
+        '| text=', JSON.stringify(directText(el).slice(0, 60))
+      ))
+    }
+    console.log('[QA dump] --- numbered "N. Label" elements anywhere (stepper nav) ---')
+    const numbered = Array.from(document.querySelectorAll('*')).filter(el => {
+      const t = String(el.textContent || '').replace(/\s+/g, ' ').trim()
+      return /^\d+\.\s+\S/.test(t) && t.length <= 60
+    })
+    const leaves = numbered.filter(el => !numbered.some(o => o !== el && el.contains(o)))
+    if (leaves.length === 0) console.log('[QA dump]  (none found)')
+    leaves.slice(0, 20).forEach((el, i) => console.log(
+      `[QA dump]  num ${i}:`, el.tagName,
+      '| class=', JSON.stringify(String(el.className || '').slice(0, 50)),
+      '| text=', JSON.stringify(String(el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60))
+    ))
+  } catch (e) {
+    console.log('[QA dump] error', String(e?.message || e))
+  }
+}
+
+function getCurrentSectionName() {
+  // 0) The TRUE navigable SECTION from the stepper (the step_N collapse show card)
+  //    — the level test-case sections are tagged at. The heading tiers below read
+  //    the BLOCK-level h1.section-title, so we only fall through to them when the
+  //    stepper yields '' (non-stepper form).
+  const stepperSection = getActiveStepperSectionName()
+  if (stepperSection) {
+    console.log('[QA section] tier0 stepper →', JSON.stringify(stepperSection)) // TEMP DIAGNOSTIC
+    return stepperSection
+  }
+
+  // 1) Irembo's canonical section heading — the most reliable signal, and the
+  //    same element label_check's getFieldSectionName() trusts.
+  const sectionTitle = visibleSectionHeadings()[0]
+  if (sectionTitle && String(sectionTitle.textContent || '').trim()) {
+    const t1 = String(sectionTitle.textContent || '').trim()
+    console.log('[QA section] tier1 h1.section-title →', JSON.stringify(t1)) // TEMP DIAGNOSTIC
+    return t1
+  }
+
+  // 2) Otherwise, the heading that actually sits above the active form fields.
+  //    Taking the LAST heading before the first visible control skips a
+  //    page/service title that floats above the real section heading.
+  const headingSel = 'h1.section-title, .section-title, .step-title, .wizard-title, h1, h2, h3, h4'
+  const headings = Array.from(document.querySelectorAll(headingSel)).filter(isVisible)
+  const firstControl = Array.from(document.querySelectorAll(
+    'formly-field, formly-wrapper-form-field, input, select, textarea, ng-select'
+  )).find(isVisible)
+  if (firstControl) {
+    let best = ''
+    for (const h of headings) {
+      const txt = String(h.textContent || '').trim()
+      if (txt && (h.compareDocumentPosition(firstControl) & Node.DOCUMENT_POSITION_FOLLOWING)) best = txt
+    }
+    if (best) {
+      console.log('[QA section] tier2 heading-before-control →', JSON.stringify(best)) // TEMP DIAGNOSTIC
+      return best
+    }
+  }
+
+  // 3) Fallback: prefer top-level wizard step titles; block sub-headings (h2/h3) come second.
+  const sectionSelectors = '.wizard-title, .step-title, .section-title, h1.section-title, h1'
+  const blockSelectors = 'h2, h3, h4, [class*="block-title"], [class*="group-title"]'
+  for (const sel of [sectionSelectors, blockSelectors]) {
+    for (const h of document.querySelectorAll(sel)) {
+      if (!isVisible(h)) continue
+      const txt = String(h.textContent || '').trim()
+      if (txt) {
+        console.log('[QA section] tier3 fallback heading →', JSON.stringify(txt)) // TEMP DIAGNOSTIC
+        return txt
+      }
+    }
+  }
+  console.log('[QA section] none — no visible heading found') // TEMP DIAGNOSTIC
+  return ''
+}
+
+/**
+ * Section signature — a stable fingerprint of the currently-visible section.
+ * Used by the multi-section bucketer in background.js to detect when clicking
+ * Continue actually advanced the form (Irembo forms stay on the same URL
+ * between sections, so location.href is not a usable signal here).
+ *
+ * Made of three layers, most-stable first:
+ *   1. Visible heading text (h1-h4, formly-group label/title-style nodes).
+ *   2. Visible formly-field DOM ids in source order.
+ *   3. Visible top-level control ids/names in source order (bounded).
+ *
+ * If any of these layers changes after a Continue click, the section is
+ * considered to have advanced.
+ */
+function getSectionSignature() {
+  const parts = []
+  const headingSel = 'h1, h2, h3, h4, formly-group > label, .step-title, .wizard-title, .section-title'
+  for (const h of document.querySelectorAll(headingSel)) {
+    if (!isVisible(h)) continue
+    const txt = String(h.textContent || '').trim()
+    if (txt) parts.push(`H:${txt.slice(0, 80)}`)
+  }
+  for (const f of document.querySelectorAll('formly-field, formly-wrapper-form-field')) {
+    if (!isVisible(f)) continue
+    const id = String(f.id || '').trim()
+    if (id) parts.push(`F:${id}`)
+  }
+  const controlSel = 'ng-select, input, select, textarea'
+  let controlCount = 0
+  for (const c of document.querySelectorAll(controlSel)) {
+    if (controlCount >= 40) break
+    if (!isVisible(c)) continue
+    const key = String(c.id || c.getAttribute?.('name') || '').trim()
+    if (!key) continue
+    parts.push(`C:${key}`)
+    controlCount += 1
+  }
+  return parts.join('|')
+}
+
+/**
+ * Fast read-only check: can this test case be executed on the current section?
+ *
+ *  - successful_submit: always reachable (it operates on Continue/Submit).
+ *  - conditional_field types: parent field must be visible (parent gates the
+ *    cascade; if it's here, the test can apply the trigger and the target
+ *    will then appear).
+ *  - all other types: the target field itself must be visible.
+ *
+ * No cascade walking, no waits — uses the same label resolvers as the test
+ * runner so behaviour stays consistent.
+ */
+function probeFieldVisibility(tc) {
+  const testType = String(tc?.test_type || '').trim()
+  if (testType === 'successful_submit') return true
+
+  if (testType === 'attachment') {
+    return probeAttachmentFieldVisible(tc)
+  }
+
+  const wttLower = String(tc?.what_to_test || '').toLowerCase()
+  if (
+    testType === 'label_check' &&
+    (/\battachment\b/.test(wttLower) || wttLower.includes('click to upload') || /upload|file/.test(wttLower))
+  ) {
+    if (probeAttachmentFieldVisible(tc)) return true
+  }
+
+  // Conditional label_check is reachable when its PARENT is visible (the child
+  // stays hidden until we set the parent at runtime).
+  if (testType === 'label_check') {
+    const pm = String(tc?.expected_result || '').match(/;\s*parent\s*:\s*([^;=]+?)\s*=/i)
+    if (pm) {
+      const parent = resolveConditionalParentField({ parentLabel: pm[1].trim(), triggerValue: '' })
+      return Boolean(parent && isVisible(parent))
+    }
+  }
+
+  if (isConditionalFieldTestType(testType)) {
+    try {
+      const spec = parseConditionalSpec(tc)
+      if (spec?.parentLabel) {
+        const parent = resolveConditionalParentField(spec)
+        return Boolean(parent && isVisible(parent))
+      }
+    } catch {
+      // Fall through to target-field check if spec parsing throws.
+    }
+  }
+
+  const rawFieldLabel = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+  const fieldLabel = sanitizeSearchLabel(
+    shouldStripConditionalClauseForFieldLabel(testType) ? stripConditionalClause(rawFieldLabel) : rawFieldLabel
+  )
+  if (!fieldLabel) return false
+
+  const ng = findNgSelectForLabel(fieldLabel)
+  if (ng && isVisible(ng)) return true
+  const radios = findRadiosForLabel(fieldLabel)
+  if (radios.length > 0 && isVisible(radios[0])) return true
+  const date = findDateInputForLabel(fieldLabel)
+  if (date && isVisible(date)) return true
+
+  const fieldName = String(tc?.field_name || '').trim()
+  if (fieldName) {
+    try {
+      const escaped = fieldName.replace(/[\\"]/g, '\\$&')
+      const byName = document.querySelector(`[name="${escaped}"], [id="${escaped}"]`)
+      if (byName && isVisible(byName)) return true
+    } catch {
+      // Bad selector chars — fall through to label scan.
+    }
+  }
+
+  const needle = String(fieldLabel || '').toLowerCase()
+  if (needle) {
+    const inputs = Array.from(document.querySelectorAll('input, select, textarea'))
+    // Build a (text) candidate list for each visible input. For each input:
+    //   1. Take getLabelText() — the for/id-tied label (strong signal when set).
+    //   2. ALSO read a label element from the closest formly wrapper — Irembo's
+    //      plain text inputs (ID Number, Email Address) often have their visible
+    //      label as a sibling, NOT tied via for/id, so getLabelText returns ''.
+    //   3. Prefer the for/id-tied label; fall back to the wrapper label.
+    const candidates = []
+    for (const input of inputs) {
+      if (!isVisible(input)) continue
+      const directLabel = normalizeLabelText(getLabelText(input) || '')
+      let wrapLabel = ''
+      const wrap = input.closest('formly-field, formly-wrapper-form-field')
+      if (wrap) {
+        const labelEl = wrap.querySelector('label, .form-label, .field-label, formly-label, mat-label')
+        if (labelEl) wrapLabel = normalizeLabelText(labelEl.textContent || '')
+      }
+      const text = directLabel || wrapLabel
+      if (!text) continue
+      candidates.push(text)
+    }
+    // Two-pass match: exact first, then substring fallback. Prevents
+    // "District" matching "Processing District" purely by substring overlap
+    // when a residential "District" field also exists on the page.
+    for (const text of candidates) {
+      if (text === needle) return true
+    }
+    for (const text of candidates) {
+      if (text.includes(needle)) return true
+    }
+  }
+
+  return false
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'QA_HELPER_SET_ENGINE_CONFIG') {
+    const applied = typeof globalThis.applyQaEngineConfig === 'function'
+      ? globalThis.applyQaEngineConfig(message.config)
+      : false
+    sendResponse({ ok: true, applied })
+    return true
+  }
+  if (message?.type === 'QA_HELPER_CANCEL_CURRENT_TEST') {
+    cancelCurrentTestRequested = true
+    sendResponse({ ok: true })
+    return true
+  }
+  if (message?.type === 'QA_HELPER_GET_CURRENT_SECTION') {
+    try {
+      try { dumpActiveStepCard() } catch {} // TEMP DIAGNOSTIC — read-only DOM dump, drives nothing
+      sendResponse({ ok: true, section: getCurrentSectionName() })
+    } catch (err) {
+      sendResponse({ ok: false, section: '', error: String(err?.message || 'Failed to read section') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_CAPTURE_FORM_STRUCTURE') {
+    try {
+      sendResponse({ ok: true, structure: captureLiveFormStructure() })
+    } catch (err) {
+      sendResponse({ ok: false, error: String(err?.message || 'Failed to capture form structure') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_PROBE_FIELD_VISIBLE') {
+    ;(async () => {
+      try {
+        const tc = message?.testCase || {}
+        let visible = probeFieldVisibility(tc)
+        if (!visible) {
+          // A present-but-unscrolled or mid-render field can read not-visible. Best-effort:
+          // resolve the target element, scroll it into view, settle ~180ms, then re-probe once.
+          try {
+            const rawLbl = normalizeCaseFieldLabelRaw(String(tc?.field_label || tc?.name || '').trim())
+            const lbl = sanitizeSearchLabel(
+              shouldStripConditionalClauseForFieldLabel(String(tc?.test_type || '')) ? stripConditionalClause(rawLbl) : rawLbl
+            )
+            const el = resolveFieldTarget(lbl, String(tc?.field_name || ''))?.element
+            if (el) scrollTestTargetIntoView(el)
+          } catch { /* resolution is best-effort */ }
+          await wait(180)
+          visible = probeFieldVisibility(tc)
+        }
+        const probeSel = 'input:not([type="hidden"]), select, textarea, ng-select, .ng-select, div[role="combobox"]'
+        const allControls = Array.from(document.querySelectorAll(probeSel))
+        const visibleControls = allControls.filter(isVisible)
+        const probeLabel = String(tc?.field_label || tc?.name || '').trim()
+        console.log('[QA probe] field=' + JSON.stringify(probeLabel) + ' | visible=' + Boolean(visible) + ' | controlsOnPage=' + allControls.length + ' | visibleControls=' + visibleControls.length + ' | path=' + location.pathname) // TEMP DIAGNOSTIC
+        sendResponse({ ok: true, visible: Boolean(visible), controlsOnPage: allControls.length, visibleControls: visibleControls.length })
+      } catch (err) {
+        // Fail-open so a probe error doesn't strand a test in the deferred pile.
+        sendResponse({ ok: false, visible: true, error: String(err?.message || 'Probe failed') })
+      }
+    })()
+    return true
+  }
+  if (message?.type === 'QA_HELPER_IS_SECTION_REACHABLE') {
+    try {
+      const sectionName = String(message?.sectionName || '').trim()
+      const testCases = Array.isArray(message?.testCases) ? message.testCases : []
+      sendResponse({
+        ok: true,
+        reachable: isSectionReachableOnPage(sectionName, testCases)
+      })
+    } catch (err) {
+      sendResponse({ ok: false, reachable: false, error: String(err?.message || 'Section reachability check failed') })
+    }
+    return true
+  }
+  if (message?.type === 'QA_HELPER_FILL_TO_REVEAL') {
+    ;(async () => {
+      try {
+        // Fill the current step's visible fields (same logic as advance) but DO NOT click
+        // Continue. This reveals progressively-gated sibling fields so their test cases can be
+        // probed and run on THIS section before advancing. Returns whether the section
+        // signature changed (i.e. new fields appeared). Generic — fills the live DOM by
+        // structure, no hardcoded names.
+        const before = getSectionSignature()
+        const fillOpts = { manualLike: true, fillEvenIfPopulated: false, widgetWaitMs: 2400, deferCascadeChains: false }
+        await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 2)
+        await wait(180)
+        const after = getSectionSignature()
+        sendResponse({ ok: true, changed: before !== after })
+      } catch (err) {
+        sendResponse({ ok: false, changed: false, error: String(err?.message || 'Fill-to-reveal failed') })
+      }
+    })()
+    return true
+  }
+  if (message?.type === 'QA_HELPER_ADVANCE_AND_PROBE') {
+    ;(async () => {
+      try {
+        cancelCurrentTestRequested = false
+        if (pendingConditionalLabelParent) {
+          await clearConditionalParent(pendingConditionalLabelParent)
+          pendingConditionalLabelParent = null
+        }
+        const signatureBefore = getSectionSignature()
+        const fillOpts = {
+          manualLike: true,
+          fillEvenIfPopulated: false,
+          widgetWaitMs: 2400,
+          deferCascadeChains: false
+        }
+        await ensureAllVisibleFieldsFilledForSubmit(fillOpts, 4)
+        const btn = findContinueButton() // TEMP DIAGNOSTIC
+        console.log('[QA advance] Continue button: found=' + Boolean(btn) + ', text=' + JSON.stringify(String(btn?.textContent || '').replace(/\s+/g, ' ').trim())) // TEMP DIAGNOSTIC
+        const clicked = await clickContinueWithoutValidationRead()
+        console.log('[QA advance] clicked Continue = ' + Boolean(clicked.ok)) // TEMP DIAGNOSTIC
+        if (!clicked.ok) {
+          console.log('[QA advance] section changed after click = false (button not found:', JSON.stringify(clicked.error || 'Continue button not found') + ')') // TEMP DIAGNOSTIC
+          sendResponse({ ok: false, error: clicked.error || 'Continue button not found', sectionChanged: false, buttonFound: false })
+          return
+        }
+        await wait(900)
+        const signatureAfter = getSectionSignature()
+        const sectionChanged = signatureBefore !== signatureAfter
+        console.log('[QA advance] section changed after click = ' + sectionChanged + ' | sigLen ' + signatureBefore.length + ' → ' + signatureAfter.length) // TEMP DIAGNOSTIC
+        if (!sectionChanged) {
+          const errs = getVisibleValidationEntries().map(e => e.text).slice(0, 6) // TEMP DIAGNOSTIC
+          console.log('[QA advance] NOT advanced — Continue clicked but section signature unchanged | visible validation errors:', JSON.stringify(errs)) // TEMP DIAGNOSTIC
+        }
+        sendResponse({
+          ok: true,
+          sectionChanged,
+          buttonFound: true,
+          signatureBeforeLen: signatureBefore.length,
+          signatureAfterLen: signatureAfter.length
+        })
+      } catch (err) {
+        sendResponse({ ok: false, sectionChanged: false, error: String(err?.message || 'Failed to advance section') })
+      }
+    })()
+    return true
+  }
+  if (message?.type === 'QA_HELPER_SCAN_FIELDS') {
+    sendResponse({ ok: true, fields: scanFormFields() })
+    return true
+  }
+  if (message?.type === 'QA_HELPER_ADVANCE_SECTION') {
+    ;(async () => {
+      try {
+        cancelCurrentTestRequested = false
+        const clicked = await clickContinueWithoutValidationRead()
+        if (!clicked.ok) {
+          sendResponse({ ok: false, error: clicked.error || 'Continue button not found' })
+          return
+        }
+        // Give SPA routers / lazy sections time to render the next step.
+        await wait(900)
+        sendResponse({ ok: true, advanced: true })
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err?.message || 'Failed to advance section') })
+      }
+    })()
+    return true
+  }
+  if (message?.type === 'QA_HELPER_RUN_TEST_CASE') {
+    let responded = false
+    const safeResponse = (payload) => {
+      if (responded) return
+      responded = true
+      try {
+        sendResponse(payload)
+      } catch {
+        /* Port may already be closed after navigation. */
+      }
+    }
+    const onPageHide = () => {
+      cancelCurrentTestRequested = true
+      safeResponse({
+        ok: true,
+        passed: false,
+        message: 'Interrupted: page changed during this test — run continues on the new page.'
+      })
+    }
+    window.addEventListener('pagehide', onPageHide)
+    ;(async () => {
+      try {
+        cancelCurrentTestRequested = false
+        const tc = message?.testCase || {}
+        if (message?.isRunStart) await resetRunStateForNewRun()
+        reusableIdValueForRun = String(message?.reusableIdValue || '').trim()
+        throwIfCancelled()
+        await expandCollapsedSectionsOnce()
+        const result = await executeTestCase(tc, {
+          isRunStart: Boolean(message?.isRunStart),
+          primeAfterNavigation: Boolean(message?.primeAfterNavigation),
+          previousParentSetupKey: String(message?.previousParentSetupKey || '')
+        })
+        if (message?.skipFormResetAfter) {
+          result.skipFullResetAfter = true
+        }
+        throwIfCancelled()
+        if (result && result.passed === false && !result.skipped) {
+          result.screenshotDataUrl = await requestFailureScreenshot()
+        }
+        const targetLabel = sanitizeSearchLabel(String(tc?.field_label || tc?.name || ''))
+        const targetField = resolveFieldTarget(targetLabel, String(tc?.field_name || ''))
+        if (!result?.skipFullResetAfter) {
+          await resetFormStateAfterTest(targetField)
+        } else {
+          await wait(200)
+        }
+        clearLiveRunIndicator()
+        safeResponse({ ok: true, ...result })
+      } catch (err) {
+        clearLiveRunIndicator()
+        const msg = String(err?.message || 'Unknown execution error')
+        if (/cancelled by user/i.test(msg)) {
+          safeResponse({ ok: true, skipped: true, reason: 'Stopped by user' })
+        } else {
+          safeResponse({ ok: true, passed: false, message: msg })
+        }
+      } finally {
+        window.removeEventListener('pagehide', onPageHide)
+      }
+    })()
+    return true
+  }
+  return false
+})
