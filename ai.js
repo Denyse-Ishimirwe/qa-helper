@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import fs from 'node:fs'
 import Groq from 'groq-sdk'
 import { GoogleGenerativeAI } from '@google/generative-ai'
 import { assignSectionsFromFormStructure } from './sections.js'
@@ -340,6 +341,18 @@ function extractFirstJsonArrayBlock(text) {
       if (depth === 0) return candidate.slice(start, i + 1)
     }
   }
+  // Array never closed — output was truncated at the token limit. Salvage every
+  // COMPLETE case object emitted so far: cut at the last closing brace and close
+  // the array, so a long run yields its finished cases instead of zero.
+  const lastBrace = candidate.lastIndexOf('}')
+  if (lastBrace > start) {
+    const salvaged = `${candidate.slice(start, lastBrace + 1)}]`
+    try {
+      JSON.parse(salvaged)
+      console.warn('[ai] model output truncated mid-array — salvaged the complete cases emitted before the cutoff.')
+      return salvaged
+    } catch { /* salvage failed; fall through */ }
+  }
   return ''
 }
 
@@ -349,6 +362,9 @@ function coerceToCaseArray(parsed) {
   if (Array.isArray(parsed)) return parsed
   if (parsed && typeof parsed === 'object') {
     for (const v of Object.values(parsed)) if (Array.isArray(v)) return v
+    // A single bare test-case object (json mode can produce exactly one) —
+    // keep it rather than dropping to zero cases.
+    if (parsed.name && (parsed.what_to_test || parsed.expected_result)) return [parsed]
   }
   return []
 }
@@ -440,7 +456,9 @@ async function ollamaGenerate(payload, { allowJsonFormat = true } = {}) {
     model: OLLAMA_MODEL,
     messages: Array.isArray(payload.messages) ? payload.messages : [],
     temperature: typeof payload.temperature === 'number' ? payload.temperature : 0,
-    ...(payload.max_tokens ? { max_tokens: payload.max_tokens } : {}),
+    // Local model has no per-token billing/quota — never let the cloud-sized
+    // max_tokens (tuned for Groq TPM limits) truncate a long test-case array.
+    ...(payload.max_tokens ? { max_tokens: Math.max(Number(payload.max_tokens) || 0, 8192) } : {}),
     // OpenAI-compatible structured-output hint; retried without it on rejection.
     ...(allowJsonFormat ? { response_format: { type: 'json_object' } } : {})
   }
@@ -487,17 +505,14 @@ async function ollamaGenerate(payload, { allowJsonFormat = true } = {}) {
   return { choices: [{ message: { content } }] }
 }
 
-/** Ollama with response_format json_object, retrying once as a plain call if rejected. */
+/** Ollama call for array-producing prompts.
+ *  DO NOT use response_format json_object here: json mode biases local models
+ *  toward emitting a SINGLE object, but our prompts demand a JSON ARRAY of many
+ *  test cases (observed: qwen2.5-coder returned exactly one case under json mode).
+ *  Plain mode + the parse safety nets (fence stripping, first-array extraction,
+ *  truncation salvage) handle the output reliably. */
 async function ollamaChatWithJsonFallback(payload) {
-  try {
-    return await ollamaGenerate(payload, { allowJsonFormat: true })
-  } catch (err) {
-    if (err?.code === 'OLLAMA_JSON_FORMAT_UNSUPPORTED') {
-      console.warn('[ai][ollama] response_format json_object rejected — retrying plain call; JSON safety net will clean the output.')
-      return await ollamaGenerate(payload, { allowJsonFormat: false })
-    }
-    throw err
-  }
+  return await ollamaGenerate(payload, { allowJsonFormat: false })
 }
 
 /**
@@ -841,6 +856,14 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
         })
 
         const response = completion.choices?.[0]?.message?.content || '[]'
+        console.log(`[ai][debug] raw generation output: ${response.length} chars — first 800:\n${response.slice(0, 800)}`)
+        // TEMP DIAGNOSTIC — dump the full raw model answer to a file for inspection.
+        try {
+          fs.writeFileSync(
+            new URL('./ai-debug.log', import.meta.url),
+            `=== ${new Date().toISOString()} | plan ${planIdx} | ${response.length} chars ===\n${response}\n`
+          )
+        } catch { /* diagnostics must never break generation */ }
         let parsed
         try {
           parsed = parseJsonArrayOrThrow(response)
@@ -848,7 +871,9 @@ Follow the PRODUCT STYLE in the system message: short titles, one-sentence what_
           parsed = await repairResponseToJsonArray(response)
         }
 
-        return retagSpecialCaseTypes(normalizeCases(parsed))
+        const usable = retagSpecialCaseTypes(normalizeCases(parsed))
+        console.log(`[ai][debug] parsed ${Array.isArray(parsed) ? parsed.length : typeof parsed} raw rows → ${usable.length} usable cases`)
+        return usable
       } catch (err) {
         lastErr = err
         // ORDER MATTERS: check "request too large" BEFORE "rate limit". Groq
