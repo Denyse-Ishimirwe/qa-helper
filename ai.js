@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import fs from 'node:fs'
 import Groq from 'groq-sdk'
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from '@google/generative-ai'
 import { assignSectionsFromFormStructure } from './sections.js'
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
@@ -430,13 +430,24 @@ async function geminiGenerate(payload) {
   const model = genAI.getGenerativeModel({
     model: GEMINI_MODEL,
     ...(systemInstruction ? { systemInstruction } : {}),
-    generationConfig
+    generationConfig,
+    // Government service SRDs legitimately reference sensitive civic topics
+    // (e.g. genocide memorial site regulations). Default safety filters return
+    // EMPTY text for such documents; relax them — output here is only ever
+    // structured QA test cases derived from the user's own document.
+    safetySettings: [
+      { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+      { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+      { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+      { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE }
+    ]
   })
   const result = await model.generateContent(userText)
   const finishReason = result?.response?.candidates?.[0]?.finishReason || 'unknown'
+  const blockReason = result?.response?.promptFeedback?.blockReason || ''
   const text = typeof result?.response?.text === 'function' ? result.response.text() : ''
   if (!String(text || '').trim()) {
-    throw new Error(`Gemini returned empty text (finishReason=${finishReason})`)
+    throw new Error(`Gemini returned empty text (finishReason=${finishReason}${blockReason ? `, blockReason=${blockReason}` : ''})`)
   }
   return { choices: [{ message: { content: String(text) } }] }
 }
