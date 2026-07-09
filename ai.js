@@ -589,6 +589,72 @@ async function groqChatCompletionsCreate(payload) {
   }
 }
 
+function _normNameKey(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** Parse the SRD's "Form Structure" markdown table (Section | Block | Field name)
+ *  applying the forward-fill rule (blank cells inherit the value above), and return
+ *  block→section and field→section lookup maps. Only the table whose header row
+ *  contains Section+Block+Field is read — other tables (Form Elements etc.) are ignored. */
+function buildSrdSectionMaps(srdText) {
+  const blockToSection = new Map()
+  const fieldToSection = new Map()
+  const lines = String(srdText || '').split('\n')
+  let inTable = false
+  let section = ''
+  let block = ''
+  for (const line of lines) {
+    const t = line.trim()
+    if (!t.startsWith('|')) {
+      if (inTable) inTable = false
+      continue
+    }
+    const cells = t.split('|').map(c => c.replace(/\*\*/g, '').trim()).slice(1, -1)
+    if (!inTable) {
+      if (cells.length >= 3 && /section/i.test(cells[0]) && /block/i.test(cells[1]) && /field/i.test(cells[2])) {
+        inTable = true
+        section = ''
+        block = ''
+      }
+      continue
+    }
+    if (cells.length < 3) { inTable = false; continue }
+    if (cells.every(c => /^[-\s:]*$/.test(c))) continue // separator row
+    const [c1, c2, c3] = cells
+    if (c1) section = c1
+    if (c2) block = c2
+    const field = c3 || ''
+    if (!section) continue
+    if (block && !blockToSection.has(_normNameKey(block))) blockToSection.set(_normNameKey(block), section)
+    if (field && !fieldToSection.has(_normNameKey(field))) fieldToSection.set(_normNameKey(field), section)
+  }
+  return { blockToSection, fieldToSection }
+}
+
+/** Force each case's `section` to the SRD structure table's truth. Models routinely
+ *  promote BLOCK names (e.g. "Passport Details") to sections despite the prompt's
+ *  forward-fill rules — this fixes that deterministically, including the
+ *  "section: X" fragment inside label_check expected_result strings. */
+function correctSectionsAgainstSrd(cases, srdText) {
+  const { blockToSection, fieldToSection } = buildSrdSectionMaps(srdText)
+  if (!blockToSection.size && !fieldToSection.size) return cases
+  let fixed = 0
+  const out = (Array.isArray(cases) ? cases : []).map(tc => {
+    const viaBlock = blockToSection.get(_normNameKey(tc.block))
+    const sectionIsActuallyBlock = blockToSection.get(_normNameKey(tc.section))
+    const viaField = fieldToSection.get(_normNameKey(tc.field_label))
+    const target = viaBlock || sectionIsActuallyBlock || viaField
+    if (!target || _normNameKey(tc.section) === _normNameKey(target)) return tc
+    fixed += 1
+    const er = String(tc.expected_result || '').replace(/section:\s*[^;]+/i, `section: ${target}`)
+    // When the model used the block name as the section AND as the block, keep the block.
+    return { ...tc, section: target, expected_result: er }
+  })
+  if (fixed) console.log(`[ai] corrected section on ${fixed} case(s) using the SRD structure table (block names are not sections).`)
+  return out
+}
+
 async function generateTestCases(srdText, formStructure) {
   function compactStructureForPrompt(structure, maxChars) {
     if (!structure) return ''
@@ -797,7 +863,8 @@ async function generateTestCases(srdText, formStructure) {
       kept.length ? kept : merged,
       formStructure
     )
-    return withSections
+    // Final authority on section names is the SRD's own structure table.
+    return correctSectionsAgainstSrd(withSections, srdText)
   }
 
   async function requestOnce(extraRules = '') {
